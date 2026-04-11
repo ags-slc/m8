@@ -60,7 +60,12 @@ func (d *Differ) Close() error {
 
 // Diff compares the desired DDL (from an S__ file) against the live database
 // for a given schema and returns the ALTER statements needed to converge.
-func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, desiredDDL []string) (*DiffResult, error) {
+//
+// When strict is false (default), only statements targeting objects defined in
+// the DDL are included — undeclared objects in the live DB are ignored.
+// When strict is true, all diff statements are included, including DROPs for
+// objects that exist in the DB but not in the DDL.
+func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, desiredDDL []string, strict bool) (*DiffResult, error) {
 	plan, err := diff.Generate(ctx,
 		diff.DBSchemaSource(liveDB),
 		diff.DDLSchemaSource(desiredDDL),
@@ -70,15 +75,26 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 		return nil, fmt.Errorf("failed to generate schema diff: %w", err)
 	}
 
-	// Extract the object names defined in the desired DDL so we can filter
-	// the diff to only include statements targeting those objects.
-	definedObjects := extractDefinedObjects(desiredDDL)
+	// In default (non-strict) mode, only include statements targeting objects
+	// defined in the DDL. In strict mode, include everything except _m8 internals.
+	var definedObjects map[string]bool
+	if !strict {
+		definedObjects = extractDefinedObjects(desiredDDL)
+	}
 
 	result := &DiffResult{}
 
 	for _, stmt := range plan.Statements {
-		if !statementTargetsDefinedObject(stmt.DDL, definedObjects) {
+		// Always exclude m8 internal schema
+		lower := strings.ToLower(stmt.DDL)
+		if strings.Contains(lower, `"_m8"`) || strings.Contains(lower, `_m8.`) {
 			continue
+		}
+
+		if !strict {
+			if !statementTargetsDefinedObject(stmt.DDL, definedObjects) {
+				continue
+			}
 		}
 		ds := DiffStatement{
 			DDL:         stmt.DDL,

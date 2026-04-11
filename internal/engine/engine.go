@@ -32,6 +32,7 @@ type Engine struct {
 type Config struct {
 	MigrationsDir string
 	ConnStr       string
+	Strict        bool // When true, schema diffs include DROPs for undeclared objects.
 }
 
 // ApplyResult holds the outcome of an apply or plan operation.
@@ -178,7 +179,7 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		sr := SchemaResult{Migration: m}
 		if e.differ != nil {
 			ddl := []string{string(m.Content)}
-			diffResult, err := e.differ.Diff(ctx, e.sqlDB, m.PGSchema, ddl)
+			diffResult, err := e.differ.Diff(ctx, e.sqlDB, m.PGSchema, ddl, e.config.Strict)
 			if err != nil {
 				sr.Error = err
 			} else {
@@ -318,6 +319,81 @@ func (e *Engine) Baseline(ctx context.Context, version string, all bool) error {
 	return nil
 }
 
+// Sync performs a one-time convergence: diffs all schema/ files against the live
+// database and applies changes, then applies all logic/ and permissions/ files.
+// Ops/ files are skipped (they require explicit ordering via apply).
+// This is the brownfield adoption command — run it once to bring an existing
+// database in line with your migration files.
+func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
+	if err := e.acquireLock(ctx); err != nil {
+		return nil, err
+	}
+	defer e.releaseLock(ctx)
+
+	if err := e.store.EnsureSchema(ctx); err != nil {
+		return nil, err
+	}
+
+	all, err := migration.Discover(e.config.MigrationsDir)
+	if err != nil {
+		return nil, err
+	}
+
+	result := &ApplyResult{}
+
+	// Mark all ops as baselined (they're assumed already applied in an existing DB)
+	for _, m := range filterByType(all, migration.TypeOps) {
+		_ = e.store.RecordBaseline(ctx, &m.Version, m.Name, m.Type.String(), nil, m.Checksum)
+		result.Ops = append(result.Ops, MigrationResult{Migration: m, Skipped: true})
+		e.logger.Info("baselined (sync)", "file", m.Filename, "type", "ops")
+	}
+
+	// Schema — diff and apply
+	s, err := e.applySchema(ctx, filterByType(all, migration.TypeSchema))
+	result.Schema = s
+	if err != nil {
+		return result, err
+	}
+
+	// Logic — apply all (force re-apply regardless of checksum)
+	for _, m := range filterByType(all, migration.TypeLogic) {
+		mr := MigrationResult{Migration: m}
+		start := time.Now()
+		if err := e.executeMigration(ctx, m); err != nil {
+			mr.ExecutionMs = time.Since(start).Milliseconds()
+			mr.Error = err
+			_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), nil, m.Checksum, mr.ExecutionMs, false)
+			result.Logic = append(result.Logic, mr)
+			return result, fmt.Errorf("sync: %s failed: %w", m.Filename, err)
+		}
+		mr.ExecutionMs = time.Since(start).Milliseconds()
+		mr.Applied = true
+		_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), nil, m.Checksum, mr.ExecutionMs, true)
+		e.logger.Info("applied (sync)", "file", m.Filename, "type", "logic", "ms", mr.ExecutionMs)
+		result.Logic = append(result.Logic, mr)
+	}
+
+	// Permissions — apply all (force re-apply regardless of checksum)
+	for _, m := range filterByType(all, migration.TypePermissions) {
+		mr := MigrationResult{Migration: m}
+		start := time.Now()
+		if err := e.executeMigration(ctx, m); err != nil {
+			mr.ExecutionMs = time.Since(start).Milliseconds()
+			mr.Error = err
+			_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), nil, m.Checksum, mr.ExecutionMs, false)
+			result.Permissions = append(result.Permissions, mr)
+			return result, fmt.Errorf("sync: %s failed: %w", m.Filename, err)
+		}
+		mr.ExecutionMs = time.Since(start).Milliseconds()
+		mr.Applied = true
+		_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), nil, m.Checksum, mr.ExecutionMs, true)
+		e.logger.Info("applied (sync)", "file", m.Filename, "type", "permissions", "ms", mr.ExecutionMs)
+		result.Permissions = append(result.Permissions, mr)
+	}
+
+	return result, nil
+}
+
 // --- apply helpers ---
 
 func (e *Engine) applyOps(ctx context.Context, migrations []*migration.Migration) ([]MigrationResult, error) {
@@ -365,7 +441,7 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 	for _, m := range migrations {
 		sr := SchemaResult{Migration: m}
 		ddl := []string{string(m.Content)}
-		diffResult, err := e.differ.Diff(ctx, e.sqlDB, m.PGSchema, ddl)
+		diffResult, err := e.differ.Diff(ctx, e.sqlDB, m.PGSchema, ddl, e.config.Strict)
 		if err != nil {
 			sr.Error = err
 			results = append(results, sr)

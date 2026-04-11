@@ -24,6 +24,7 @@ var (
 	flagSSLMode       string
 	flagMigrationsDir string
 	flagDatabaseURL   string
+	flagStrict        bool
 	flagJSON          bool
 )
 
@@ -44,7 +45,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagSSLMode, "sslmode", "", "PostgreSQL SSL mode (env: PGSSLMODE, default: prefer)")
 	rootCmd.PersistentFlags().StringVar(&flagDatabaseURL, "database-url", "", "PostgreSQL connection URL (overrides individual flags)")
 	rootCmd.PersistentFlags().StringVar(&flagMigrationsDir, "migrations-dir", "migrations", "Path to migrations directory")
-	// --schema flag removed: PG schema is now derived from schema/{pg_schema}/ subfolder
+	rootCmd.PersistentFlags().BoolVar(&flagStrict, "strict", false, "Include DROP statements for DB objects not declared in migration files")
 	rootCmd.PersistentFlags().BoolVar(&flagJSON, "json", false, "Output in JSON format")
 }
 
@@ -128,6 +129,7 @@ func connectAndBuildEngine(ctx context.Context) (*pgx.Conn, *engine.Engine, func
 	eng := engine.New(conn, sqlDB, differ, &engine.Config{
 		MigrationsDir: flagMigrationsDir,
 		ConnStr:       connStr,
+		Strict:        flagStrict,
 	}, logger)
 
 	cleanup := func() {
