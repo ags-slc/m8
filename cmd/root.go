@@ -24,14 +24,13 @@ var (
 	flagSSLMode       string
 	flagMigrationsDir string
 	flagDatabaseURL   string
-	flagTargetSchema  string
 	flagJSON          bool
 )
 
 var rootCmd = &cobra.Command{
 	Use:   "m8",
 	Short: "PostgreSQL migration tool",
-	Long:  "m8 (mate) -- a PostgreSQL-specific migration tool with versioned, repeatable, and schema migrations.",
+	Long:  "m8 (mate) -- a PostgreSQL-specific migration tool with schema, logic, permissions, and ops migrations.",
 }
 
 func init() {
@@ -45,7 +44,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagSSLMode, "sslmode", "", "PostgreSQL SSL mode (env: PGSSLMODE, default: prefer)")
 	rootCmd.PersistentFlags().StringVar(&flagDatabaseURL, "database-url", "", "PostgreSQL connection URL (overrides individual flags)")
 	rootCmd.PersistentFlags().StringVar(&flagMigrationsDir, "migrations-dir", "migrations", "Path to migrations directory")
-	rootCmd.PersistentFlags().StringVar(&flagTargetSchema, "schema", "public", "Target schema for S__ migrations")
+	// --schema flag removed: PG schema is now derived from schema/{pg_schema}/ subfolder
 	rootCmd.PersistentFlags().BoolVar(&flagJSON, "json", false, "Output in JSON format")
 }
 
@@ -128,7 +127,6 @@ func connectAndBuildEngine(ctx context.Context) (*pgx.Conn, *engine.Engine, func
 	logger := slog.Default()
 	eng := engine.New(conn, sqlDB, differ, &engine.Config{
 		MigrationsDir: flagMigrationsDir,
-		TargetSchema:  flagTargetSchema,
 		ConnStr:       connStr,
 	}, logger)
 

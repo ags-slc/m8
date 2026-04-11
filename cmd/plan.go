@@ -38,7 +38,7 @@ var planCmd = &cobra.Command{
 }
 
 func hasPending(r *engine.ApplyResult) bool {
-	for _, v := range r.Versioned {
+	for _, v := range r.Ops {
 		if !v.Skipped {
 			return true
 		}
@@ -48,8 +48,13 @@ func hasPending(r *engine.ApplyResult) bool {
 			return true
 		}
 	}
-	for _, rep := range r.Repeatable {
-		if !rep.Skipped {
+	for _, v := range r.Logic {
+		if !v.Skipped {
+			return true
+		}
+	}
+	for _, v := range r.Permissions {
+		if !v.Skipped {
 			return true
 		}
 	}

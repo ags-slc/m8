@@ -2,7 +2,7 @@
 
 PostgreSQL migration tool. Mate for your database.
 
-m8 is a PostgreSQL-specific migration tool with three migration types -- versioned, repeatable, and schema (declarative) -- built as a single static binary.
+m8 is a PostgreSQL-specific migration tool with four migration types -- schema, logic, permissions, and ops -- built as a single static binary.
 
 ## Installation
 
@@ -38,37 +38,48 @@ m8 status --database mydb --user postgres
 m8 baseline --all --database mydb --user postgres
 ```
 
-## Migration Files
+## Migration Layout
 
-Place SQL files in a `migrations/` directory (configurable with `--migrations-dir`):
+Organize SQL files in four directories:
 
 ```
 migrations/
-├── V20260411_001__create_extensions.sql       # Versioned: run once, in order
-├── V20260411_002__create_schemas.sql          # Versioned: run once, in order
-├── S__users.sql                               # Schema: desired state, auto-diffed
-├── S__orders.sql                              # Schema: desired state, auto-diffed
-├── R__proc_refresh_invoice_detail.sql         # Repeatable: re-run on change
-├── R__grants.sql                              # Repeatable: re-run on change
-└── R__cron_schedules.sql                      # Repeatable: re-run on change
+├── schema/                                    # Desired state (auto-diffed)
+│   ├── public/                                # ← PostgreSQL schema name
+│   │   ├── users.sql
+│   │   └── orders.sql
+│   └── materialized/
+│       ├── rpt_invoice_detail.sql
+│       └── rpt_order_detail.sql
+├── logic/                                     # Re-applied on change
+│   ├── proc_refresh_invoice_detail.sql
+│   ├── proc_refresh_invoice_summary.sql
+│   └── view_payout_summary.sql
+├── permissions/                               # Re-applied on change
+│   ├── grants_materialized.sql
+│   └── default_privileges.sql
+└── ops/                                       # One-time, sequential
+    ├── 20260411_001__create_extensions.sql
+    └── 20260411_002__create_hypertables.sql
 ```
 
 ### Migration Types
 
-| Type | Prefix | Behavior | Use for |
+| Type | Folder | Behavior | Use for |
 |------|--------|----------|---------|
-| **Versioned** | `V{timestamp}__` | Run once in order, tracked by checksum | One-time DDL (extensions, schemas, data migrations) |
-| **Schema** | `S__` | Desired state diffed against live DB, auto-generates ALTER | Tables, indexes, constraints (things that need ALTER) |
-| **Repeatable** | `R__` | Re-run whenever file content changes | Procedures, functions, views, grants, pg_cron schedules |
+| **Schema** | `schema/{pg_schema}/` | Desired state diffed against live DB per PG schema | Tables, indexes, constraints |
+| **Logic** | `logic/` | Re-run whenever file content changes | Procedures, functions, views, triggers, pg_cron |
+| **Permissions** | `permissions/` | Re-run whenever file content changes | Grants, revokes, roles, default privileges |
+| **Ops** | `ops/` | Run once in timestamp order | Extensions, hypertables, data migrations |
 
-**Apply order:** Versioned -> Schema -> Repeatable
+**Apply order:** Ops → Schema → Logic → Permissions
 
-### Schema Migrations (S__)
+### Schema Migrations
 
-Edit the desired state, m8 figures out the diff:
+The `schema/` folder mirrors your PostgreSQL schemas. Each subfolder targets a specific PG schema:
 
 ```sql
--- S__users.sql
+-- schema/public/users.sql
 CREATE TABLE users (
     id         BIGSERIAL PRIMARY KEY,
     email      TEXT NOT NULL,
@@ -81,7 +92,7 @@ CREATE INDEX idx_users_email ON users (email);
 Add a column? Just edit the file:
 
 ```sql
--- S__users.sql (updated)
+-- schema/public/users.sql (updated)
 CREATE TABLE users (
     id         BIGSERIAL PRIMARY KEY,
     email      TEXT NOT NULL,
@@ -97,10 +108,23 @@ m8 computes the minimal ALTER statements automatically using [pg-schema-diff](ht
 
 ```
 $ m8 plan
-Schema migrations:
-  ~ S__users.sql
-    ALTER TABLE users ADD COLUMN phone TEXT;
-    CREATE INDEX CONCURRENTLY idx_users_phone ON users (phone);
+Plan: 1 migration(s) to apply.
+
+  ~ schema/public/users.sql (schema)
+    ALTER TABLE "public"."users" ADD COLUMN "phone" text
+    CREATE INDEX CONCURRENTLY idx_users_phone ON public.users USING btree (phone)
+    ⚠ INDEX_BUILD
+```
+
+### Legacy Flat Layout
+
+m8 also supports a flat directory with prefixed filenames for backward compatibility:
+
+```
+migrations/
+├── V20260411_001__create_extensions.sql    # V__ = ops
+├── S__users.sql                           # S__ = schema (defaults to public)
+└── R__grants.sql                          # R__ = logic
 ```
 
 ## SQL Directives
