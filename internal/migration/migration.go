@@ -16,10 +16,10 @@ type Type int
 const (
 	// TypeVersioned migrations run once, tracked by version.
 	TypeVersioned Type = iota
-	// TypeRepeatable migrations re-run when their content changes.
-	TypeRepeatable
 	// TypeSchema migrations are declarative desired-state files, auto-diffed against the live database.
 	TypeSchema
+	// TypeRepeatable migrations re-run when their content changes.
+	TypeRepeatable
 )
 
 // String returns the type name for display and database storage.
@@ -48,7 +48,7 @@ type Migration struct {
 }
 
 var (
-	versionedPattern  = regexp.MustCompile(`^V(\d+)__(.+)\.sql$`)
+	versionedPattern  = regexp.MustCompile(`^V(\d+(?:_\d+)*)__(.+)\.sql$`)
 	repeatablePattern = regexp.MustCompile(`^R__(.+)\.sql$`)
 	schemaPattern     = regexp.MustCompile(`^S__(.+)\.sql$`)
 )
