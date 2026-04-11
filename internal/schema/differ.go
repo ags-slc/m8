@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -69,11 +70,16 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 		return nil, fmt.Errorf("failed to generate schema diff: %w", err)
 	}
 
-	result := &DiffResult{
-		HasChanges: len(plan.Statements) > 0,
-	}
+	// Extract the object names defined in the desired DDL so we can filter
+	// the diff to only include statements targeting those objects.
+	definedObjects := extractDefinedObjects(desiredDDL)
+
+	result := &DiffResult{}
 
 	for _, stmt := range plan.Statements {
+		if !statementTargetsDefinedObject(stmt.DDL, definedObjects) {
+			continue
+		}
 		ds := DiffStatement{
 			DDL:         stmt.DDL,
 			Timeout:     stmt.Timeout,
@@ -85,7 +91,89 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 		result.Statements = append(result.Statements, ds)
 	}
 
+	result.HasChanges = len(result.Statements) > 0
 	return result, nil
+}
+
+var (
+	// Matches: CREATE TABLE [IF NOT EXISTS] [schema.]tablename
+	createTableRe = regexp.MustCompile(`(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:"?\w+"?\.)?("?\w+"?)`)
+	// Matches: CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] indexname
+	createIndexRe = regexp.MustCompile(`(?i)CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?(?:IF\s+NOT\s+EXISTS\s+)?("?\w+"?)`)
+)
+
+// extractDefinedObjects parses the desired DDL statements and returns the set
+// of object names (tables, indexes) that are explicitly defined. Names are
+// stored unquoted and lowercased for case-insensitive matching.
+func extractDefinedObjects(ddlStatements []string) map[string]bool {
+	objects := make(map[string]bool)
+	combined := strings.Join(ddlStatements, "\n")
+
+	for _, m := range createTableRe.FindAllStringSubmatch(combined, -1) {
+		name := strings.Trim(m[1], `"`)
+		objects[strings.ToLower(name)] = true
+	}
+	for _, m := range createIndexRe.FindAllStringSubmatch(combined, -1) {
+		name := strings.Trim(m[1], `"`)
+		objects[strings.ToLower(name)] = true
+	}
+	return objects
+}
+
+// statementTargetsDefinedObject returns true if the DDL statement modifies an
+// object that was defined in the S__ file. This prevents pg-schema-diff from
+// generating DROP/ALTER/REVOKE statements for unrelated objects that exist in
+// the live database but aren't mentioned in the desired DDL.
+func statementTargetsDefinedObject(ddl string, defined map[string]bool) bool {
+	lower := strings.ToLower(ddl)
+
+	// Always exclude m8 internal schema
+	if strings.Contains(lower, `"_m8"`) || strings.Contains(lower, `_m8.`) {
+		return false
+	}
+
+	// Exclude GRANT/REVOKE — privileges are managed by R__ migrations, not S__
+	if strings.HasPrefix(lower, "grant ") || strings.HasPrefix(lower, "revoke ") {
+		return false
+	}
+
+	// Check if any defined object name appears in the statement.
+	// pg-schema-diff quotes table names ("users") but not index names (idx_foo).
+	for name := range defined {
+		if strings.Contains(lower, `"`+name+`"`) {
+			return true
+		}
+		if containsWord(lower, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// containsWord checks if s contains word as a whole word (not a substring of
+// a longer identifier). Uses simple boundary checking on adjacent characters.
+func containsWord(s, word string) bool {
+	for i := 0; i <= len(s)-len(word); i++ {
+		if s[i:i+len(word)] != word {
+			continue
+		}
+		// Check character before
+		if i > 0 && isIdentChar(s[i-1]) {
+			continue
+		}
+		// Check character after
+		end := i + len(word)
+		if end < len(s) && isIdentChar(s[end]) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isIdentChar(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '_'
 }
 
 // replaceDBName replaces the database name in a PostgreSQL connection string.
