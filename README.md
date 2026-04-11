@@ -2,7 +2,49 @@
 
 PostgreSQL migration tool. Mate for your database.
 
-m8 is a PostgreSQL-specific migration tool with four migration types -- schema, logic, permissions, and ops -- built as a single static binary.
+m8 is a PostgreSQL-specific migration tool built as a single static Go binary. It organizes migrations into four directories -- **schema**, **logic**, **permissions**, and **ops** -- each with behavior matched to the type of database object it manages.
+
+## Why m8?
+
+Every existing migration tool requires escape hatches for real-world PostgreSQL deployments. m8 was built after evaluating pg_schema, Atlas, pgroll, Sqitch, Flyway, dbmate, and golang-migrate -- and finding that none could handle the full surface area of a PostgreSQL database using TimescaleDB, pg_cron, extensions, and CDC-replicated schemas without a sidecar system.
+
+### How m8 compares
+
+| Feature | m8 | pg_schema | Atlas | pgroll | Sqitch | Flyway | dbmate |
+|---------|-----|-----------|-------|--------|--------|--------|--------|
+| Declarative schema diffing | Yes | Yes | Yes | No | No | No | No |
+| Native SQL (no DSL) | Yes | Yes | Partial (HCL) | No (JSON) | Yes | Yes | Yes |
+| Extensions / TimescaleDB | Yes | No | Pro only | Escape hatch | Yes | Yes | Yes |
+| Repeatable migrations | Yes | No | No | No | No | Yes | No |
+| Advisory locking | Yes | No | No | No | Yes | No | No |
+| Checksum tracking | Yes | No | Yes | No | Yes | Yes | No |
+| Single static binary | Yes | Yes | Yes | Yes | No (Perl) | No (JVM) | Yes |
+| Fully open source | Yes | Yes | Open-core | Yes | Yes | Open-core | Yes |
+| PostgreSQL-only | Yes | Yes | No (16+ DBs) | Yes | No | No | No |
+
+### What's wrong with the alternatives?
+
+**pg_schema** cannot manage `CREATE EXTENSION`, `CREATE SCHEMA`, `CREATE ROLE`, pg_cron, or any TimescaleDB DDL. No custom SQL hooks. Would cover ~40% of the migration surface area.
+
+**Atlas** is open-core with an accelerating paywall -- extension support is Pro-only, linting moved to paid in Oct 2025. Multi-database design means PostgreSQL-specific features aren't first-class.
+
+**pgroll** requires all migrations in JSON/YAML DSL. The raw SQL escape hatch loses zero-downtime guarantees. Write amplification from bidirectional triggers. Overkill for databases that don't need rolling deployments.
+
+**Sqitch** has the best design of any migration tool -- but it's written in Perl with a deep CPAN dependency tree. Homebrew installs break on Perl upgrades. No dry-run mode. No single-binary distribution.
+
+**Flyway** requires a JVM. Undo/rollback is paywalled. Multi-database, so PostgreSQL-specific features aren't prioritized.
+
+**dbmate** and **golang-migrate** are simple and lightweight but lack declarative diffing, repeatable migrations, advisory locking, and checksums.
+
+### What m8 takes from each
+
+| Source | What m8 adopted |
+|--------|----------------|
+| **Sqitch** | Native SQL, advisory locking, in-database state tracking, named targets |
+| **Flyway** | Repeatable migrations (re-run on content change) |
+| **pg-schema-diff** (Stripe) | Auto `CREATE INDEX CONCURRENTLY`, `NOT VALID` constraints, hazard warnings |
+| **dbmate** | `.env` file loading, clean CLI design |
+| **pgroll** | Brownfield adoption (`m8 sync`), in-database state with no external files |
 
 ## Installation
 
@@ -35,7 +77,16 @@ m8 apply --database mydb --user postgres
 m8 status --database mydb --user postgres
 
 # Adopt m8 on an existing database
+m8 sync --database mydb --user postgres
+
+# Mark all files as applied without running them
 m8 baseline --all --database mydb --user postgres
+
+# Scaffold a new migration file
+m8 new schema public/users
+m8 new logic proc_refresh_invoices
+m8 new permissions grants_readonly
+m8 new ops "create extensions"
 ```
 
 ## Migration Layout
@@ -116,16 +167,11 @@ Plan: 1 migration(s) to apply.
     ⚠ INDEX_BUILD
 ```
 
-### Legacy Flat Layout
+### Safe by Default
 
-m8 also supports a flat directory with prefixed filenames for backward compatibility:
+m8 only manages objects you declare. Tables, procedures, and grants that exist in the database but aren't in your migration files are never touched -- never dropped, never altered.
 
-```
-migrations/
-├── V20260411_001__create_extensions.sql    # V__ = ops
-├── S__users.sql                           # S__ = schema (defaults to public)
-└── R__grants.sql                          # R__ = logic
-```
+Use `--strict` to opt in to exact-match mode, where schema diffs include DROP statements for undeclared objects.
 
 ## SQL Directives
 
@@ -141,6 +187,20 @@ CREATE INDEX CONCURRENTLY idx_users_email ON users (email);
 ALTER TABLE large_table ADD COLUMN new_col TEXT;
 ```
 
+m8 also auto-detects `CREATE INDEX CONCURRENTLY` and runs those migrations outside a transaction automatically.
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `m8 apply` | Apply pending migrations (ops → schema → logic → permissions) |
+| `m8 plan` | Show what would be applied without making changes (exit code 2 if pending) |
+| `m8 status` | Show applied, pending, changed, and drifted migrations |
+| `m8 sync` | One-time convergence for brownfield adoption |
+| `m8 baseline` | Mark migrations as applied without running them |
+| `m8 new` | Scaffold a new migration file in the correct folder |
+| `m8 version` | Print version information |
+
 ## Environment Variables
 
 m8 supports standard PostgreSQL environment variables and `.env` files:
@@ -154,10 +214,6 @@ m8 supports standard PostgreSQL environment variables and `.env` files:
 | `PGPASSWORD` | `--password` | -- |
 | `PGSSLMODE` | `--sslmode` | prefer |
 | `DATABASE_URL` | `--database-url` | -- |
-
-## Design
-
-See the [Architecture Decision Record](https://github.com/ags-slc/data-hub/blob/main/docs/adr-002-custom-migration-tool-m8.md) for design rationale and alternatives analysis.
 
 ## License
 
