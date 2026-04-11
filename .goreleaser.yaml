@@ -11,9 +11,9 @@ builds:
       - arm64
     ldflags:
       - -s -w
-      - -X github.com/Zonos/m8/cmd.version={{.Version}}
-      - -X github.com/Zonos/m8/cmd.commit={{.ShortCommit}}
-      - -X github.com/Zonos/m8/cmd.date={{.Date}}
+      - -X github.com/ags-slc/m8/cmd.version={{.Version}}
+      - -X github.com/ags-slc/m8/cmd.commit={{.ShortCommit}}
+      - -X github.com/ags-slc/m8/cmd.date={{.Date}}
 
 archives:
   - format: tar.gz
@@ -32,10 +32,10 @@ changelog:
 
 brews:
   - repository:
-      owner: Zonos
+      owner: ags-slc
       name: homebrew-tap
     name: m8
-    homepage: "https://github.com/Zonos/m8"
+    homepage: "https://github.com/ags-slc/m8"
     description: "PostgreSQL migration tool"
     install: |
       bin.install "m8"

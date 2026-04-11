@@ -10,7 +10,7 @@ ARG COMMIT=none
 ARG DATE=unknown
 
 RUN CGO_ENABLED=0 go build \
-    -ldflags "-s -w -X github.com/Zonos/m8/cmd.version=${VERSION} -X github.com/Zonos/m8/cmd.commit=${COMMIT} -X github.com/Zonos/m8/cmd.date=${DATE}" \
+    -ldflags "-s -w -X github.com/ags-slc/m8/cmd.version=${VERSION} -X github.com/ags-slc/m8/cmd.commit=${COMMIT} -X github.com/ags-slc/m8/cmd.date=${DATE}" \
     -o /m8 .
 
 FROM alpine:3.21

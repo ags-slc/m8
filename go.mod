@@ -1,4 +1,4 @@
-module github.com/Zonos/m8
+module github.com/ags-slc/m8
 
 go 1.26.1
 

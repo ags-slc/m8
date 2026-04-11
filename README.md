@@ -9,18 +9,18 @@ m8 is a PostgreSQL-specific migration tool with three migration types -- version
 ### Homebrew (macOS/Linux)
 
 ```bash
-brew install Zonos/tap/m8
+brew install ags-slc/tap/m8
 ```
 
 ### Go
 
 ```bash
-go install github.com/Zonos/m8@latest
+go install github.com/ags-slc/m8@latest
 ```
 
 ### Binary
 
-Download from [GitHub Releases](https://github.com/Zonos/m8/releases).
+Download from [GitHub Releases](https://github.com/ags-slc/m8/releases).
 
 ## Quick Start
 
@@ -133,7 +133,7 @@ m8 supports standard PostgreSQL environment variables and `.env` files:
 
 ## Design
 
-See the [Architecture Decision Record](https://github.com/Zonos/data-hub/blob/main/docs/adr-002-custom-migration-tool-m8.md) for design rationale and alternatives analysis.
+See the [Architecture Decision Record](https://github.com/ags-slc/data-hub/blob/main/docs/adr-002-custom-migration-tool-m8.md) for design rationale and alternatives analysis.
 
 ## License
 

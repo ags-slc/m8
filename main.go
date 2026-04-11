@@ -1,6 +1,6 @@
 package main
 
-import "github.com/Zonos/m8/cmd"
+import "github.com/ags-slc/m8/cmd"
 
 func main() {
 	cmd.Execute()
