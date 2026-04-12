@@ -30,14 +30,17 @@ changelog:
       - "^test:"
       - "^chore:"
 
-brews:
-  - repository:
-      owner: ags-slc
-      name: homebrew-tap
-    name: m8
-    homepage: "https://github.com/ags-slc/m8"
-    description: "PostgreSQL migration tool"
-    install: |
-      bin.install "m8"
-    test: |
-      system "#{bin}/m8", "version"
+# Homebrew tap requires a PAT with repo scope.
+# Set HOMEBREW_TAP_GITHUB_TOKEN secret and uncomment:
+# brews:
+#   - repository:
+#       owner: ags-slc
+#       name: homebrew-tap
+#       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+#     name: m8
+#     homepage: "https://github.com/ags-slc/m8"
+#     description: "PostgreSQL migration tool"
+#     install: |
+#       bin.install "m8"
+#     test: |
+#       system "#{bin}/m8", "version"
