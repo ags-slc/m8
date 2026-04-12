@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -174,21 +175,40 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		}
 	}
 
-	// Phase B: Schema — diff each against live DB
-	for _, m := range filterByType(all, migration.TypeSchema) {
-		sr := SchemaResult{Migration: m}
-		if e.differ != nil {
-			ddl := []string{string(m.Content)}
-			diffResult, err := e.differ.Diff(ctx, e.sqlDB, m.PGSchema, ddl, e.config.Strict)
+	// Phase B: Schema — group by PG schema and diff combined DDL
+	schemaMigrations := filterByType(all, migration.TypeSchema)
+	if e.differ != nil {
+		grouped := groupByPGSchema(schemaMigrations)
+		for pgSchema, migrations := range grouped {
+			var combinedDDL []string
+			for _, m := range migrations {
+				combinedDDL = append(combinedDDL, string(m.Content))
+			}
+			diffResult, err := e.differ.Diff(ctx, e.sqlDB, pgSchema, combinedDDL, e.config.Strict)
 			if err != nil {
-				sr.Error = err
+				// Report error on the first migration in the group
+				for _, m := range migrations {
+					result.Schema = append(result.Schema, SchemaResult{Migration: m, Error: err})
+				}
 			} else {
-				diffResult.Name = m.Name
-				sr.Diff = diffResult
-				sr.Skipped = !diffResult.HasChanges
+				diffResult.Name = pgSchema
+				// Assign the combined diff to the first migration, mark rest as skipped
+				for i, m := range migrations {
+					sr := SchemaResult{Migration: m}
+					if i == 0 {
+						sr.Diff = diffResult
+						sr.Skipped = !diffResult.HasChanges
+					} else {
+						sr.Skipped = true
+					}
+					result.Schema = append(result.Schema, sr)
+				}
 			}
 		}
-		result.Schema = append(result.Schema, sr)
+	} else {
+		for _, m := range schemaMigrations {
+			result.Schema = append(result.Schema, SchemaResult{Migration: m, Skipped: true})
+		}
 	}
 
 	// Phase C: Logic — find changed checksums
@@ -438,25 +458,32 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 	}
 
 	var results []SchemaResult
-	for _, m := range migrations {
-		sr := SchemaResult{Migration: m}
-		ddl := []string{string(m.Content)}
-		diffResult, err := e.differ.Diff(ctx, e.sqlDB, m.PGSchema, ddl, e.config.Strict)
-		if err != nil {
-			sr.Error = err
-			results = append(results, sr)
-			return results, fmt.Errorf("schema diff failed for %s: %w", m.Filename, err)
+
+	// Group by PG schema and diff combined DDL (FK references across files need this)
+	grouped := groupByPGSchema(migrations)
+	for pgSchema, pgMigrations := range grouped {
+		var combinedDDL []string
+		for _, m := range pgMigrations {
+			combinedDDL = append(combinedDDL, string(m.Content))
 		}
-		diffResult.Name = m.Name
-		sr.Diff = diffResult
+
+		diffResult, err := e.differ.Diff(ctx, e.sqlDB, pgSchema, combinedDDL, e.config.Strict)
+		if err != nil {
+			for _, m := range pgMigrations {
+				results = append(results, SchemaResult{Migration: m, Error: err})
+			}
+			return results, fmt.Errorf("schema diff failed for %s: %w", pgSchema, err)
+		}
+		diffResult.Name = pgSchema
 
 		if !diffResult.HasChanges {
-			sr.Skipped = true
-			results = append(results, sr)
+			for _, m := range pgMigrations {
+				results = append(results, SchemaResult{Migration: m, Skipped: true})
+			}
 			continue
 		}
 
-		pgSchema := &m.PGSchema
+		// Apply the combined diff and record against each migration file
 		start := time.Now()
 		for i, stmt := range diffResult.Statements {
 			if stmt.LockTimeout > 0 {
@@ -466,18 +493,29 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 				_, _ = e.conn.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", stmt.Timeout.Milliseconds()))
 			}
 			if _, err := e.conn.Exec(ctx, stmt.DDL); err != nil {
-				sr.ExecMs = time.Since(start).Milliseconds()
-				sr.Error = fmt.Errorf("statement %d failed: %w\nDDL: %s", i+1, err, stmt.DDL)
-				_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), pgSchema, m.Checksum, sr.ExecMs, false)
-				results = append(results, sr)
-				return results, fmt.Errorf("schema migration %s failed: %w", m.Filename, sr.Error)
+				execMs := time.Since(start).Milliseconds()
+				errMsg := fmt.Errorf("statement %d failed: %w\nDDL: %s", i+1, err, stmt.DDL)
+				for _, m := range pgMigrations {
+					ps := pgSchema
+					_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), &ps, m.Checksum, execMs, false)
+					results = append(results, SchemaResult{Migration: m, ExecMs: execMs, Error: errMsg})
+				}
+				return results, fmt.Errorf("schema migration for %s failed: %w", pgSchema, errMsg)
 			}
 		}
-		sr.ExecMs = time.Since(start).Milliseconds()
-		sr.Applied = true
-		_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), pgSchema, m.Checksum, sr.ExecMs, true)
-		e.logger.Info("applied", "file", m.Filename, "type", "schema", "ms", sr.ExecMs, "statements", len(diffResult.Statements))
-		results = append(results, sr)
+		execMs := time.Since(start).Milliseconds()
+
+		// Record success for all migrations in this PG schema group
+		for i, m := range pgMigrations {
+			ps := pgSchema
+			_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), &ps, m.Checksum, execMs, true)
+			sr := SchemaResult{Migration: m, ExecMs: execMs, Applied: true}
+			if i == 0 {
+				sr.Diff = diffResult
+			}
+			results = append(results, sr)
+		}
+		e.logger.Info("applied", "pg_schema", pgSchema, "type", "schema", "ms", execMs, "statements", len(diffResult.Statements))
 	}
 	return results, nil
 }
@@ -590,6 +628,26 @@ func (e *Engine) releaseLock(ctx context.Context) {
 }
 
 // --- helpers ---
+
+func groupByPGSchema(migrations []*migration.Migration) map[string][]*migration.Migration {
+	grouped := make(map[string][]*migration.Migration)
+	for _, m := range migrations {
+		grouped[m.PGSchema] = append(grouped[m.PGSchema], m)
+	}
+	// Sort within each group: tables without REFERENCES before tables with REFERENCES
+	// so FK targets exist when creating referencing tables in the temp DB.
+	for _, group := range grouped {
+		sort.SliceStable(group, func(i, j int) bool {
+			iFK := strings.Contains(strings.ToLower(string(group[i].Content)), "references")
+			jFK := strings.Contains(strings.ToLower(string(group[j].Content)), "references")
+			if iFK != jFK {
+				return !iFK
+			}
+			return false
+		})
+	}
+	return grouped
+}
 
 func filterByType(migrations []*migration.Migration, typ migration.Type) []*migration.Migration {
 	var result []*migration.Migration
