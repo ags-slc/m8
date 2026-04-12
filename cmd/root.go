@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/ags-slc/m8/internal/config"
 	"github.com/ags-slc/m8/internal/engine"
 	"github.com/ags-slc/m8/internal/schema"
 	"github.com/jackc/pgx/v5"
@@ -61,30 +62,49 @@ func Execute() {
 	}
 }
 
-// resolveConnStr builds a PostgreSQL connection string from flags, env vars, and defaults.
+// loadConfig loads .m8.yaml from the current directory (if it exists).
+func loadConfig() *config.Config {
+	cfg, err := config.Load(".m8.yaml")
+	if err != nil {
+		slog.Warn("failed to load .m8.yaml", "error", err)
+		return &config.Config{}
+	}
+	return cfg
+}
+
+// resolveConnStr builds a PostgreSQL connection string.
+// Priority: flag > env > .m8.yaml > default
 func resolveConnStr() string {
-	// --database-url or DATABASE_URL takes highest priority
+	cfg := loadConfig()
+
+	// --database-url or DATABASE_URL or config takes highest priority
 	if flagDatabaseURL != "" {
 		return flagDatabaseURL
 	}
 	if url := os.Getenv("DATABASE_URL"); url != "" {
 		return url
 	}
+	if cfg.DatabaseURL != "" {
+		return cfg.DatabaseURL
+	}
 
-	host := coalesce(flagHost, os.Getenv("PGHOST"), "localhost")
+	host := coalesce(flagHost, os.Getenv("PGHOST"), cfg.Host, "localhost")
 	port := flagPort
 	if port == 0 {
 		if p := os.Getenv("PGPORT"); p != "" {
 			fmt.Sscanf(p, "%d", &port)
 		}
+		if port == 0 && cfg.Port > 0 {
+			port = cfg.Port
+		}
 		if port == 0 {
 			port = 5432
 		}
 	}
-	database := coalesce(flagDatabase, os.Getenv("PGDATABASE"), "")
-	user := coalesce(flagUser, os.Getenv("PGUSER"), "")
-	password := coalesce(flagPassword, os.Getenv("PGPASSWORD"), "")
-	sslmode := coalesce(flagSSLMode, os.Getenv("PGSSLMODE"), "prefer")
+	database := coalesce(flagDatabase, os.Getenv("PGDATABASE"), cfg.Database, "")
+	user := coalesce(flagUser, os.Getenv("PGUSER"), cfg.User, "")
+	password := coalesce(flagPassword, os.Getenv("PGPASSWORD"), cfg.Password, "")
+	sslmode := coalesce(flagSSLMode, os.Getenv("PGSSLMODE"), cfg.SSLMode, "prefer")
 
 	connStr := fmt.Sprintf("host=%s port=%d sslmode=%s", host, port, sslmode)
 	if database != "" {
@@ -97,6 +117,27 @@ func resolveConnStr() string {
 		connStr += fmt.Sprintf(" password=%s", password)
 	}
 	return connStr
+}
+
+// resolveMigrationsDir returns the migrations directory from flag or config.
+func resolveMigrationsDir() string {
+	cfg := loadConfig()
+	if flagMigrationsDir != "migrations" {
+		return flagMigrationsDir // explicit flag overrides
+	}
+	if cfg.MigrationsDir != "" {
+		return cfg.MigrationsDir
+	}
+	return flagMigrationsDir
+}
+
+// resolveStrict returns the strict setting from flag or config.
+func resolveStrict() bool {
+	if flagStrict {
+		return true
+	}
+	cfg := loadConfig()
+	return cfg.Strict
 }
 
 // connectAndBuildEngine creates a pgx connection, sql.DB, schema differ, and engine.
@@ -127,9 +168,9 @@ func connectAndBuildEngine(ctx context.Context) (*pgx.Conn, *engine.Engine, func
 
 	logger := slog.Default()
 	eng := engine.New(conn, sqlDB, differ, &engine.Config{
-		MigrationsDir: flagMigrationsDir,
+		MigrationsDir: resolveMigrationsDir(),
 		ConnStr:       connStr,
-		Strict:        flagStrict,
+		Strict:        resolveStrict(),
 	}, logger)
 
 	cleanup := func() {

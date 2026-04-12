@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/ags-slc/m8/internal/dump"
 	"github.com/jackc/pgx/v5"
@@ -17,16 +18,18 @@ var (
 
 var dumpCmd = &cobra.Command{
 	Use:   "dump",
-	Short: "Export database schema to migration files",
-	Long: `Introspects the live database and generates schema/ files with CREATE TABLE
-statements for each table. Use this to bootstrap m8 on an existing database.
+	Short: "Export database objects to migration files",
+	Long: `Introspects the live database and generates files in the m8 folder layout:
+  schema/{pg_schema}/  — CREATE TABLE for each table
+  logic/               — CREATE OR REPLACE FUNCTION/PROCEDURE/VIEW
+  permissions/         — GRANT statements
 
-By default, exports all user schemas. Use --schema to limit to specific schemas.
+Use this to bootstrap m8 on an existing database.
 
 Examples:
   m8 dump --database mydb --user postgres
   m8 dump --database mydb --user postgres --schema public --schema materialized
-  m8 dump --database mydb --user postgres --stdout  # print to stdout instead of files`,
+  m8 dump --database mydb --user postgres --stdout`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 		connStr := resolveConnStr()
@@ -39,7 +42,6 @@ Examples:
 
 		d := dump.NewDumper(conn)
 
-		// Determine which schemas to dump
 		schemas := dumpSchemas
 		if len(schemas) == 0 {
 			var err error
@@ -49,16 +51,13 @@ Examples:
 			}
 		}
 
-		totalTables := 0
+		var totalTables, totalLogic, totalPerms int
 
 		for _, schema := range schemas {
+			// --- Tables → schema/{pg_schema}/*.sql ---
 			tables, err := d.ListTables(ctx, schema)
 			if err != nil {
 				return fmt.Errorf("failed to list tables in %s: %w", schema, err)
-			}
-
-			if len(tables) == 0 {
-				continue
 			}
 
 			for _, tableName := range tables {
@@ -70,29 +69,116 @@ Examples:
 				ddl := dump.RenderDDL(table)
 
 				if dumpStdout {
-					fmt.Printf("-- %s.%s\n%s\n", schema, tableName, ddl)
+					fmt.Printf("-- schema/%s/%s.sql\n%s\n", schema, tableName, ddl)
 				} else {
-					dir := filepath.Join(flagMigrationsDir, "schema", schema)
-					if err := os.MkdirAll(dir, 0755); err != nil {
-						return fmt.Errorf("failed to create directory %s: %w", dir, err)
+					if err := writeFile(filepath.Join(flagMigrationsDir, "schema", schema), tableName+".sql", ddl); err != nil {
+						return err
 					}
-					filePath := filepath.Join(dir, tableName+".sql")
-					if err := os.WriteFile(filePath, []byte(ddl), 0644); err != nil {
-						return fmt.Errorf("failed to write %s: %w", filePath, err)
-					}
-					fmt.Printf("  %s\n", filePath)
+				}
+				totalTables++
+			}
+
+			// --- Functions/Procedures → logic/*.sql ---
+			funcs, err := d.ListFunctions(ctx, schema)
+			if err != nil {
+				return fmt.Errorf("failed to list functions in %s: %w", schema, err)
+			}
+
+			for _, f := range funcs {
+				rendered := dump.RenderFunction(&f)
+				filename := f.Name + ".sql"
+				// Prefix with schema if not public to avoid collisions
+				if schema != "public" {
+					filename = schema + "_" + f.Name + ".sql"
 				}
 
-				totalTables++
+				if dumpStdout {
+					fmt.Printf("-- logic/%s\n%s\n", filename, rendered)
+				} else {
+					if err := writeFile(filepath.Join(flagMigrationsDir, "logic"), filename, rendered); err != nil {
+						return err
+					}
+				}
+				totalLogic++
+			}
+
+			// --- Views → logic/*.sql ---
+			views, err := d.ListViews(ctx, schema)
+			if err != nil {
+				return fmt.Errorf("failed to list views in %s: %w", schema, err)
+			}
+
+			for _, v := range views {
+				rendered := dump.RenderView(&v)
+				filename := v.Name + ".sql"
+				if schema != "public" {
+					filename = schema + "_" + v.Name + ".sql"
+				}
+
+				if dumpStdout {
+					fmt.Printf("-- logic/%s\n%s\n", filename, rendered)
+				} else {
+					if err := writeFile(filepath.Join(flagMigrationsDir, "logic"), filename, rendered); err != nil {
+						return err
+					}
+				}
+				totalLogic++
+			}
+
+			// --- Grants → permissions/grants_{schema}.sql ---
+			grants, err := d.ListGrants(ctx, schema)
+			if err != nil {
+				return fmt.Errorf("failed to list grants in %s: %w", schema, err)
+			}
+			publicGrants, err := d.ListPublicGrants(ctx, schema)
+			if err != nil {
+				return fmt.Errorf("failed to list public grants in %s: %w", schema, err)
+			}
+
+			allGrants := append(grants, publicGrants...)
+			if len(allGrants) > 0 {
+				rendered := dump.RenderGrants(allGrants, schema)
+				filename := "grants_" + schema + ".sql"
+
+				if dumpStdout {
+					fmt.Printf("-- permissions/%s\n%s\n", filename, rendered)
+				} else {
+					if err := writeFile(filepath.Join(flagMigrationsDir, "permissions"), filename, rendered); err != nil {
+						return err
+					}
+				}
+				totalPerms++
 			}
 		}
 
 		if !dumpStdout {
-			fmt.Printf("\nDumped %d tables across %d schemas.\n", totalTables, len(schemas))
+			parts := []string{}
+			if totalTables > 0 {
+				parts = append(parts, fmt.Sprintf("%d tables", totalTables))
+			}
+			if totalLogic > 0 {
+				parts = append(parts, fmt.Sprintf("%d logic objects", totalLogic))
+			}
+			if totalPerms > 0 {
+				parts = append(parts, fmt.Sprintf("%d permission files", totalPerms))
+			}
+			fmt.Printf("\nDumped %s across %d schemas.\n", strings.Join(parts, ", "), len(schemas))
 		}
 
 		return nil
 	},
+}
+
+func writeFile(dir, filename, content string) error {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+	}
+	filePath := filepath.Join(dir, filename)
+	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("failed to write %s: %w", filePath, err)
+	}
+	fmt.Printf("  %s\n", filePath)
+	return nil
 }
 
 func init() {

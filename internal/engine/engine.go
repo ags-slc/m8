@@ -114,8 +114,12 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 		return result, err
 	}
 
-	// Phase B: Schema
-	s, err := e.applySchema(ctx, filterByType(all, migration.TypeSchema))
+	// Phase B: Schema — ensure PG schemas exist, then diff and apply
+	schemaMigrations := filterByType(all, migration.TypeSchema)
+	if err := e.ensurePGSchemas(ctx, schemaMigrations); err != nil {
+		return result, err
+	}
+	s, err := e.applySchema(ctx, schemaMigrations)
 	result.Schema = s
 	if err != nil {
 		return result, err
@@ -175,8 +179,11 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		}
 	}
 
-	// Phase B: Schema — group by PG schema and diff combined DDL
+	// Phase B: Schema — ensure PG schemas exist, then diff combined DDL
 	schemaMigrations := filterByType(all, migration.TypeSchema)
+	if err := e.ensurePGSchemas(ctx, schemaMigrations); err != nil {
+		return nil, err
+	}
 	if e.differ != nil {
 		grouped := groupByPGSchema(schemaMigrations)
 		for pgSchema, migrations := range grouped {
@@ -368,8 +375,12 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 		e.logger.Info("baselined (sync)", "file", m.Filename, "type", "ops")
 	}
 
-	// Schema — diff and apply
-	s, err := e.applySchema(ctx, filterByType(all, migration.TypeSchema))
+	// Schema — ensure PG schemas exist, then diff and apply
+	syncSchemaMigrations := filterByType(all, migration.TypeSchema)
+	if err := e.ensurePGSchemas(ctx, syncSchemaMigrations); err != nil {
+		return result, err
+	}
+	s, err := e.applySchema(ctx, syncSchemaMigrations)
 	result.Schema = s
 	if err != nil {
 		return result, err
@@ -628,6 +639,25 @@ func (e *Engine) releaseLock(ctx context.Context) {
 }
 
 // --- helpers ---
+
+// ensurePGSchemas creates any PostgreSQL schemas referenced by schema/ subfolders
+// that don't already exist. This means you don't need an ops/ migration just to
+// CREATE SCHEMA — the folder structure implies it.
+func (e *Engine) ensurePGSchemas(ctx context.Context, migrations []*migration.Migration) error {
+	seen := make(map[string]bool)
+	for _, m := range migrations {
+		if m.PGSchema == "" || m.PGSchema == "public" || seen[m.PGSchema] {
+			continue
+		}
+		seen[m.PGSchema] = true
+		_, err := e.conn.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", m.PGSchema))
+		if err != nil {
+			return fmt.Errorf("failed to create schema %s: %w", m.PGSchema, err)
+		}
+		e.logger.Info("ensured schema exists", "pg_schema", m.PGSchema)
+	}
+	return nil
+}
 
 func groupByPGSchema(migrations []*migration.Migration) map[string][]*migration.Migration {
 	grouped := make(map[string][]*migration.Migration)
