@@ -39,9 +39,15 @@ type Differ struct {
 // DDL parsing.
 func NewDiffer(ctx context.Context, connStr string) (*Differ, error) {
 	factory, err := tempdb.NewOnInstanceFactory(ctx, func(ctx context.Context, dbName string) (*sql.DB, error) {
-		// Build a connection string pointing at the temp database
 		tempConnStr := replaceDBName(connStr, dbName)
-		return sql.Open("pgx", tempConnStr)
+		db, err := sql.Open("pgx", tempConnStr)
+		if err != nil {
+			return nil, err
+		}
+		// Disable statement_timeout so CREATE/DROP DATABASE don't get killed
+		// on connections with role-level timeouts configured.
+		_, _ = db.ExecContext(ctx, "SET statement_timeout = 0")
+		return db, nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp database factory: %w", err)

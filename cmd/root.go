@@ -155,6 +155,8 @@ func connectAndBuildEngine(ctx context.Context) (*pgx.Conn, *engine.Engine, func
 		conn.Close(ctx)
 		return nil, nil, nil, fmt.Errorf("failed to open sql.DB: %w", err)
 	}
+	// Disable statement_timeout for schema diffing operations (CREATE/DROP temp DBs)
+	sqlDB.ExecContext(ctx, "SET statement_timeout = 0")
 
 	// Schema differ (may fail if we lack CREATE DATABASE privilege — non-fatal)
 	var differ *schema.Differ

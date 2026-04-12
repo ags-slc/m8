@@ -460,8 +460,14 @@ func RenderDDL(t *Table) string {
 	b.WriteString(");\n")
 
 	// Indexes (non-constraint)
+	// Strip schema qualification from pg_get_indexdef() output so the DDL
+	// is portable across schema contexts (e.g., "ON materialized.table" → "ON table")
 	for _, idx := range t.Indexes {
-		fmt.Fprintf(&b, "\n%s;\n", idx.Definition)
+		def := idx.Definition
+		if t.Schema != "public" {
+			def = strings.ReplaceAll(def, t.Schema+".", "")
+		}
+		fmt.Fprintf(&b, "\n%s;\n", def)
 	}
 
 	return b.String()

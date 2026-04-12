@@ -188,12 +188,15 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		grouped := groupByPGSchema(schemaMigrations)
 		for pgSchema, migrations := range grouped {
 			var combinedDDL []string
+			// Ensure the PG schema exists in the temp DB for DDL parsing
+			if pgSchema != "public" {
+				combinedDDL = append(combinedDDL, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", pgSchema))
+			}
 			for _, m := range migrations {
 				combinedDDL = append(combinedDDL, string(m.Content))
 			}
 			diffResult, err := e.differ.Diff(ctx, e.sqlDB, pgSchema, combinedDDL, e.config.Strict)
 			if err != nil {
-				// Report error on the first migration in the group
 				for _, m := range migrations {
 					result.Schema = append(result.Schema, SchemaResult{Migration: m, Error: err})
 				}
@@ -474,6 +477,9 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 	grouped := groupByPGSchema(migrations)
 	for pgSchema, pgMigrations := range grouped {
 		var combinedDDL []string
+		if pgSchema != "public" {
+			combinedDDL = append(combinedDDL, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", pgSchema))
+		}
 		for _, m := range pgMigrations {
 			combinedDDL = append(combinedDDL, string(m.Content))
 		}
