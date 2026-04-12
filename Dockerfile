@@ -17,3 +17,4 @@ FROM alpine:3.21
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /m8 /usr/local/bin/m8
 ENTRYPOINT ["m8"]
+
