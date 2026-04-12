@@ -40,7 +40,7 @@ Every existing migration tool requires escape hatches for real-world PostgreSQL 
 
 | Source | What m8 adopted |
 |--------|----------------|
-| **Sqitch** | Native SQL, advisory locking, in-database state tracking, named targets |
+| **Sqitch** | Native SQL, advisory locking, in-database state tracking |
 | **Flyway** | Repeatable migrations (re-run on content change) |
 | **pg-schema-diff** (Stripe) | Auto `CREATE INDEX CONCURRENTLY`, `NOT VALID` constraints, hazard warnings |
 | **dbmate** | `.env` file loading, clean CLI design |
@@ -67,6 +67,9 @@ Download from [GitHub Releases](https://github.com/ags-slc/m8/releases).
 ## Quick Start
 
 ```bash
+# Bootstrap from an existing database
+m8 dump --database mydb --user postgres
+
 # Show what would be applied
 m8 plan --database mydb --user postgres
 
@@ -76,11 +79,8 @@ m8 apply --database mydb --user postgres
 # Show migration status
 m8 status --database mydb --user postgres
 
-# Adopt m8 on an existing database
+# One-time convergence for brownfield adoption
 m8 sync --database mydb --user postgres
-
-# Mark all files as applied without running them
-m8 baseline --all --database mydb --user postgres
 
 # Scaffold a new migration file
 m8 new schema public/users
@@ -127,7 +127,7 @@ migrations/
 
 ### Schema Migrations
 
-The `schema/` folder mirrors your PostgreSQL schemas. Each subfolder targets a specific PG schema:
+The `schema/` folder mirrors your PostgreSQL schemas. Each subfolder targets a specific PG schema. Non-public schemas are created automatically (`CREATE SCHEMA IF NOT EXISTS`) -- no ops/ migration needed.
 
 ```sql
 -- schema/public/users.sql
@@ -173,6 +173,40 @@ m8 only manages objects you declare. Tables, procedures, and grants that exist i
 
 Use `--strict` to opt in to exact-match mode, where schema diffs include DROP statements for undeclared objects.
 
+## Bootstrapping an Existing Database
+
+Use `m8 dump` to export an existing database into the m8 folder layout:
+
+```bash
+m8 dump --database mydb --user postgres
+```
+
+This generates:
+- `schema/{pg_schema}/*.sql` -- one CREATE TABLE per table, with indexes and constraints
+- `logic/*.sql` -- one file per function, procedure, and view (CREATE OR REPLACE)
+- `permissions/grants_{schema}.sql` -- GRANT statements per schema
+
+Then run `m8 plan` to verify the dump produces a clean diff (no pending changes).
+
+To limit to specific schemas:
+
+```bash
+m8 dump --database mydb --user postgres --schema public --schema materialized
+```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `m8 apply` | Apply pending migrations (ops → schema → logic → permissions) |
+| `m8 plan` | Show what would be applied without making changes (exit code 2 if pending) |
+| `m8 status` | Show applied, pending, changed, and drifted migrations |
+| `m8 sync` | One-time convergence for brownfield adoption |
+| `m8 baseline` | Mark migrations as applied without running them |
+| `m8 dump` | Export database objects to migration files |
+| `m8 new` | Scaffold a new migration file in the correct folder |
+| `m8 version` | Print version information |
+
 ## SQL Directives
 
 Control migration behavior with special comments:
@@ -189,31 +223,42 @@ ALTER TABLE large_table ADD COLUMN new_col TEXT;
 
 m8 also auto-detects `CREATE INDEX CONCURRENTLY` and runs those migrations outside a transaction automatically.
 
-## Commands
+## Configuration
 
-| Command | Description |
-|---------|-------------|
-| `m8 apply` | Apply pending migrations (ops → schema → logic → permissions) |
-| `m8 plan` | Show what would be applied without making changes (exit code 2 if pending) |
-| `m8 status` | Show applied, pending, changed, and drifted migrations |
-| `m8 sync` | One-time convergence for brownfield adoption |
-| `m8 baseline` | Mark migrations as applied without running them |
-| `m8 new` | Scaffold a new migration file in the correct folder |
-| `m8 version` | Print version information |
+### .m8.yaml
 
-## Environment Variables
+Create a `.m8.yaml` in your project root to persist connection settings:
+
+```yaml
+database: mydb
+host: localhost
+port: 5432
+user: postgres
+sslmode: prefer
+migrations_dir: migrations
+```
+
+Or use a connection URL:
+
+```yaml
+database_url: postgres://user:pass@localhost:5432/mydb?sslmode=prefer
+```
+
+**Priority order:** CLI flags > environment variables > `.m8.yaml` > defaults
+
+### Environment Variables
 
 m8 supports standard PostgreSQL environment variables and `.env` files:
 
-| Variable | Flag | Default |
-|----------|------|---------|
-| `PGHOST` | `--host` | localhost |
-| `PGPORT` | `--port` | 5432 |
-| `PGDATABASE` | `--database` | -- |
-| `PGUSER` | `--user` | -- |
-| `PGPASSWORD` | `--password` | -- |
-| `PGSSLMODE` | `--sslmode` | prefer |
-| `DATABASE_URL` | `--database-url` | -- |
+| Variable | Flag | Config key | Default |
+|----------|------|------------|---------|
+| `PGHOST` | `--host` | `host` | localhost |
+| `PGPORT` | `--port` | `port` | 5432 |
+| `PGDATABASE` | `--database` | `database` | -- |
+| `PGUSER` | `--user` | `user` | -- |
+| `PGPASSWORD` | `--password` | `password` | -- |
+| `PGSSLMODE` | `--sslmode` | `sslmode` | prefer |
+| `DATABASE_URL` | `--database-url` | `database_url` | -- |
 
 ## License
 
