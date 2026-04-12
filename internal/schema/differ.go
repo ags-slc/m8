@@ -38,16 +38,14 @@ type Differ struct {
 // both introspecting the live database and creating temp databases for
 // DDL parsing.
 func NewDiffer(ctx context.Context, connStr string) (*Differ, error) {
+	// Append statement_timeout=0 so CREATE/DROP DATABASE don't get killed
+	// by role-level timeouts. Must be in the connection string itself because
+	// sql.Open is lazy and SET commands may not affect the factory's connections.
+	noTimeoutStr := appendConnOption(connStr, "statement_timeout", "0")
+
 	factory, err := tempdb.NewOnInstanceFactory(ctx, func(ctx context.Context, dbName string) (*sql.DB, error) {
-		tempConnStr := replaceDBName(connStr, dbName)
-		db, err := sql.Open("pgx", tempConnStr)
-		if err != nil {
-			return nil, err
-		}
-		// Disable statement_timeout so CREATE/DROP DATABASE don't get killed
-		// on connections with role-level timeouts configured.
-		_, _ = db.ExecContext(ctx, "SET statement_timeout = 0")
-		return db, nil
+		tempConnStr := replaceDBName(noTimeoutStr, dbName)
+		return sql.Open("pgx", tempConnStr)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp database factory: %w", err)
@@ -196,6 +194,23 @@ func containsWord(s, word string) bool {
 func isIdentChar(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 		(c >= '0' && c <= '9') || c == '_'
+}
+
+// appendConnOption appends a PostgreSQL connection option to a connection string.
+// For URL format, appends as a query parameter. For key-value format, appends as options.
+func appendConnOption(connStr, key, value string) string {
+	if strings.HasPrefix(connStr, "postgres://") || strings.HasPrefix(connStr, "postgresql://") {
+		sep := "?"
+		if strings.Contains(connStr, "?") {
+			sep = "&"
+		}
+		return connStr + sep + "options=-c+" + key + "%3D" + value
+	}
+	// Key-value format: append options parameter
+	if strings.Contains(connStr, "options=") {
+		return strings.Replace(connStr, "options='", "options='-c "+key+"="+value+" ", 1)
+	}
+	return connStr + " options='-c " + key + "=" + value + "'"
 }
 
 // replaceDBName replaces the database name in a PostgreSQL connection string.
