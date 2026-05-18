@@ -6,6 +6,7 @@ builds:
     goos:
       - linux
       - darwin
+      - windows
     goarch:
       - amd64
       - arm64
@@ -16,11 +17,36 @@ builds:
       - -X github.com/ags-slc/m8/cmd.date={{.Date}}
 
 archives:
-  - format: tar.gz
+  - formats: [tar.gz]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
 
 checksum:
   name_template: "checksums.txt"
+
+# Cosign keyless signing via Sigstore + GitHub OIDC.
+# Signs the checksums file (which covers all artifacts transitively).
+# Verify with:
+#   cosign verify-blob \
+#     --certificate checksums.txt.pem \
+#     --signature checksums.txt.sig \
+#     --certificate-identity-regexp 'https://github.com/ags-slc/m8/.*' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+#     checksums.txt
+signs:
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    signature: "${artifact}.sig"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
 
 changelog:
   sort: asc
@@ -30,17 +56,30 @@ changelog:
       - "^test:"
       - "^chore:"
 
-# Homebrew tap requires a PAT with repo scope.
-# Set HOMEBREW_TAP_GITHUB_TOKEN secret and uncomment:
-# brews:
-#   - repository:
-#       owner: ags-slc
-#       name: homebrew-tap
-#       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-#     name: m8
-#     homepage: "https://github.com/ags-slc/m8"
-#     description: "PostgreSQL migration tool"
-#     install: |
-#       bin.install "m8"
-#     test: |
-#       system "#{bin}/m8", "version"
+# Homebrew tap (cask — the formula path is deprecated in GoReleaser).
+# Works on macOS and Linux (Homebrew supports casks on both since brew 4.x).
+# Prereqs (one-time):
+#   1. Create github.com/ags-slc/homebrew-tap (empty repo is fine).
+#   2. Create a fine-grained PAT with Contents:write on ags-slc/homebrew-tap.
+#   3. Add it as repository secret HOMEBREW_TAP_GITHUB_TOKEN.
+# After release, users can: brew install ags-slc/tap/m8
+homebrew_casks:
+  - repository:
+      owner: ags-slc
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    name: m8
+    homepage: "https://github.com/ags-slc/m8"
+    description: "PostgreSQL migration tool"
+    license: "Apache-2.0"
+    binaries:
+      - m8
+    # Strip macOS quarantine attr so unsigned binaries from a download
+    # don't trip Gatekeeper. Standard cask boilerplate for CLI tools.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr",
+                           args: ["-dr", "com.apple.quarantine", "#{staged_path}/m8"]
+          end
