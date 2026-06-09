@@ -665,3 +665,25 @@ func TestSweepInvalidTempDBs(t *testing.T) {
 		t.Fatalf("second sweep dropped = %d, want 0", n)
 	}
 }
+
+func TestSchemaMigrationsRequireDiffer(t *testing.T) {
+	conn, sqlDB, _, cleanup := testDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	dir := setupMigrationsDir(t)
+	if err := os.WriteFile(filepath.Join(dir, "schema", "public", "users.sql"),
+		[]byte("CREATE TABLE users (id bigint PRIMARY KEY);"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// differ == nil simulates an unavailable schema differ (e.g. bad shadow creds).
+	eng := New(conn, sqlDB, nil, &Config{MigrationsDir: dir}, slog.Default())
+
+	if _, err := eng.Apply(ctx); err == nil {
+		t.Error("Apply: expected error when S__ migrations exist but differ is nil, got nil")
+	}
+	if _, err := eng.Plan(ctx); err == nil {
+		t.Error("Plan: expected error when S__ migrations exist but differ is nil, got nil")
+	}
+}
