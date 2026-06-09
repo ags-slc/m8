@@ -58,13 +58,13 @@ func NewDiffer(ctx context.Context, targetConnStr, shadowConnStr string) (*Diffe
 		shadowConnStr = targetConnStr
 	}
 
-	// Append statement_timeout=0 so CREATE/DROP DATABASE don't get killed
-	// by role-level timeouts. Must be in the connection string itself because
-	// sql.Open is lazy and SET commands may not affect the factory's connections.
-	noTimeoutStr := appendConnOption(shadowConnStr, "statement_timeout", "0")
-
 	factory, err := tempdb.NewOnInstanceFactory(ctx, func(ctx context.Context, dbName string) (*sql.DB, error) {
-		tempConnStr := replaceDBName(noTimeoutStr, dbName)
+		// Replace the database name first, THEN append statement_timeout=0.
+		// replaceDBName tokenizes key=value DSNs on whitespace and would corrupt
+		// a quoted options='...' value, so options must be appended last.
+		// statement_timeout=0 must live in the connection string itself because
+		// sql.Open is lazy and a SET may not reach the factory's connections.
+		tempConnStr := appendConnOption(replaceDBName(shadowConnStr, dbName), "statement_timeout", "0")
 		return sql.Open("pgx", tempConnStr)
 	}, tempdb.WithDropTimeout(tempDropTimeout))
 	if err != nil {
@@ -84,19 +84,14 @@ func NewDiffer(ctx context.Context, targetConnStr, shadowConnStr string) (*Diffe
 // Invalid databases cannot be connected to, so dropping them is always safe even
 // when another m8 process is running. It returns the number of databases dropped.
 func (d *Differ) SweepInvalidTempDBs(ctx context.Context) (int, error) {
-	rootStr := replaceDBName(d.shadowConnStr, "postgres")
-	db, err := sql.Open("pgx", rootStr)
+	db, conn, err := d.rootConn(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("open shadow root connection: %w", err)
+		return 0, err
 	}
 	defer db.Close()
+	defer conn.Close()
 
-	// Don't let our own cleanup get killed by a role-level statement_timeout.
-	if _, err := db.ExecContext(ctx, "SET statement_timeout = 0"); err != nil {
-		return 0, fmt.Errorf("disabling statement_timeout: %w", err)
-	}
-
-	rows, err := db.QueryContext(ctx,
+	rows, err := conn.QueryContext(ctx,
 		`SELECT datname FROM pg_database WHERE datname LIKE 'pgschemadiff\_tmp\_%' AND datconnlimit = -2`)
 	if err != nil {
 		return 0, fmt.Errorf("listing invalid temp databases: %w", err)
@@ -118,12 +113,37 @@ func (d *Differ) SweepInvalidTempDBs(ctx context.Context) (int, error) {
 	dropped := 0
 	for _, n := range names {
 		stmt := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", quoteIdent(n))
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return dropped, fmt.Errorf("dropping orphaned temp database %s: %w", n, err)
 		}
 		dropped++
 	}
 	return dropped, nil
+}
+
+// rootConn opens a single pinned connection to the shadow instance's root
+// ("postgres") database with statement_timeout disabled. Pinning one connection
+// (rather than using the *sql.DB pool directly) guarantees the statement_timeout
+// reset and the subsequent statements all run on the same backend. The caller
+// must close both the returned conn and pool (conn first).
+func (d *Differ) rootConn(ctx context.Context) (*sql.DB, *sql.Conn, error) {
+	rootStr := replaceDBName(d.shadowConnStr, "postgres")
+	db, err := sql.Open("pgx", rootStr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open shadow root connection: %w", err)
+	}
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		db.Close()
+		return nil, nil, fmt.Errorf("acquire shadow root connection: %w", err)
+	}
+	// Don't let our own cleanup get killed by a role-level statement_timeout.
+	if _, err := conn.ExecContext(ctx, "SET statement_timeout = 0"); err != nil {
+		conn.Close()
+		db.Close()
+		return nil, nil, fmt.Errorf("disabling statement_timeout: %w", err)
+	}
+	return db, conn, nil
 }
 
 // quoteIdent double-quotes a PostgreSQL identifier, escaping embedded quotes.
