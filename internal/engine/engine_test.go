@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -685,5 +686,66 @@ func TestSchemaMigrationsRequireDiffer(t *testing.T) {
 	}
 	if _, err := eng.Plan(ctx); err == nil {
 		t.Error("Plan: expected error when S__ migrations exist but differ is nil, got nil")
+	}
+}
+
+func TestSweepStaleTempDBs(t *testing.T) {
+	conn, _, connStr, cleanup := testDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	differ, err := schema.NewDiffer(ctx, connStr, "")
+	if err != nil {
+		t.Fatalf("NewDiffer: %v", err)
+	}
+	defer differ.Close()
+
+	mustExec := func(c *pgx.Conn, sqlStr string) {
+		if _, err := c.Exec(ctx, sqlStr); err != nil {
+			t.Fatalf("exec %q: %v", sqlStr, err)
+		}
+	}
+	mustExec(conn, `CREATE DATABASE pgschemadiff_tmp_stale TEMPLATE template0`)
+	mustExec(conn, `CREATE DATABASE pgschemadiff_tmp_fresh TEMPLATE template0`)
+	mustExec(conn, `CREATE DATABASE pgschemadiff_tmp_nometa TEMPLATE template0`)
+
+	// Seed pg-schema-diff's metadata table inside the temp DBs with a chosen age.
+	setupMeta := func(dbName, createdAt string) {
+		c, err := pgx.Connect(ctx, strings.Replace(connStr, "/m8test?", "/"+dbName+"?", 1))
+		if err != nil {
+			t.Fatalf("connect %s: %v", dbName, err)
+		}
+		defer c.Close(ctx)
+		mustExec(c, `CREATE SCHEMA pgschemadiff_tmp_metadata`)
+		mustExec(c, `CREATE TABLE pgschemadiff_tmp_metadata.metadata (db_created_at timestamptz NOT NULL DEFAULT current_timestamp)`)
+		mustExec(c, `INSERT INTO pgschemadiff_tmp_metadata.metadata (db_created_at) VALUES (`+createdAt+`)`)
+	}
+	setupMeta("pgschemadiff_tmp_stale", "now() - interval '2 hours'")
+	setupMeta("pgschemadiff_tmp_fresh", "now()")
+	// pgschemadiff_tmp_nometa intentionally has no metadata table.
+
+	n, err := differ.SweepStaleTempDBs(ctx, time.Hour)
+	if err != nil {
+		t.Fatalf("SweepStaleTempDBs: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("dropped = %d, want 1 (only the stale DB)", n)
+	}
+
+	exists := func(name string) bool {
+		var ok bool
+		if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)`, name).Scan(&ok); err != nil {
+			t.Fatalf("exists(%s): %v", name, err)
+		}
+		return ok
+	}
+	if exists("pgschemadiff_tmp_stale") {
+		t.Error("stale temp database was not dropped")
+	}
+	if !exists("pgschemadiff_tmp_fresh") {
+		t.Error("fresh temp database was incorrectly dropped")
+	}
+	if !exists("pgschemadiff_tmp_nometa") {
+		t.Error("temp database without metadata was incorrectly dropped")
 	}
 }

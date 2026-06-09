@@ -35,6 +35,13 @@ type DiffStatement struct {
 // remediation of any that still slip through.
 const tempDropTimeout = 5 * time.Minute
 
+// StaleTempDBTTL is the age past which a *valid* orphaned temp database is
+// considered abandoned and eligible for cleanup. A schema diff uses its temp
+// database for only seconds, so an hour is far longer than any in-flight run
+// could legitimately hold one — making TTL-based cleanup safe even on a shadow
+// instance shared by several targets.
+const StaleTempDBTTL = time.Hour
+
 // Differ computes the difference between a desired-state DDL definition
 // and the live database schema, producing ALTER statements to converge.
 type Differ struct {
@@ -119,6 +126,87 @@ func (d *Differ) SweepInvalidTempDBs(ctx context.Context) (int, error) {
 		dropped++
 	}
 	return dropped, nil
+}
+
+// SweepStaleTempDBs drops valid (non-invalid) orphaned pgschemadiff_tmp_*
+// databases on the shadow instance that have no active connections and whose
+// recorded creation time (written by pg-schema-diff into its metadata table) is
+// older than maxAge. This reclaims temp databases leaked by a process that died
+// before its drop ran — the case SweepInvalidTempDBs (which only handles
+// already-invalid databases) cannot cover.
+//
+// It is intentionally conservative: a database is dropped only when its age can
+// be confirmed from metadata. Databases missing the metadata, busy, or otherwise
+// uninspectable are left untouched. Callers should run this only against a
+// dedicated shadow instance, never the live target. Returns the number dropped.
+func (d *Differ) SweepStaleTempDBs(ctx context.Context, maxAge time.Duration) (int, error) {
+	db, conn, err := d.rootConn(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	defer conn.Close()
+
+	// Candidates: valid temp databases with no active backends.
+	rows, err := conn.QueryContext(ctx, `
+		SELECT d.datname
+		FROM pg_database d
+		LEFT JOIN pg_stat_database s ON s.datname = d.datname
+		WHERE d.datname LIKE 'pgschemadiff\_tmp\_%'
+		  AND d.datconnlimit <> -2
+		  AND COALESCE(s.numbackends, 0) = 0`)
+	if err != nil {
+		return 0, fmt.Errorf("listing stale temp databases: %w", err)
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scanning temp database name: %w", err)
+		}
+		names = append(names, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterating temp databases: %w", err)
+	}
+
+	dropped := 0
+	for _, n := range names {
+		// Only drop when we can positively confirm the database is stale.
+		if old, err := d.tempDBOlderThan(ctx, n, maxAge); err != nil || !old {
+			continue
+		}
+		stmt := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", quoteIdent(n))
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return dropped, fmt.Errorf("dropping stale temp database %s: %w", n, err)
+		}
+		dropped++
+	}
+	return dropped, nil
+}
+
+// tempDBOlderThan reports whether the temp database's recorded creation time is
+// older than maxAge, by reading pg-schema-diff's metadata table inside it. Any
+// error (missing metadata table, empty table, unreachable) is returned so the
+// caller can leave the database alone rather than drop something it can't vet.
+func (d *Differ) tempDBOlderThan(ctx context.Context, dbName string, maxAge time.Duration) (bool, error) {
+	connStr := appendConnOption(replaceDBName(d.shadowConnStr, dbName), "statement_timeout", "0")
+	db, err := sql.Open("pgx", connStr)
+	if err != nil {
+		return false, err
+	}
+	defer db.Close()
+
+	var old bool
+	err = db.QueryRowContext(ctx,
+		`SELECT max(db_created_at) < now() - $1::interval FROM pgschemadiff_tmp_metadata.metadata`,
+		fmt.Sprintf("%d seconds", int64(maxAge.Seconds()))).Scan(&old)
+	if err != nil {
+		return false, err
+	}
+	return old, nil
 }
 
 // rootConn opens a single pinned connection to the shadow instance's root

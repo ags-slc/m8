@@ -212,6 +212,16 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 			} else if n > 0 {
 				slog.Info("swept orphaned invalid schema-diff temp databases", "dropped", n)
 			}
+			// On a dedicated shadow instance, also reclaim valid temp databases
+			// abandoned by a process that died before its drop. Restricted to an
+			// explicit shadow so we never auto-drop valid databases on the target.
+			if shadowConnStr != "" {
+				if n, serr := d.SweepStaleTempDBs(ctx, schema.StaleTempDBTTL); serr != nil {
+					slog.Warn("failed to sweep stale schema-diff temp databases", "error", serr)
+				} else if n > 0 {
+					slog.Info("swept stale schema-diff temp databases", "dropped", n)
+				}
+			}
 		}
 	}
 

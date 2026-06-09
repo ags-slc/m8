@@ -278,11 +278,30 @@ database_url: postgres://user:pass@prod-host:5432/mydb
 shadow_url:   postgres://user:pass@shadow-host:5432/postgres   # isolated instance
 ```
 
-The shadow instance only needs `CREATE DATABASE` privilege and should match the
-target's major PostgreSQL version for accurate plan validation. m8 also sweeps
-any invalid orphaned `pgschemadiff_tmp_*` databases on the shadow instance at
-startup. If `shadow_url` is unset, m8 logs a warning and falls back to the
-target instance.
+**The shadow must be able to faithfully build your schema.** Temp databases are
+created from `template0`, so the shadow instance needs:
+
+- `CREATE DATABASE` privilege for the connecting role.
+- The **same major PostgreSQL version** as the target (plan validation runs your
+  DDL there; version-specific syntax/behavior must match).
+- **The same extensions available** and the same `shared_preload_libraries` as
+  the target, if your schema references extension-provided types/functions
+  (TimescaleDB, PostGIS, `pg_cron`, etc.). The cleanest way to guarantee this is
+  to point the shadow at a restore/clone of the target rather than an empty
+  instance.
+
+If the shadow is **explicitly configured** but the differ can't initialize
+(unreachable, bad credentials, missing privilege), m8 fails loudly rather than
+silently skipping schema migrations. With no shadow configured it warns and
+falls back to the target; either way the engine refuses to apply when schema
+migrations exist but cannot be diffed.
+
+**Cleanup.** At startup (for `plan`/`apply`/`sync` only) m8 drops any *invalid*
+orphaned `pgschemadiff_tmp_*` databases (the residue of an interrupted drop) on
+whichever instance hosts temp databases. When a dedicated shadow is configured,
+it additionally reclaims *valid* temp databases older than one hour that have no
+active connections — abandoned leftovers from a killed process. Read-only
+commands (`status`, `baseline`) never touch temp databases.
 
 ## License
 
