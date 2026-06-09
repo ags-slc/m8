@@ -159,8 +159,12 @@ func resolveStrict() bool {
 	return cfg.Strict
 }
 
-// connectAndBuildEngine creates a pgx connection, sql.DB, schema differ, and engine.
-func connectAndBuildEngine(ctx context.Context) (*pgx.Conn, *engine.Engine, func(), error) {
+// connectAndBuildEngine creates a pgx connection, sql.DB, and engine. When
+// needDiffer is true it also constructs the schema differ — which connects to
+// the shadow instance and sweeps orphaned temp databases. Commands that never
+// diff (status, baseline) pass false so they don't open a shadow connection or
+// perform DROP DATABASE side effects.
+func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *engine.Engine, func(), error) {
 	connStr := resolveConnStr()
 
 	conn, err := pgx.Connect(ctx, connStr)
@@ -177,28 +181,37 @@ func connectAndBuildEngine(ctx context.Context) (*pgx.Conn, *engine.Engine, func
 	// Disable statement_timeout for schema diffing operations (CREATE/DROP temp DBs)
 	sqlDB.ExecContext(ctx, "SET statement_timeout = 0")
 
-	// Schema differ (may fail if we lack CREATE DATABASE privilege — non-fatal)
 	var differ *schema.Differ
-	shadowConnStr := resolveShadowConnStr()
-	if shadowConnStr == "" {
-		slog.Warn("no shadow instance configured: schema-diff temp databases will be created on the TARGET instance " +
-			"(set --shadow-url / SHADOW_DATABASE_URL to an isolated non-production instance to avoid CREATE/DROP DATABASE churn on the target)")
-	} else {
-		slog.Info("schema-diff temp databases will be created on the configured shadow instance")
-	}
-	d, err := schema.NewDiffer(ctx, connStr, shadowConnStr)
-	if err != nil {
-		// Log but don't fail — S__ migrations just won't be diffed
-		slog.Warn("schema differ unavailable (S__ migrations will be skipped)", "error", err)
-	} else {
-		differ = d
-		// Best-effort: remove any invalid temp databases left behind by a
-		// previously interrupted diff (datconnlimit = -2). Safe to run anytime —
-		// invalid databases cannot be in use.
-		if n, serr := d.SweepInvalidTempDBs(ctx); serr != nil {
-			slog.Warn("failed to sweep orphaned schema-diff temp databases", "error", serr)
-		} else if n > 0 {
-			slog.Info("swept orphaned schema-diff temp databases", "dropped", n)
+	if needDiffer {
+		shadowConnStr := resolveShadowConnStr()
+		if shadowConnStr == "" {
+			slog.Warn("no shadow instance configured: schema-diff temp databases will be created on the TARGET instance " +
+				"(set --shadow-url / SHADOW_DATABASE_URL to an isolated non-production instance to avoid CREATE/DROP DATABASE churn on the target)")
+		} else {
+			slog.Info("schema-diff temp databases will be created on the configured shadow instance")
+		}
+		d, derr := schema.NewDiffer(ctx, connStr, shadowConnStr)
+		if derr != nil {
+			if shadowConnStr != "" {
+				// An explicitly configured shadow that fails must not silently
+				// disable schema diffing — fail loudly rather than skip S__ work.
+				sqlDB.Close()
+				conn.Close(ctx)
+				return nil, nil, nil, fmt.Errorf("schema differ unavailable with configured shadow instance: %w", derr)
+			}
+			// No shadow configured: degrade. The engine still refuses to skip
+			// schema migrations silently (see errDifferUnavailable).
+			slog.Warn("schema differ unavailable (schema migrations cannot be diffed)", "error", derr)
+		} else {
+			differ = d
+			// Best-effort: remove any invalid temp databases left behind by a
+			// previously interrupted diff (datconnlimit = -2). Safe to run anytime —
+			// invalid databases cannot be in use.
+			if n, serr := d.SweepInvalidTempDBs(ctx); serr != nil {
+				slog.Warn("failed to sweep orphaned schema-diff temp databases", "error", serr)
+			} else if n > 0 {
+				slog.Info("swept orphaned invalid schema-diff temp databases", "dropped", n)
+			}
 		}
 	}
 

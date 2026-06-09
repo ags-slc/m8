@@ -14,7 +14,7 @@ var statusCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		_, eng, cleanup, err := connectAndBuildEngine(ctx)
+		_, eng, cleanup, err := connectAndBuildEngine(ctx, false)
 		if err != nil {
 			return err
 		}

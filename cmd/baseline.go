@@ -22,7 +22,7 @@ var baselineCmd = &cobra.Command{
 
 		ctx := cmd.Context()
 
-		_, eng, cleanup, err := connectAndBuildEngine(ctx)
+		_, eng, cleanup, err := connectAndBuildEngine(ctx, false)
 		if err != nil {
 			return err
 		}
