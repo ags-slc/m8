@@ -25,6 +25,7 @@ var (
 	flagSSLMode       string
 	flagMigrationsDir string
 	flagDatabaseURL   string
+	flagShadowURL     string
 	flagStrict        bool
 	flagJSON          bool
 )
@@ -45,6 +46,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagPassword, "password", "", "PostgreSQL password (env: PGPASSWORD)")
 	rootCmd.PersistentFlags().StringVar(&flagSSLMode, "sslmode", "", "PostgreSQL SSL mode (env: PGSSLMODE, default: prefer)")
 	rootCmd.PersistentFlags().StringVar(&flagDatabaseURL, "database-url", "", "PostgreSQL connection URL (overrides individual flags)")
+	rootCmd.PersistentFlags().StringVar(&flagShadowURL, "shadow-url", "", "PostgreSQL connection URL for an isolated instance to host schema-diff temp databases (env: SHADOW_DATABASE_URL). Strongly recommended against production; if unset, temp DBs are created on the target.")
 	rootCmd.PersistentFlags().StringVar(&flagMigrationsDir, "migrations-dir", "migrations", "Path to migrations directory")
 	rootCmd.PersistentFlags().BoolVar(&flagStrict, "strict", false, "Include DROP statements for DB objects not declared in migration files")
 	rootCmd.PersistentFlags().BoolVar(&flagJSON, "json", false, "Output in JSON format")
@@ -119,6 +121,23 @@ func resolveConnStr() string {
 	return connStr
 }
 
+// resolveShadowConnStr returns the connection string for the instance that
+// hosts schema-diff temp databases. Priority: flag > SHADOW_DATABASE_URL env >
+// .m8.yaml shadow_url. Returns "" when none is configured (temp DBs then land
+// on the target instance).
+func resolveShadowConnStr() string {
+	if flagShadowURL != "" {
+		return flagShadowURL
+	}
+	if url := os.Getenv("SHADOW_DATABASE_URL"); url != "" {
+		return url
+	}
+	if cfg := loadConfig(); cfg.ShadowURL != "" {
+		return cfg.ShadowURL
+	}
+	return ""
+}
+
 // resolveMigrationsDir returns the migrations directory from flag or config.
 func resolveMigrationsDir() string {
 	cfg := loadConfig()
@@ -160,12 +179,27 @@ func connectAndBuildEngine(ctx context.Context) (*pgx.Conn, *engine.Engine, func
 
 	// Schema differ (may fail if we lack CREATE DATABASE privilege — non-fatal)
 	var differ *schema.Differ
-	d, err := schema.NewDiffer(ctx, connStr)
+	shadowConnStr := resolveShadowConnStr()
+	if shadowConnStr == "" {
+		slog.Warn("no shadow instance configured: schema-diff temp databases will be created on the TARGET instance " +
+			"(set --shadow-url / SHADOW_DATABASE_URL to an isolated non-production instance to avoid CREATE/DROP DATABASE churn on the target)")
+	} else {
+		slog.Info("schema-diff temp databases will be created on the configured shadow instance")
+	}
+	d, err := schema.NewDiffer(ctx, connStr, shadowConnStr)
 	if err != nil {
 		// Log but don't fail — S__ migrations just won't be diffed
 		slog.Warn("schema differ unavailable (S__ migrations will be skipped)", "error", err)
 	} else {
 		differ = d
+		// Best-effort: remove any invalid temp databases left behind by a
+		// previously interrupted diff (datconnlimit = -2). Safe to run anytime —
+		// invalid databases cannot be in use.
+		if n, serr := d.SweepInvalidTempDBs(ctx); serr != nil {
+			slog.Warn("failed to sweep orphaned schema-diff temp databases", "error", serr)
+		} else if n > 0 {
+			slog.Info("swept orphaned schema-diff temp databases", "dropped", n)
+		}
 	}
 
 	logger := slog.Default()

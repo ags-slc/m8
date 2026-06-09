@@ -75,7 +75,7 @@ func setupMigrationsDir(t *testing.T) string {
 
 func newEngine(conn *pgx.Conn, sqlDB *sql.DB, connStr, migrationsDir string, strict bool) (*Engine, *schema.Differ) {
 	ctx := context.Background()
-	differ, _ := schema.NewDiffer(ctx, connStr)
+	differ, _ := schema.NewDiffer(ctx, connStr, "")
 	eng := New(conn, sqlDB, differ, &Config{
 		MigrationsDir: migrationsDir,
 		ConnStr:       connStr,
@@ -606,5 +606,62 @@ func TestSchemaApply(t *testing.T) {
 		if !s.Skipped {
 			t.Error("expected schema to be skipped on second apply (no diff)")
 		}
+	}
+}
+
+func TestSweepInvalidTempDBs(t *testing.T) {
+	conn, _, connStr, cleanup := testDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	differ, err := schema.NewDiffer(ctx, connStr, "")
+	if err != nil {
+		t.Fatalf("NewDiffer: %v", err)
+	}
+	defer differ.Close()
+
+	mustExec := func(sqlStr string) {
+		if _, err := conn.Exec(ctx, sqlStr); err != nil {
+			t.Fatalf("exec %q: %v", sqlStr, err)
+		}
+	}
+	// An orphaned temp DB marked invalid (residue of an interrupted DROP), a
+	// healthy temp DB that must survive, and an unrelated DB that must survive.
+	mustExec(`CREATE DATABASE pgschemadiff_tmp_invalid TEMPLATE template0`)
+	mustExec(`CREATE DATABASE pgschemadiff_tmp_valid TEMPLATE template0`)
+	mustExec(`CREATE DATABASE unrelated_db TEMPLATE template0`)
+	// Simulate what an interrupted DROP DATABASE leaves behind (datconnlimit = -2).
+	mustExec(`UPDATE pg_database SET datconnlimit = -2 WHERE datname = 'pgschemadiff_tmp_invalid'`)
+
+	n, err := differ.SweepInvalidTempDBs(ctx)
+	if err != nil {
+		t.Fatalf("SweepInvalidTempDBs: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("dropped = %d, want 1", n)
+	}
+
+	exists := func(name string) bool {
+		var ok bool
+		if err := conn.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)`, name).Scan(&ok); err != nil {
+			t.Fatalf("exists(%s): %v", name, err)
+		}
+		return ok
+	}
+	if exists("pgschemadiff_tmp_invalid") {
+		t.Error("invalid temp database was not dropped")
+	}
+	if !exists("pgschemadiff_tmp_valid") {
+		t.Error("healthy temp database was incorrectly dropped")
+	}
+	if !exists("unrelated_db") {
+		t.Error("unrelated database was incorrectly dropped")
+	}
+
+	// Idempotent: a second sweep finds nothing.
+	if n, err = differ.SweepInvalidTempDBs(ctx); err != nil {
+		t.Fatalf("second SweepInvalidTempDBs: %v", err)
+	} else if n != 0 {
+		t.Fatalf("second sweep dropped = %d, want 0", n)
 	}
 }

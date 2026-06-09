@@ -2,6 +2,21 @@ package schema
 
 import "testing"
 
+func TestQuoteIdent(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"pgschemadiff_tmp_abc", `"pgschemadiff_tmp_abc"`},
+		{`weird"name`, `"weird""name"`},
+	}
+	for _, tt := range tests {
+		if got := quoteIdent(tt.in); got != tt.want {
+			t.Errorf("quoteIdent(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestReplaceDBNameURL(t *testing.T) {
 	tests := []struct {
 		input string

@@ -15,6 +15,7 @@ type Config struct {
 	Password      string `yaml:"password"`
 	SSLMode       string `yaml:"sslmode"`
 	DatabaseURL   string `yaml:"database_url"`
+	ShadowURL     string `yaml:"shadow_url"`
 	MigrationsDir string `yaml:"migrations_dir"`
 	Strict        bool   `yaml:"strict"`
 }

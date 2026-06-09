@@ -27,34 +27,108 @@ type DiffStatement struct {
 	LockTimeout time.Duration // Suggested lock_timeout.
 }
 
+// tempDropTimeout caps how long pg-schema-diff's cleanup may spend dropping a
+// temporary shadow database. The library defaults to 3s (tempdb.DefaultStatementTimeout),
+// which is far too aggressive on a loaded instance: a DROP DATABASE that exceeds it
+// is interrupted, leaving the database INVALID (pg_database.datconnlimit = -2) and
+// orphaned. A generous ceiling lets the drop complete. See SweepInvalidTempDBs for
+// remediation of any that still slip through.
+const tempDropTimeout = 5 * time.Minute
+
 // Differ computes the difference between a desired-state DDL definition
 // and the live database schema, producing ALTER statements to converge.
 type Differ struct {
-	connStr     string         // connection string for creating temp databases
-	tempFactory tempdb.Factory // creates temp DBs for DDL parsing
+	connStr       string         // connection string for the live target database
+	shadowConnStr string         // connection string for the instance hosting temp DBs
+	tempFactory   tempdb.Factory // creates temp DBs for DDL parsing/plan validation
 }
 
-// NewDiffer creates a Differ that uses the given connection string for
-// both introspecting the live database and creating temp databases for
-// DDL parsing.
-func NewDiffer(ctx context.Context, connStr string) (*Differ, error) {
+// NewDiffer creates a Differ. The live target database (introspected for the
+// current schema) is reached via targetConnStr. Temporary shadow databases —
+// which pg-schema-diff creates and drops to parse desired DDL and validate plans
+// (named pgschemadiff_tmp_*) — are created on the instance reached via
+// shadowConnStr.
+//
+// IMPORTANT: when shadowConnStr is empty, temp databases are created on the
+// TARGET instance itself. Against a production primary this churns
+// CREATE/DROP DATABASE on the live cluster — pass a separate, non-production
+// shadow instance to avoid that.
+func NewDiffer(ctx context.Context, targetConnStr, shadowConnStr string) (*Differ, error) {
+	if shadowConnStr == "" {
+		shadowConnStr = targetConnStr
+	}
+
 	// Append statement_timeout=0 so CREATE/DROP DATABASE don't get killed
 	// by role-level timeouts. Must be in the connection string itself because
 	// sql.Open is lazy and SET commands may not affect the factory's connections.
-	noTimeoutStr := appendConnOption(connStr, "statement_timeout", "0")
+	noTimeoutStr := appendConnOption(shadowConnStr, "statement_timeout", "0")
 
 	factory, err := tempdb.NewOnInstanceFactory(ctx, func(ctx context.Context, dbName string) (*sql.DB, error) {
 		tempConnStr := replaceDBName(noTimeoutStr, dbName)
 		return sql.Open("pgx", tempConnStr)
-	})
+	}, tempdb.WithDropTimeout(tempDropTimeout))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp database factory: %w", err)
 	}
 
 	return &Differ{
-		connStr:     connStr,
-		tempFactory: factory,
+		connStr:       targetConnStr,
+		shadowConnStr: shadowConnStr,
+		tempFactory:   factory,
 	}, nil
+}
+
+// SweepInvalidTempDBs drops any orphaned pgschemadiff_tmp_* databases on the
+// shadow instance that Postgres has marked INVALID (datconnlimit = -2) — the
+// residue of a DROP DATABASE that was interrupted (e.g. by a statement timeout).
+// Invalid databases cannot be connected to, so dropping them is always safe even
+// when another m8 process is running. It returns the number of databases dropped.
+func (d *Differ) SweepInvalidTempDBs(ctx context.Context) (int, error) {
+	rootStr := replaceDBName(d.shadowConnStr, "postgres")
+	db, err := sql.Open("pgx", rootStr)
+	if err != nil {
+		return 0, fmt.Errorf("open shadow root connection: %w", err)
+	}
+	defer db.Close()
+
+	// Don't let our own cleanup get killed by a role-level statement_timeout.
+	if _, err := db.ExecContext(ctx, "SET statement_timeout = 0"); err != nil {
+		return 0, fmt.Errorf("disabling statement_timeout: %w", err)
+	}
+
+	rows, err := db.QueryContext(ctx,
+		`SELECT datname FROM pg_database WHERE datname LIKE 'pgschemadiff\_tmp\_%' AND datconnlimit = -2`)
+	if err != nil {
+		return 0, fmt.Errorf("listing invalid temp databases: %w", err)
+	}
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scanning temp database name: %w", err)
+		}
+		names = append(names, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterating temp databases: %w", err)
+	}
+
+	dropped := 0
+	for _, n := range names {
+		stmt := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", quoteIdent(n))
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return dropped, fmt.Errorf("dropping orphaned temp database %s: %w", n, err)
+		}
+		dropped++
+	}
+	return dropped, nil
+}
+
+// quoteIdent double-quotes a PostgreSQL identifier, escaping embedded quotes.
+func quoteIdent(name string) string {
+	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 // Close cleans up the temp database factory.

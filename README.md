@@ -259,6 +259,30 @@ m8 supports standard PostgreSQL environment variables and `.env` files:
 | `PGPASSWORD` | `--password` | `password` | -- |
 | `PGSSLMODE` | `--sslmode` | `sslmode` | prefer |
 | `DATABASE_URL` | `--database-url` | `database_url` | -- |
+| `SHADOW_DATABASE_URL` | `--shadow-url` | `shadow_url` | -- |
+
+### Shadow Instance for Schema Diffing
+
+To compute schema diffs, pg-schema-diff creates and drops temporary databases
+(named `pgschemadiff_tmp_*`) to parse your desired DDL and validate the generated
+plan. By default these are created **on the target instance** — including for
+`m8 plan`, which is therefore *not* side-effect-free.
+
+Against a production primary this churns `CREATE`/`DROP DATABASE` on the live
+cluster, which can be disruptive (and on some PostgreSQL versions can leave
+invalid databases behind if a drop is interrupted). Point m8 at a separate,
+non-production instance to host these temp databases:
+
+```yaml
+database_url: postgres://user:pass@prod-host:5432/mydb
+shadow_url:   postgres://user:pass@shadow-host:5432/postgres   # isolated instance
+```
+
+The shadow instance only needs `CREATE DATABASE` privilege and should match the
+target's major PostgreSQL version for accurate plan validation. m8 also sweeps
+any invalid orphaned `pgschemadiff_tmp_*` databases on the shadow instance at
+startup. If `shadow_url` is unset, m8 logs a warning and falls back to the
+target instance.
 
 ## License
 
