@@ -36,9 +36,19 @@ func TestRequireShadowRefusesWhenNoShadowIsConfigured(t *testing.T) {
 	flagShadowURL = ""
 	t.Cleanup(func() { flagShadowURL = "" })
 
+	// Point at a port nothing listens on: the refusal must come from the
+	// missing shadow, BEFORE any session is opened on the target.
+	t.Setenv("PGHOST", "127.0.0.1")
+	t.Setenv("PGPORT", "1")
+	t.Setenv("PGDATABASE", "nonexistent")
+	t.Setenv("PGUSER", "nonexistent")
+
 	_, _, _, err = connectAndBuildEngine(context.Background(), true)
 	if err == nil {
 		t.Fatal("expected a refusal, got none")
+	}
+	if strings.Contains(err.Error(), "failed to connect") {
+		t.Errorf("connected to the target before refusing: %v", err)
 	}
 	if !strings.Contains(err.Error(), "require_shadow") {
 		t.Errorf("error does not explain why it refused: %v", err)

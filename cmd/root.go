@@ -202,6 +202,19 @@ func resolveStrict() bool {
 func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *engine.Engine, func(), error) {
 	connStr := resolveConnStr()
 
+	// Checked before connecting: a missing shadow is a configuration error, and
+	// there is no reason to open a session on the target -- possibly a
+	// production primary -- only to refuse a moment later.
+	if needDiffer && resolveShadowConnStr() == "" && loadConfig().RequireShadow {
+		// A warning is not enough when the target is a production primary:
+		// falling back means CREATE DATABASE / DROP DATABASE churn on it.
+		// Repositories that can never accept that set require_shadow in
+		// .m8.yaml, and this turns the degrade into a refusal.
+		return nil, nil, nil, fmt.Errorf(
+			"require_shadow is set in .m8.yaml but no shadow instance is configured: " +
+				"set --shadow-url or SHADOW_DATABASE_URL to an isolated non-production instance")
+	}
+
 	conn, err := pgx.Connect(ctx, connStr)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to connect to database: %w", err)
@@ -217,15 +230,6 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 	var differ *schema.Differ
 	if needDiffer {
 		shadowConnStr := resolveShadowConnStr()
-		if shadowConnStr == "" && loadConfig().RequireShadow {
-			// A warning is not enough when the target is a production primary:
-			// falling back means CREATE DATABASE / DROP DATABASE churn on it.
-			// Repositories that can never accept that set require_shadow in
-			// .m8.yaml, and this turns the degrade into a refusal.
-			return nil, nil, nil, fmt.Errorf(
-				"require_shadow is set in .m8.yaml but no shadow instance is configured: " +
-					"set --shadow-url or SHADOW_DATABASE_URL to an isolated non-production instance")
-		}
 		if shadowConnStr == "" {
 			slog.Warn("no shadow instance configured: schema-diff temp databases will be created on the TARGET instance " +
 				"(set --shadow-url / SHADOW_DATABASE_URL to an isolated non-production instance to avoid CREATE/DROP DATABASE churn on the target)")
