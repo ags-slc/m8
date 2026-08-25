@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ags-slc/m8/internal/dump"
 	"github.com/ags-slc/m8/internal/migration"
 	"github.com/ags-slc/m8/internal/schema"
 	"github.com/jackc/pgx/v5"
@@ -1894,5 +1895,74 @@ func TestSchemaStatementTimeoutOverride(t *testing.T) {
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) || pgErr.Code != "57014" {
 		t.Fatalf("derived statement_timeout was not applied: %v", err)
+	}
+}
+
+// TestDumpedSchemaPlansClean pins the seam between the two halves of m8: what
+// `m8 dump` writes must be what `m8 plan` reads as already-applied. The README
+// tells operators to bootstrap by dumping and then checking that the plan is
+// empty, so a mismatch here means m8 proposes rewriting a database to the state
+// it is already in.
+//
+// It is a real regression risk for anything that changes how DDL is rendered.
+// The dumper now quotes every identifier, and the differ's non-strict filter
+// decides what to keep by looking for declared object names in the generated
+// statements -- one is written against the other, and only an end-to-end check
+// notices when they drift apart.
+func TestDumpedSchemaPlansClean(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.parent (id BIGINT PRIMARY KEY, name TEXT);
+		CREATE TABLE public.child (
+			id        BIGSERIAL PRIMARY KEY,
+			parent_id BIGINT NOT NULL,
+			label     TEXT NOT NULL DEFAULT 'x',
+			CONSTRAINT child_parent_fk FOREIGN KEY (parent_id)
+				REFERENCES public.parent (id) ON DELETE CASCADE,
+			CONSTRAINT child_label_ck   CHECK (label <> ''),
+			CONSTRAINT child_label_uniq UNIQUE (label)
+		);
+		CREATE INDEX child_parent_idx ON public.child (parent_id) WHERE parent_id > 0;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	d := dump.NewDumper(conn)
+	dir := setupMigrationsDir(t)
+	for _, name := range []string{"parent", "child"} {
+		tbl, err := d.DumpTable(ctx, "public", name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustWriteFile(t, filepath.Join(dir, "schema", "public", name+".sql"),
+			[]byte(dump.RenderDDL(tbl)), 0644)
+	}
+
+	// --strict is the sharper half: with no post-filter, anything the dump
+	// failed to describe comes back as a DROP.
+	for _, strict := range []bool{false, true} {
+		eng, differ := newEngine(conn, sqlDB, connStr, dir, strict)
+		result, err := eng.Plan(ctx)
+		if err != nil {
+			t.Fatalf("strict=%v: plan: %v", strict, err)
+		}
+		for _, s := range result.Schema {
+			if s.Error != nil {
+				t.Fatalf("strict=%v: diff error: %v", strict, s.Error)
+			}
+			if s.Diff == nil {
+				continue
+			}
+			for _, stmt := range s.Diff.Statements {
+				t.Errorf("strict=%v: dumped schema does not plan clean: %s", strict, stmt.DDL)
+			}
+		}
+		if differ != nil {
+			_ = differ.Close()
+		}
 	}
 }
