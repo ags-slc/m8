@@ -27,6 +27,12 @@ type Config struct {
 	FailOnUnvalidated bool   `yaml:"fail_on_unvalidated"`
 	MigrationsDir     string `yaml:"migrations_dir"`
 	Strict            bool   `yaml:"strict"`
+	// LockTimeout and StatementTimeout override the per-statement timeouts
+	// pg-schema-diff derives from each generated statement's hazards. Empty
+	// keeps the derived value. Any duration Go's time.ParseDuration accepts,
+	// e.g. "5s", "10min" is not valid -- use "10m".
+	LockTimeout      string `yaml:"lock_timeout"`
+	StatementTimeout string `yaml:"statement_timeout"`
 }
 
 // Load reads .m8.yaml from the current directory. A missing file yields an

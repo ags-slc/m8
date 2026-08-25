@@ -48,6 +48,14 @@ type Config struct {
 	// gate can be built on the resulting exit code; a warning printed to stdout
 	// is not something a pipeline can fail on.
 	FailOnUnvalidated bool
+	// LockTimeout and StatementTimeout override the hazard-derived timeouts
+	// pg-schema-diff attaches to each generated statement. Zero keeps the
+	// plan's own value, which is what you want by default: 3s for ordinary DDL,
+	// 20 minutes for a concurrent index build. The override exists because a
+	// legitimate ALTER TABLE on a large table can exceed 3s -- and until these
+	// timeouts were actually applied, it silently did.
+	LockTimeout      time.Duration
+	StatementTimeout time.Duration
 }
 
 // ApplyResult holds the outcome of an apply or plan operation.
@@ -582,13 +590,7 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 		// Apply the combined diff and record against each migration file
 		start := time.Now()
 		for i, stmt := range diffResult.Statements {
-			if stmt.LockTimeout > 0 {
-				_, _ = e.conn.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", stmt.LockTimeout.Milliseconds()))
-			}
-			if stmt.Timeout > 0 {
-				_, _ = e.conn.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", stmt.Timeout.Milliseconds()))
-			}
-			if _, err := e.conn.Exec(ctx, stmt.DDL); err != nil {
+			if err := e.execSchemaStatement(ctx, stmt); err != nil {
 				execMs := time.Since(start).Milliseconds()
 				errMsg := fmt.Errorf("statement %d failed: %w\nDDL: %s", i+1, err, stmt.DDL)
 				for _, m := range pgMigrations {
@@ -614,6 +616,60 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 		e.logger.Info("applied", "pg_schema", pgSchema, "type", "schema", "ms", execMs, "statements", len(diffResult.Statements))
 	}
 	return results, nil
+}
+
+// execSchemaStatement runs one generated DDL statement with pg-schema-diff's
+// hazard-derived timeouts actually in force.
+//
+// The timeouts are applied with a SESSION-level SET. They used to be issued as
+// SET LOCAL on e.conn, which is not inside a transaction -- and SET LOCAL
+// outside a transaction block does nothing at all: Postgres raises a WARNING
+// and moves on. The errors were discarded (`_, _ =`) so even the warning went
+// nowhere. Every lock timeout pg-schema-diff derived from a statement's hazards
+// was therefore silently dropped, and schema DDL waited for its ACCESS
+// EXCLUSIVE lock without bound against whatever it was pointed at.
+//
+// Wrapping the statement in an explicit transaction is not the fix: the plan
+// contains CREATE INDEX CONCURRENTLY, which Postgres refuses to run inside one.
+// pg-schema-diff says as much in Statement's own documentation ("be sure to set
+// the session-level ... timeout"), and its CLI emits SET SESSION.
+//
+// A plain SET is safe here because e.conn is one dedicated connection: the same
+// backend runs the SET and the statement. Both settings are reset afterwards,
+// on a context detached from the caller's, so a cancelled or failed statement
+// cannot leave its timeout on the connection the rest of the run keeps using.
+func (e *Engine) execSchemaStatement(ctx context.Context, stmt schema.DiffStatement) error {
+	lockTimeout := stmt.LockTimeout
+	if e.config.LockTimeout > 0 {
+		lockTimeout = e.config.LockTimeout
+	}
+	statementTimeout := stmt.Timeout
+	if e.config.StatementTimeout > 0 {
+		statementTimeout = e.config.StatementTimeout
+	}
+
+	reset := func(setting string) {
+		if _, err := e.conn.Exec(context.WithoutCancel(ctx), "RESET "+setting); err != nil {
+			e.logger.Warn("failed to reset session setting after a schema statement",
+				"setting", setting, "error", err)
+		}
+	}
+
+	if lockTimeout > 0 {
+		if _, err := e.conn.Exec(ctx, fmt.Sprintf("SET lock_timeout = '%dms'", lockTimeout.Milliseconds())); err != nil {
+			return fmt.Errorf("setting lock_timeout: %w", err)
+		}
+		defer reset("lock_timeout")
+	}
+	if statementTimeout > 0 {
+		if _, err := e.conn.Exec(ctx, fmt.Sprintf("SET statement_timeout = '%dms'", statementTimeout.Milliseconds())); err != nil {
+			return fmt.Errorf("setting statement_timeout: %w", err)
+		}
+		defer reset("statement_timeout")
+	}
+
+	_, err := e.conn.Exec(ctx, stmt.DDL)
+	return err
 }
 
 func (e *Engine) applyIdempotent(ctx context.Context, migrations []*migration.Migration, typ string) ([]MigrationResult, error) {

@@ -36,6 +36,10 @@ var (
 	// flagFailOnUnvalidated turns an unvalidated plan into a refusal rather
 	// than a warning, so a CI gate can be built on the exit code.
 	flagFailOnUnvalidated bool
+	// Overrides for the per-statement timeouts pg-schema-diff derives from each
+	// generated statement's hazards. Zero keeps the derived value.
+	flagLockTimeout      time.Duration
+	flagStatementTimeout time.Duration
 )
 
 var rootCmd = &cobra.Command{
@@ -64,6 +68,10 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&flagJSON, "json", false, "Output in JSON format")
 	rootCmd.PersistentFlags().BoolVar(&flagFailOnUnvalidated, "fail-on-unvalidated", false,
 		"Refuse to plan or apply a schema diff whose plan could not be validated (env: M8_FAIL_ON_UNVALIDATED; implied by require_shadow)")
+	rootCmd.PersistentFlags().DurationVar(&flagLockTimeout, "lock-timeout", 0,
+		"Override the lock_timeout applied to every generated schema statement (default: pg-schema-diff's hazard-derived value, 3s for ordinary DDL)")
+	rootCmd.PersistentFlags().DurationVar(&flagStatementTimeout, "statement-timeout", 0,
+		"Override the statement_timeout applied to every generated schema statement (default: pg-schema-diff's hazard-derived value, 3s for ordinary DDL / 20m for a concurrent index build)")
 }
 
 func loadEnv() {
@@ -122,6 +130,8 @@ type settings struct {
 	Strict            bool
 	RequireShadow     bool
 	FailOnUnvalidated bool
+	LockTimeout       time.Duration
+	StatementTimeout  time.Duration
 }
 
 func resolveSettings() (*settings, error) {
@@ -142,6 +152,15 @@ func resolveSettings() (*settings, error) {
 		return nil, err
 	}
 
+	lockTimeout, err := resolveDuration("lock_timeout", flagLockTimeout, cfg.LockTimeout)
+	if err != nil {
+		return nil, err
+	}
+	statementTimeout, err := resolveDuration("statement_timeout", flagStatementTimeout, cfg.StatementTimeout)
+	if err != nil {
+		return nil, err
+	}
+
 	return &settings{
 		ConnStr:       resolveConnStr(cfg),
 		ShadowConnStr: resolveShadowConnStr(cfg),
@@ -153,7 +172,30 @@ func resolveSettings() (*settings, error) {
 		// A repository that refuses to plan without a shadow instance cannot
 		// coherently accept applying a plan the shadow never checked.
 		FailOnUnvalidated: flagFailOnUnvalidated || failOnUnvalidated || requireShadow,
+		LockTimeout:       lockTimeout,
+		StatementTimeout:  statementTimeout,
 	}, nil
+}
+
+// resolveDuration takes the flag when set, otherwise the config value. A config
+// value that does not parse is an error rather than a silent zero -- zero here
+// means "keep pg-schema-diff's derived timeout", which is not what someone who
+// wrote lock_timeout into the file was asking for.
+func resolveDuration(key string, flag time.Duration, configured string) (time.Duration, error) {
+	if flag > 0 {
+		return flag, nil
+	}
+	if configured == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(configured)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not a duration", key, configured)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s: %q is negative", key, configured)
+	}
+	return d, nil
 }
 
 // envBool reads a boolean override from the environment. Unset or empty leaves
@@ -338,6 +380,8 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 		ConnStr:           connStr,
 		Strict:            st.Strict,
 		FailOnUnvalidated: st.FailOnUnvalidated,
+		LockTimeout:       st.LockTimeout,
+		StatementTimeout:  st.StatementTimeout,
 	}, logger)
 
 	cleanup := func() {

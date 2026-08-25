@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/ags-slc/m8/internal/migration"
 	"github.com/ags-slc/m8/internal/schema"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -1735,5 +1737,117 @@ func TestApplyRefusesUnvalidatedPlanWhenConfigured(t *testing.T) {
 	}
 	if !hasNote {
 		t.Error("the permissive apply did not apply the plan either")
+	}
+}
+
+// TestSchemaStatementLockTimeoutIsActuallyApplied pins that pg-schema-diff's
+// hazard-derived timeouts reach the server.
+//
+// They were issued as SET LOCAL on e.conn, which is not inside a transaction --
+// and SET LOCAL outside a transaction block does nothing at all. Postgres
+// raises a WARNING and moves on; the errors were discarded with `_, _ =`, so
+// nothing surfaced. Schema DDL therefore waited for its ACCESS EXCLUSIVE lock
+// without bound.
+//
+// With the fix the ALTER aborts with 55P03 (lock_not_available). Without it, it
+// blocks until the context deadline below, which is what the test distinguishes.
+func TestSchemaStatementLockTimeoutIsActuallyApplied(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if _, err := conn.Exec(ctx, `CREATE TABLE public.blocked (id BIGINT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second session sitting on the lock the ALTER needs.
+	blocker, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Close(ctx) }()
+	tx, err := blocker.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `LOCK TABLE public.blocked IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatal(err)
+	}
+
+	eng := New(conn, sqlDB, nil, &Config{ConnStr: connStr}, slog.Default())
+
+	// Bounded so an unbounded wait is a failure rather than a hang.
+	stmtCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	err = eng.execSchemaStatement(stmtCtx, schema.DiffStatement{
+		DDL:         `ALTER TABLE public.blocked ADD COLUMN note TEXT`,
+		LockTimeout: 2 * time.Second,
+		Timeout:     10 * time.Second,
+	})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("the ALTER succeeded while another session held ACCESS EXCLUSIVE")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("statement did not abort on lock_timeout after %s: %v", elapsed, err)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("lock_timeout of 2s took %s to fire", elapsed)
+	}
+
+	// Release the lock; the connection must be usable and clean afterwards.
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for setting, want := range map[string]string{"lock_timeout": "0", "statement_timeout": "0"} {
+		var got string
+		if err := conn.QueryRow(ctx, "SHOW "+setting).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Errorf("%s leaked onto the connection after the statement: %q, want %q", setting, got, want)
+		}
+	}
+}
+
+// TestSchemaStatementTimeoutOverride pins the escape hatch. pg-schema-diff's
+// derived statement_timeout is 3s for ordinary DDL, which a legitimate ALTER on
+// a large table can exceed -- and did, unnoticed, for as long as the timeouts
+// were no-ops.
+func TestSchemaStatementTimeoutOverride(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	eng := New(conn, sqlDB, nil, &Config{
+		ConnStr:          connStr,
+		StatementTimeout: 30 * time.Second,
+	}, slog.Default())
+
+	// The plan says 100ms; the override says 30s. pg_sleep(1) settles it.
+	err := eng.execSchemaStatement(ctx, schema.DiffStatement{
+		DDL:     `SELECT pg_sleep(1)`,
+		Timeout: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("override did not replace the derived statement_timeout: %v", err)
+	}
+
+	// Without the override the derived value is what applies.
+	strict := New(conn, sqlDB, nil, &Config{ConnStr: connStr}, slog.Default())
+	err = strict.execSchemaStatement(ctx, schema.DiffStatement{
+		DDL:     `SELECT pg_sleep(1)`,
+		Timeout: 100 * time.Millisecond,
+	})
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.Code != "57014" {
+		t.Fatalf("derived statement_timeout was not applied: %v", err)
 	}
 }

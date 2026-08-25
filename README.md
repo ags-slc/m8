@@ -223,6 +223,33 @@ ALTER TABLE large_table ADD COLUMN new_col TEXT;
 
 m8 also auto-detects `CREATE INDEX CONCURRENTLY` and runs those migrations outside a transaction automatically.
 
+### Timeouts on generated schema statements
+
+pg-schema-diff attaches a `lock_timeout` and a `statement_timeout` to every
+statement it generates, derived from that statement's hazards: 3 seconds for
+ordinary DDL, 20 minutes for a concurrent index build or a table drop. m8
+applies both, session-level, around each statement and resets them afterwards.
+(Session-level, not `SET LOCAL`: the plan contains `CREATE INDEX CONCURRENTLY`,
+which cannot run inside a transaction, and `SET LOCAL` outside one does
+nothing.)
+
+A `lock_timeout` means a schema statement that cannot get its `ACCESS EXCLUSIVE`
+lock **fails fast instead of queueing behind a long transaction** — which on a
+busy primary is what stops one DDL statement from blocking every reader behind
+it. If a legitimate statement needs longer than the derived value, raise it:
+
+```bash
+m8 apply --statement-timeout 5m --lock-timeout 10s
+```
+
+```yaml
+statement_timeout: 5m
+lock_timeout: 10s
+```
+
+Either override replaces the derived value for **every** generated statement,
+including the 20-minute index-build allowance, so prefer the flag for a one-off.
+
 ## Configuration
 
 ### .m8.yaml
