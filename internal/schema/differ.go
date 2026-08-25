@@ -3,6 +3,7 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -429,12 +430,19 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 		// step, not a problem with the diff, and refusing to plan because of it
 		// would make m8 unusable on any database whose views cross schemas.
 		//
-		// Degrade instead of failing: recompute without validation and tell the
-		// operator plainly that the extra check did not run.
+		// ONLY that phase degrades — see isValidationFailure. "The generated
+		// DDL does not execute" and "the plan does not converge" still abort.
 		if !isValidationFailure(err) {
 			return nil, fmt.Errorf("failed to generate schema diff: %w", err)
 		}
 		validationSkipped = err.Error()
+		// Regenerating means a second introspection of the target and a second
+		// temp database. pg-schema-diff v1.0.5 offers no way to avoid it: the
+		// plan it computed is discarded with the error, and SchemaSource's only
+		// method takes an unexported dependency struct, so an already-parsed
+		// schema cannot be handed back in. Reaching this path at all is
+		// reported to the operator (PLAN_NOT_VALIDATED), which is the signal to
+		// give the run a real shadow instance.
 		plan, err = diff.Generate(ctx,
 			diff.DBSchemaSource(liveDB),
 			diff.DDLSchemaSource(desiredDDL),
@@ -492,14 +500,49 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 	return result, nil
 }
 
-// isValidationFailure reports whether an error came from pg-schema-diff's
-// plan-validation step rather than from computing the diff. Validation is the
-// phase that rebuilds the current schema in a temporary database; with the diff
-// scoped to a single schema, that rebuild cannot resolve cross-schema
-// dependencies. Matching on the phase pg-schema-diff names in its error keeps
-// the degrade narrow — any other failure still aborts.
+// Phase strings pg-schema-diff v1.0.5 puts on the errors its plan-validation
+// step returns. assertValidPlan runs four phases inside one wrap:
+//
+//	validating migration plan: inserting schema in temporary database: …
+//	validating migration plan: running migration plan: …
+//	validating migration plan: fetching schema from migrated database: …
+//	validating migration plan: validating plan failed. diff detected: …
+//
+// Only the first is a limitation of how m8 scopes the diff. The other three are
+// the entire safety value of validation — "the generated DDL does not execute"
+// and "the plan does not converge" — and must stay fatal.
+const (
+	validationWrap     = "validating migration plan: "
+	shadowRebuildPhase = "inserting schema in temporary database: "
+)
+
+// isValidationFailure reports whether an error is the ONE plan-validation
+// failure m8 is allowed to degrade past: pg-schema-diff could not rebuild the
+// current schema in a throwaway database. Scoping the diff to a single schema —
+// which is what makes it correct and affordable — means that rebuild sees only
+// that schema, so it fails on any object whose definition reaches outside it.
+// Refusing to plan because of that would make m8 unusable on any database whose
+// views cross schemas.
+//
+// Every other validation phase still aborts. In particular "running migration
+// plan" means the generated DDL does not execute, which against a production
+// primary is the difference between a refusal and a migration that dies
+// halfway.
+//
+// The match is a prefix on the wrap and on the phase pg-schema-diff nests
+// inside it, never strings.Contains: the outer error appends
+// pretty.Formatter(plan), i.e. every DDL statement in the plan, so a Contains
+// test can be satisfied by DDL text rather than by the phase that actually
+// failed.
 func isValidationFailure(err error) bool {
-	return strings.Contains(err.Error(), "validating migration plan")
+	if err == nil {
+		return false
+	}
+	if !strings.HasPrefix(err.Error(), validationWrap) {
+		return false
+	}
+	inner := errors.Unwrap(err)
+	return inner != nil && strings.HasPrefix(inner.Error(), shadowRebuildPhase)
 }
 
 var (
