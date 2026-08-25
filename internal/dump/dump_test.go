@@ -31,19 +31,19 @@ func testDB(t *testing.T) (*pgx.Conn, func()) {
 
 	connStr, err := container.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
-		container.Terminate(ctx)
+		_ = container.Terminate(ctx)
 		t.Fatalf("failed to get connection string: %v", err)
 	}
 
 	conn, err := pgx.Connect(ctx, connStr)
 	if err != nil {
-		container.Terminate(ctx)
+		_ = container.Terminate(ctx)
 		t.Fatalf("failed to connect: %v", err)
 	}
 
 	cleanup := func() {
-		conn.Close(ctx)
-		container.Terminate(ctx)
+		_ = conn.Close(ctx)
+		_ = container.Terminate(ctx)
 	}
 	return conn, cleanup
 }

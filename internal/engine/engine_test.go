@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -39,27 +38,27 @@ func testDB(t *testing.T) (*pgx.Conn, *sql.DB, string, func()) {
 
 	connStr, err := container.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
-		container.Terminate(ctx)
+		_ = container.Terminate(ctx)
 		t.Fatalf("failed to get connection string: %v", err)
 	}
 
 	conn, err := pgx.Connect(ctx, connStr)
 	if err != nil {
-		container.Terminate(ctx)
+		_ = container.Terminate(ctx)
 		t.Fatalf("failed to connect: %v", err)
 	}
 
 	sqlDB, err := sql.Open("pgx", connStr)
 	if err != nil {
-		conn.Close(ctx)
-		container.Terminate(ctx)
+		_ = conn.Close(ctx)
+		_ = container.Terminate(ctx)
 		t.Fatalf("failed to open sql.DB: %v", err)
 	}
 
 	cleanup := func() {
-		sqlDB.Close()
-		conn.Close(ctx)
-		container.Terminate(ctx)
+		_ = sqlDB.Close()
+		_ = conn.Close(ctx)
+		_ = container.Terminate(ctx)
 	}
 
 	return conn, sqlDB, connStr, cleanup
@@ -69,7 +68,7 @@ func setupMigrationsDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	for _, sub := range []string{"ops", "schema/public", "logic", "permissions"} {
-		os.MkdirAll(filepath.Join(dir, sub), 0755)
+		mustMkdirAll(t, filepath.Join(dir, sub), 0755)
 	}
 	return dir
 }
@@ -90,12 +89,12 @@ func TestApplyOps(t *testing.T) {
 	defer cleanup()
 
 	dir := setupMigrationsDir(t)
-	os.WriteFile(filepath.Join(dir, "ops", "20260411_001__create_ext.sql"),
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260411_001__create_ext.sql"),
 		[]byte("CREATE EXTENSION IF NOT EXISTS pg_trgm;"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	ctx := context.Background()
@@ -124,18 +123,18 @@ func TestApplyLogicAndPermissions(t *testing.T) {
 	dir := setupMigrationsDir(t)
 
 	// Create a table first via ops
-	os.WriteFile(filepath.Join(dir, "ops", "20260411_001__setup.sql"),
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260411_001__setup.sql"),
 		[]byte("CREATE TABLE users (id INT PRIMARY KEY, name TEXT);"), 0644)
 
-	os.WriteFile(filepath.Join(dir, "logic", "hello_func.sql"),
+	mustWriteFile(t, filepath.Join(dir, "logic", "hello_func.sql"),
 		[]byte("CREATE OR REPLACE FUNCTION hello() RETURNS TEXT LANGUAGE sql AS $$ SELECT 'hello'; $$;"), 0644)
 
-	os.WriteFile(filepath.Join(dir, "permissions", "grants.sql"),
+	mustWriteFile(t, filepath.Join(dir, "permissions", "grants.sql"),
 		[]byte("GRANT SELECT ON users TO PUBLIC;"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	ctx := context.Background()
@@ -177,12 +176,12 @@ func TestApplyLogicChangedChecksum(t *testing.T) {
 
 	dir := setupMigrationsDir(t)
 	logicFile := filepath.Join(dir, "logic", "hello.sql")
-	os.WriteFile(logicFile,
+	mustWriteFile(t, logicFile,
 		[]byte("CREATE OR REPLACE FUNCTION hello() RETURNS TEXT LANGUAGE sql AS $$ SELECT 'v1'; $$;"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	ctx := context.Background()
@@ -193,13 +192,15 @@ func TestApplyLogicChangedChecksum(t *testing.T) {
 
 	// Verify v1
 	var val string
-	conn.QueryRow(ctx, "SELECT hello()").Scan(&val)
+	if err := conn.QueryRow(ctx, "SELECT hello()").Scan(&val); err != nil {
+		t.Fatalf("querying: %v", err)
+	}
 	if val != "v1" {
 		t.Errorf("expected v1, got %q", val)
 	}
 
 	// Change the file
-	os.WriteFile(logicFile,
+	mustWriteFile(t, logicFile,
 		[]byte("CREATE OR REPLACE FUNCTION hello() RETURNS TEXT LANGUAGE sql AS $$ SELECT 'v2'; $$;"), 0644)
 
 	result2, err := eng.Apply(ctx)
@@ -210,7 +211,9 @@ func TestApplyLogicChangedChecksum(t *testing.T) {
 		t.Error("expected logic to be re-applied on checksum change")
 	}
 
-	conn.QueryRow(ctx, "SELECT hello()").Scan(&val)
+	if err := conn.QueryRow(ctx, "SELECT hello()").Scan(&val); err != nil {
+		t.Fatalf("querying: %v", err)
+	}
 	if val != "v2" {
 		t.Errorf("expected v2, got %q", val)
 	}
@@ -221,14 +224,14 @@ func TestPlan(t *testing.T) {
 	defer cleanup()
 
 	dir := setupMigrationsDir(t)
-	os.WriteFile(filepath.Join(dir, "ops", "20260411_001__ext.sql"),
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260411_001__ext.sql"),
 		[]byte("CREATE EXTENSION IF NOT EXISTS pg_trgm;"), 0644)
-	os.WriteFile(filepath.Join(dir, "logic", "func.sql"),
+	mustWriteFile(t, filepath.Join(dir, "logic", "func.sql"),
 		[]byte("CREATE OR REPLACE FUNCTION f() RETURNS void LANGUAGE sql AS $$ SELECT; $$;"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	ctx := context.Background()
@@ -255,7 +258,9 @@ func TestPlan(t *testing.T) {
 
 	// Plan should NOT have applied anything
 	var count int
-	conn.QueryRow(ctx, "SELECT count(*) FROM _m8.history").Scan(&count)
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM _m8.history").Scan(&count); err != nil {
+		t.Fatalf("querying: %v", err)
+	}
 	if count != 0 {
 		t.Errorf("plan should not write to history, got %d rows", count)
 	}
@@ -266,26 +271,26 @@ func TestStatus(t *testing.T) {
 	defer cleanup()
 
 	dir := setupMigrationsDir(t)
-	os.WriteFile(filepath.Join(dir, "ops", "20260411_001__ext.sql"),
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260411_001__ext.sql"),
 		[]byte("CREATE EXTENSION IF NOT EXISTS pg_trgm;"), 0644)
-	os.WriteFile(filepath.Join(dir, "ops", "20260411_002__pending.sql"),
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260411_002__pending.sql"),
 		[]byte("SELECT 1;"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	ctx := context.Background()
 	// Apply first migration only by applying then adding the second
-	os.Remove(filepath.Join(dir, "ops", "20260411_002__pending.sql"))
+	_ = os.Remove(filepath.Join(dir, "ops", "20260411_002__pending.sql"))
 	_, err := eng.Apply(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Re-add the second migration
-	os.WriteFile(filepath.Join(dir, "ops", "20260411_002__pending.sql"),
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260411_002__pending.sql"),
 		[]byte("SELECT 1;"), 0644)
 
 	status, err := eng.Status(ctx)
@@ -305,14 +310,14 @@ func TestBaseline(t *testing.T) {
 	defer cleanup()
 
 	dir := setupMigrationsDir(t)
-	os.WriteFile(filepath.Join(dir, "ops", "20260411_001__ext.sql"),
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260411_001__ext.sql"),
 		[]byte("CREATE EXTENSION IF NOT EXISTS pg_trgm;"), 0644)
-	os.WriteFile(filepath.Join(dir, "logic", "func.sql"),
+	mustWriteFile(t, filepath.Join(dir, "logic", "func.sql"),
 		[]byte("CREATE OR REPLACE FUNCTION f() RETURNS void LANGUAGE sql AS $$ SELECT; $$;"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	ctx := context.Background()
@@ -338,7 +343,7 @@ func TestAdvisoryLock(t *testing.T) {
 	dir := setupMigrationsDir(t)
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	ctx := context.Background()
@@ -348,10 +353,12 @@ func TestAdvisoryLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn2.Close(ctx)
+	defer func() { _ = conn2.Close(ctx) }()
 
 	var acquired bool
-	conn2.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockID).Scan(&acquired)
+	if err := conn2.QueryRow(ctx, "SELECT pg_try_advisory_lock($1)", lockID).Scan(&acquired); err != nil {
+		t.Fatalf("querying: %v", err)
+	}
 	if !acquired {
 		t.Fatal("failed to acquire lock from second connection")
 	}
@@ -363,7 +370,7 @@ func TestAdvisoryLock(t *testing.T) {
 	}
 
 	// Release and retry
-	conn2.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockID)
+	_, _ = conn2.Exec(ctx, "SELECT pg_advisory_unlock($1)", lockID)
 	_, err = eng.Apply(ctx)
 	if err != nil {
 		t.Errorf("expected success after lock release: %v", err)
@@ -384,18 +391,18 @@ func TestSync(t *testing.T) {
 
 	dir := setupMigrationsDir(t)
 	// Schema file adds a column
-	os.WriteFile(filepath.Join(dir, "schema", "public", "users.sql"),
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "users.sql"),
 		[]byte("CREATE TABLE users (id INT PRIMARY KEY, name TEXT, email TEXT);"), 0644)
-	os.WriteFile(filepath.Join(dir, "ops", "20260411_001__ext.sql"),
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260411_001__ext.sql"),
 		[]byte("CREATE EXTENSION IF NOT EXISTS pg_trgm;"), 0644)
-	os.WriteFile(filepath.Join(dir, "logic", "hello.sql"),
+	mustWriteFile(t, filepath.Join(dir, "logic", "hello.sql"),
 		[]byte("CREATE OR REPLACE FUNCTION hello() RETURNS TEXT LANGUAGE sql AS $$ SELECT 'hi'; $$;"), 0644)
-	os.WriteFile(filepath.Join(dir, "permissions", "grants.sql"),
+	mustWriteFile(t, filepath.Join(dir, "permissions", "grants.sql"),
 		[]byte("GRANT SELECT ON users TO PUBLIC;"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	result, err := eng.Sync(ctx)
@@ -418,19 +425,23 @@ func TestSync(t *testing.T) {
 
 	// Verify the email column was added
 	var colExists bool
-	conn.QueryRow(ctx, `
+	if err := conn.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM information_schema.columns
 			WHERE table_name = 'users' AND column_name = 'email'
 		)
-	`).Scan(&colExists)
+	`).Scan(&colExists); err != nil {
+		t.Fatalf("querying: %v", err)
+	}
 	if !colExists {
 		t.Error("sync should have added the email column")
 	}
 
 	// Verify function works
 	var val string
-	conn.QueryRow(ctx, "SELECT hello()").Scan(&val)
+	if err := conn.QueryRow(ctx, "SELECT hello()").Scan(&val); err != nil {
+		t.Fatalf("querying: %v", err)
+	}
 	if val != "hi" {
 		t.Errorf("expected 'hi', got %q", val)
 	}
@@ -443,20 +454,20 @@ func TestApplyPhaseOrdering(t *testing.T) {
 	dir := setupMigrationsDir(t)
 
 	// Ops creates the table
-	os.WriteFile(filepath.Join(dir, "ops", "20260411_001__create_table.sql"),
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260411_001__create_table.sql"),
 		[]byte("CREATE TABLE events (id SERIAL PRIMARY KEY, name TEXT);"), 0644)
 
 	// Logic creates a function that references the table
-	os.WriteFile(filepath.Join(dir, "logic", "count_events.sql"),
+	mustWriteFile(t, filepath.Join(dir, "logic", "count_events.sql"),
 		[]byte("CREATE OR REPLACE FUNCTION count_events() RETURNS BIGINT LANGUAGE sql AS $$ SELECT count(*) FROM events; $$;"), 0644)
 
 	// Permissions grants on the table
-	os.WriteFile(filepath.Join(dir, "permissions", "grants.sql"),
+	mustWriteFile(t, filepath.Join(dir, "permissions", "grants.sql"),
 		[]byte("GRANT SELECT ON events TO PUBLIC;"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	ctx := context.Background()
@@ -478,7 +489,9 @@ func TestApplyPhaseOrdering(t *testing.T) {
 
 	// Verify the function works (depends on table existing)
 	var count int64
-	conn.QueryRow(ctx, "SELECT count_events()").Scan(&count)
+	if err := conn.QueryRow(ctx, "SELECT count_events()").Scan(&count); err != nil {
+		t.Fatalf("querying: %v", err)
+	}
 	if count != 0 {
 		t.Errorf("expected 0 events, got %d", count)
 	}
@@ -489,12 +502,12 @@ func TestFailureRecording(t *testing.T) {
 	defer cleanup()
 
 	dir := setupMigrationsDir(t)
-	os.WriteFile(filepath.Join(dir, "ops", "20260411_001__bad.sql"),
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260411_001__bad.sql"),
 		[]byte("CREATE TABLE nonexistent_schema.fail (id INT);"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	ctx := context.Background()
@@ -520,11 +533,11 @@ func TestDriftDetection(t *testing.T) {
 
 	dir := setupMigrationsDir(t)
 	opsFile := filepath.Join(dir, "ops", "20260411_001__ext.sql")
-	os.WriteFile(opsFile, []byte("CREATE EXTENSION IF NOT EXISTS pg_trgm;"), 0644)
+	mustWriteFile(t, opsFile, []byte("CREATE EXTENSION IF NOT EXISTS pg_trgm;"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	ctx := context.Background()
@@ -534,7 +547,7 @@ func TestDriftDetection(t *testing.T) {
 	}
 
 	// Modify the file after it was applied (drift)
-	os.WriteFile(opsFile, []byte("CREATE EXTENSION IF NOT EXISTS pg_trgm; -- modified"), 0644)
+	mustWriteFile(t, opsFile, []byte("CREATE EXTENSION IF NOT EXISTS pg_trgm; -- modified"), 0644)
 
 	status, err := eng.Status(ctx)
 	if err != nil {
@@ -558,12 +571,12 @@ func TestSchemaApply(t *testing.T) {
 	}
 
 	dir := setupMigrationsDir(t)
-	os.WriteFile(filepath.Join(dir, "schema", "public", "items.sql"),
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "items.sql"),
 		[]byte("CREATE TABLE items (id SERIAL PRIMARY KEY, name TEXT NOT NULL DEFAULT '');"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
 	if differ != nil {
-		defer differ.Close()
+		defer func() { _ = differ.Close() }()
 	}
 
 	result, err := eng.Apply(ctx)
@@ -588,12 +601,14 @@ func TestSchemaApply(t *testing.T) {
 
 	// Verify column exists
 	var colExists bool
-	conn.QueryRow(ctx, fmt.Sprintf(`
+	if err := conn.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM information_schema.columns
 			WHERE table_name = 'items' AND column_name = 'name'
 		)
-	`)).Scan(&colExists)
+	`).Scan(&colExists); err != nil {
+		t.Fatalf("querying: %v", err)
+	}
 	if !colExists {
 		t.Error("name column should exist after schema apply")
 	}
@@ -619,7 +634,7 @@ func TestSweepInvalidTempDBs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDiffer: %v", err)
 	}
-	defer differ.Close()
+	defer func() { _ = differ.Close() }()
 
 	mustExec := func(sqlStr string) {
 		if _, err := conn.Exec(ctx, sqlStr); err != nil {
@@ -698,7 +713,7 @@ func TestSweepStaleTempDBs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDiffer: %v", err)
 	}
-	defer differ.Close()
+	defer func() { _ = differ.Close() }()
 
 	mustExec := func(c *pgx.Conn, sqlStr string) {
 		if _, err := c.Exec(ctx, sqlStr); err != nil {
@@ -830,7 +845,7 @@ func TestShadowInstanceRouting(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDiffer with separate shadow: %v", err)
 	}
-	defer differ.Close()
+	defer func() { _ = differ.Close() }()
 
 	t.Run("diff hosts temp databases on the shadow", func(t *testing.T) {
 		res, err := differ.Diff(ctx, targetDB, "public",
@@ -1011,5 +1026,21 @@ func TestDropCreatedTempDBs(t *testing.T) {
 	}
 	if !dbExists(t, shadowConn, "pgschemadiff_tmp_someone_else") {
 		t.Error("another process's temp database was dropped")
+	}
+}
+
+// mustWriteFile writes a test fixture, failing the test if it cannot.
+func mustWriteFile(t *testing.T, path string, data []byte, perm os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, data, perm); err != nil {
+		t.Fatalf("writing %s: %v", path, err)
+	}
+}
+
+// mustMkdirAll creates a directory tree, failing the test if it cannot.
+func mustMkdirAll(t *testing.T, path string, perm os.FileMode) {
+	t.Helper()
+	if err := os.MkdirAll(path, perm); err != nil {
+		t.Fatalf("creating %s: %v", path, err)
 	}
 }
