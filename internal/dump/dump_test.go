@@ -662,3 +662,68 @@ func TestRenderDDLGeneratedColumn(t *testing.T) {
 		t.Errorf("replayed column is not stored-generated (attgenerated=%q)", isGenerated)
 	}
 }
+
+// EXECUTE privileges live in pg_proc.proacl, which
+// information_schema.role_table_grants does not cover. Without capturing them
+// a dumped schema silently loses every routine grant, and a procedure the
+// application calls becomes uncallable on a rebuilt database.
+func TestDumpRoutineGrants(t *testing.T) {
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := conn.Exec(ctx, `
+		CREATE SCHEMA radar;
+		CREATE ROLE app;
+		CREATE PROCEDURE radar.record_decision(p_id text, p_note text DEFAULT NULL)
+			LANGUAGE sql AS $$ SELECT 1 $$;
+		CREATE FUNCTION radar.score(p_id text) RETURNS int
+			LANGUAGE sql AS $$ SELECT 1 $$;
+		REVOKE ALL ON PROCEDURE radar.record_decision(text, text) FROM PUBLIC;
+		REVOKE ALL ON FUNCTION radar.score(text) FROM PUBLIC;
+		GRANT EXECUTE ON PROCEDURE radar.record_decision(text, text) TO app;
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDumper(conn)
+	grants, err := d.ListRoutineGrants(ctx, "radar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(grants) != 1 {
+		t.Fatalf("expected exactly the one non-default grant, got %d: %+v", len(grants), grants)
+	}
+	if grants[0].Grantee != "app" || grants[0].Privilege != "EXECUTE" {
+		t.Errorf("unexpected grant: %+v", grants[0])
+	}
+
+	rendered := RenderRoutineGrants(grants)
+	if !strings.Contains(rendered, "radar.record_decision(") {
+		t.Errorf("grant is not schema-qualified with a signature:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "TO app") {
+		t.Errorf("grantee missing:\n%s", rendered)
+	}
+
+	// It must replay without a search_path, and restore the privilege exactly.
+	if _, err := conn.Exec(ctx, "REVOKE ALL ON PROCEDURE radar.record_decision(text, text) FROM app"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "SET search_path TO public"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, rendered); err != nil {
+		t.Fatalf("rendered routine grants failed to replay: %v\n%s", err, rendered)
+	}
+
+	after, err := d.ListRoutineGrants(ctx, "radar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != 1 || after[0].Grantee != "app" {
+		t.Errorf("replay did not restore the grant: %+v", after)
+	}
+}

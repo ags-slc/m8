@@ -123,9 +123,20 @@ Examples:
 				return fmt.Errorf("failed to list public grants in %s: %w", schema, err)
 			}
 
+			routineGrants, err := d.ListRoutineGrants(ctx, schema)
+			if err != nil {
+				return fmt.Errorf("failed to list routine grants in %s: %w", schema, err)
+			}
+
 			allGrants := append(grants, publicGrants...)
-			if len(allGrants) > 0 {
+			if len(allGrants) > 0 || len(routineGrants) > 0 {
 				rendered := dump.RenderGrants(allGrants, schema)
+				if len(allGrants) == 0 {
+					rendered = fmt.Sprintf("-- Grants for schema %s\n\n", schema)
+				}
+				if r := dump.RenderRoutineGrants(routineGrants); r != "" {
+					rendered += "\n" + r
+				}
 				filename := "grants_" + schema + ".sql"
 
 				if dumpStdout {

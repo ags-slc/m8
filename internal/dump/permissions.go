@@ -77,6 +77,77 @@ func (d *Dumper) ListPublicGrants(ctx context.Context, schema string) ([]Grant, 
 	return grants, rows.Err()
 }
 
+// RoutineGrant represents a non-default EXECUTE privilege on a function or
+// procedure.
+type RoutineGrant struct {
+	Schema    string
+	Signature string // name(identity args) -- required, EXECUTE is per-overload
+	Grantee   string
+	Privilege string
+}
+
+// ListRoutineGrants returns EXECUTE privileges on a schema's functions and
+// procedures, excluding the owner's own and the implicit grant to PUBLIC.
+//
+// information_schema.role_table_grants covers relations only, so without this
+// a dumped schema silently loses every routine grant -- and a procedure the
+// application calls becomes uncallable on a rebuilt database.
+func (d *Dumper) ListRoutineGrants(ctx context.Context, schema string) ([]RoutineGrant, error) {
+	rows, err := d.conn.Query(ctx, `
+		SELECT
+			n.nspname,
+			p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')',
+			pg_catalog.pg_get_userbyid(a.grantee),
+			a.privilege_type
+		FROM pg_proc p
+		JOIN pg_namespace n ON n.oid = p.pronamespace
+		CROSS JOIN LATERAL aclexplode(
+			coalesce(p.proacl, acldefault('f', p.proowner))
+		) a
+		WHERE n.nspname = $1
+		  AND p.prokind IN ('f', 'p')
+		  AND a.grantee <> 0                                    -- not PUBLIC
+		  AND a.grantee <> p.proowner                           -- not the owner's own
+		  AND pg_catalog.pg_get_userbyid(a.grantee) NOT LIKE 'pg\_%'
+		  AND NOT EXISTS (
+			  SELECT 1 FROM pg_depend d
+			  WHERE d.objid = p.oid AND d.deptype = 'e'
+		  )
+		ORDER BY 2, 3, 4
+	`, schema)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list routine grants in %s: %w", schema, err)
+	}
+	defer rows.Close()
+
+	var grants []RoutineGrant
+	for rows.Next() {
+		var g RoutineGrant
+		if err := rows.Scan(&g.Schema, &g.Signature, &g.Grantee, &g.Privilege); err != nil {
+			return nil, err
+		}
+		grants = append(grants, g)
+	}
+	return grants, rows.Err()
+}
+
+// RenderRoutineGrants generates GRANT ... ON FUNCTION/PROCEDURE statements.
+//
+// The signature is always included: EXECUTE is granted per overload, and an
+// unqualified or unsignatured GRANT is ambiguous the moment a function is
+// overloaded. "ON ROUTINE" covers both functions and procedures.
+func RenderRoutineGrants(grants []RoutineGrant) string {
+	if len(grants) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, g := range grants {
+		fmt.Fprintf(&b, "GRANT %s ON ROUTINE %s.%s TO %s;\n",
+			g.Privilege, g.Schema, g.Signature, g.Grantee)
+	}
+	return b.String()
+}
+
 // RenderGrants generates GRANT statements grouped by grantee and table.
 func RenderGrants(grants []Grant, schema string) string {
 	if len(grants) == 0 {
