@@ -162,7 +162,11 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 	}
 	defer e.releaseLock(ctx)
 
-	if err := e.store.EnsureSchema(ctx); err != nil {
+	// Deliberately NOT EnsureSchema: plan is read-only, so on a database m8 has
+	// never touched it reports everything as pending rather than bootstrapping
+	// its own state as a side effect of being asked what it would do.
+	stateReady, err := e.store.SchemaExists(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -174,9 +178,12 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 	result := &ApplyResult{}
 
 	// Phase A: Ops — find unapplied
-	applied, err := e.store.GetAppliedOps(ctx)
-	if err != nil {
-		return nil, err
+	var applied []state.HistoryRow
+	if stateReady {
+		applied, err = e.store.GetAppliedOps(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 	appliedSet := make(map[string]bool)
 	for _, h := range applied {
@@ -237,13 +244,13 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 	}
 
 	// Phase C: Logic — find changed checksums
-	result.Logic, err = e.planIdempotent(ctx, filterByType(all, migration.TypeLogic), "logic")
+	result.Logic, err = e.planIdempotent(ctx, filterByType(all, migration.TypeLogic), "logic", stateReady)
 	if err != nil {
 		return result, err
 	}
 
 	// Phase D: Permissions — find changed checksums
-	result.Permissions, err = e.planIdempotent(ctx, filterByType(all, migration.TypePermissions), "permissions")
+	result.Permissions, err = e.planIdempotent(ctx, filterByType(all, migration.TypePermissions), "permissions", stateReady)
 	if err != nil {
 		return result, err
 	}
@@ -585,10 +592,18 @@ func (e *Engine) applyIdempotent(ctx context.Context, migrations []*migration.Mi
 	return results, nil
 }
 
-func (e *Engine) planIdempotent(ctx context.Context, migrations []*migration.Migration, typ string) ([]MigrationResult, error) {
-	latest, err := e.store.GetLatestByType(ctx, typ)
-	if err != nil {
-		return nil, err
+// planIdempotent classifies logic/permissions migrations as pending or already
+// applied. stateReady is false on a database m8 has never touched, where there
+// is no history to read and everything is therefore pending — plan must not
+// create the state schema just to discover that.
+func (e *Engine) planIdempotent(ctx context.Context, migrations []*migration.Migration, typ string, stateReady bool) ([]MigrationResult, error) {
+	latest := map[string]state.HistoryRow{}
+	if stateReady {
+		var err error
+		latest, err = e.store.GetLatestByType(ctx, typ)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var results []MigrationResult
 	for _, m := range migrations {

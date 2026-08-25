@@ -256,13 +256,16 @@ func TestPlan(t *testing.T) {
 		t.Errorf("expected 2 pending, got %d", pending)
 	}
 
-	// Plan should NOT have applied anything
-	var count int
-	if err := conn.QueryRow(ctx, "SELECT count(*) FROM _m8.history").Scan(&count); err != nil {
+	// Plan should NOT have applied anything — and on a database m8 has never
+	// touched, it should not have bootstrapped its own state schema either.
+	var stateExists bool
+	if err := conn.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = '_m8')`,
+	).Scan(&stateExists); err != nil {
 		t.Fatalf("querying: %v", err)
 	}
-	if count != 0 {
-		t.Errorf("plan should not write to history, got %d rows", count)
+	if stateExists {
+		t.Error("plan should not create the _m8 state schema")
 	}
 }
 
@@ -1243,5 +1246,60 @@ func TestSchemaApplyCreatesSerialTable(t *testing.T) {
 				t.Errorf("second plan is not clean: %s", stmt.DDL)
 			}
 		}
+	}
+}
+
+// TestPlanOnVirginDatabaseIsReadOnly pins that plan writes nothing at all to a
+// database m8 has never touched — not even its own state schema. A CI plan gate
+// runs on every pull request; it must be safe to point at production.
+func TestPlanOnVirginDatabaseIsReadOnly(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	dir := setupMigrationsDir(t)
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260101_001__seed.sql"),
+		[]byte("SELECT 1;"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "logic", "helper.sql"),
+		[]byte("CREATE OR REPLACE FUNCTION helper() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;"), 0644)
+
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+
+	result, err := eng.Plan(ctx)
+	if err != nil {
+		t.Fatalf("plan on a virgin database: %v", err)
+	}
+
+	var stateExists bool
+	if err := conn.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = '_m8')`,
+	).Scan(&stateExists); err != nil {
+		t.Fatal(err)
+	}
+	if stateExists {
+		t.Error("plan bootstrapped the _m8 state schema; plan must not write")
+	}
+
+	// With no history to read, everything is pending.
+	if len(result.Ops) != 1 || result.Ops[0].Skipped {
+		t.Errorf("expected the ops migration to be pending, got %+v", result.Ops)
+	}
+	if len(result.Logic) != 1 || result.Logic[0].Skipped {
+		t.Errorf("expected the logic migration to be pending, got %+v", result.Logic)
+	}
+
+	// The function it planned must not have been created either.
+	var fnExists bool
+	if err := conn.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'helper')`,
+	).Scan(&fnExists); err != nil {
+		t.Fatal(err)
+	}
+	if fnExists {
+		t.Error("plan created the helper function")
 	}
 }
