@@ -458,6 +458,23 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 	var definedObjects map[string]bool
 	if !strict {
 		definedObjects = extractDefinedObjects(desiredDDL)
+		// A sequence behind a SERIAL or IDENTITY column is never named in the
+		// DDL that declares it — the column says BIGSERIAL and Postgres derives
+		// "<table>_<column>_seq" — so the desired state alone cannot say which
+		// sequences are ours. The catalog can: pg_depend records the column each
+		// sequence hangs off. Adopt every sequence whose owning table is
+		// declared, and nothing else. Guessing by name prefix instead would
+		// adopt an undeclared "probe_history" the moment "probe" is declared,
+		// and then happily DROP its sequence.
+		owned, err := ownedSequences(ctx, liveDB, targetSchema)
+		if err != nil {
+			return nil, err
+		}
+		for sequence, table := range owned {
+			if definedObjects[table] {
+				definedObjects[sequence] = true
+			}
+		}
 	}
 
 	result := &DiffResult{}
@@ -482,14 +499,7 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 		for _, h := range stmt.Hazards {
 			ds.Hazards = append(ds.Hazards, string(h.Type))
 		}
-
-		// pg-schema-diff doesn't manage sequences, so a generated CREATE TABLE
-		// for a SERIAL column arrives with a nextval() default and nothing
-		// behind it. Bracket it with the sequence it needs. See sequences.go.
-		before, after := sequenceStatements(findSequenceFixups(stmt.DDL))
-		result.Statements = append(result.Statements, before...)
 		result.Statements = append(result.Statements, ds)
-		result.Statements = append(result.Statements, after...)
 	}
 
 	result.HasChanges = len(result.Statements) > 0
@@ -570,6 +580,11 @@ func extractDefinedObjects(ddlStatements []string) map[string]bool {
 	return objects
 }
 
+// createStatementRe matches a statement that brings a new object into
+// existence. Anchored: only the leading keyword counts, never CREATE appearing
+// inside a body or a string literal.
+var createStatementRe = regexp.MustCompile(`(?is)^\s*CREATE\s`)
+
 // statementTargetsDefinedObject returns true if the DDL statement modifies an
 // object that was defined in the S__ file. This prevents pg-schema-diff from
 // generating DROP/ALTER/REVOKE statements for unrelated objects that exist in
@@ -587,6 +602,27 @@ func statementTargetsDefinedObject(ddl string, defined map[string]bool) bool {
 		return false
 	}
 
+	// A CREATE is always ours. pg-schema-diff emits CREATE only for objects
+	// present in the desired schema and absent from the (schema-scoped) current
+	// one, so a CREATE can never reach an undeclared live object — which is the
+	// only thing this filter exists to protect.
+	//
+	// It is also the only way some declared objects are reachable at all. The
+	// sequence behind a SERIAL column arrives as
+	//
+	//	CREATE SEQUENCE "public"."probe_id_seq"
+	//
+	// which contains neither `"probe"` nor a word-bounded `probe` ('_' is an
+	// identifier character), so the name test below drops it — while the
+	// matching ALTER SEQUENCE … OWNED BY "public"."probe"."id" survives, because
+	// that one does mention the table. m8 used to paper over the asymmetry by
+	// synthesizing its own CREATE SEQUENCE from a regex over the generated DDL;
+	// that fixup was anchored on CREATE TABLE, so ALTER TABLE … ADD COLUMN …
+	// BIGSERIAL got none and died on apply with 42P01.
+	if createStatementRe.MatchString(ddl) {
+		return true
+	}
+
 	// Check if any defined object name appears in the statement.
 	// pg-schema-diff quotes table names ("users") but not index names (idx_foo).
 	for name := range defined {
@@ -598,6 +634,48 @@ func statementTargetsDefinedObject(ddl string, defined map[string]bool) bool {
 		}
 	}
 	return false
+}
+
+// ownedSequences returns the sequences in targetSchema that belong to a column,
+// mapped to the (lowercased) name of the table that owns them. These are the
+// sequences SERIAL and GENERATED … AS IDENTITY create: they carry an automatic
+// (deptype 'a') or internal (deptype 'i') dependency on the owning column, which
+// is what makes them droppable with the table.
+//
+// Without this, a declared table that stops being SERIAL leaves its sequence
+// behind forever: the plan's DROP SEQUENCE "public"."probe_id_seq" names no
+// declared object and is filtered away, so every run re-proposes nothing and the
+// orphan is never reclaimed.
+func ownedSequences(ctx context.Context, liveDB *sql.DB, targetSchema string) (map[string]string, error) {
+	rows, err := liveDB.QueryContext(ctx, `
+		SELECT lower(s.relname), lower(t.relname)
+		FROM pg_class s
+		JOIN pg_namespace n ON n.oid = s.relnamespace
+		JOIN pg_depend d
+		  ON d.classid = 'pg_class'::regclass
+		 AND d.objid = s.oid
+		 AND d.refclassid = 'pg_class'::regclass
+		 AND d.deptype IN ('a', 'i')
+		JOIN pg_class t ON t.oid = d.refobjid
+		WHERE s.relkind = 'S'
+		  AND n.nspname = $1`, targetSchema)
+	if err != nil {
+		return nil, fmt.Errorf("listing owned sequences in %s: %w", targetSchema, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	owned := make(map[string]string)
+	for rows.Next() {
+		var sequence, table string
+		if err := rows.Scan(&sequence, &table); err != nil {
+			return nil, fmt.Errorf("scanning owned sequence in %s: %w", targetSchema, err)
+		}
+		owned[sequence] = table
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating owned sequences in %s: %w", targetSchema, err)
+	}
+	return owned, nil
 }
 
 // containsWord checks if s contains word as a whole word (not a substring of

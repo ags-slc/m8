@@ -1181,10 +1181,14 @@ func TestSchemaDiffIsScopedToItsSchema(t *testing.T) {
 }
 
 // TestSchemaApplyCreatesSerialTable pins that a table declared with a SERIAL
-// column can actually be created. pg-schema-diff does not manage sequences: the
-// CREATE TABLE it generates carries a nextval() default with nothing behind it,
-// which fails on apply with 42P01. m8 brackets such a statement with the
-// sequence it needs.
+// column can actually be created.
+//
+// pg-schema-diff does manage sequences: it emits its own, correctly qualified,
+// CREATE SEQUENCE "public"."probe_id_seq". What broke this was m8's own
+// non-strict filter, which kept a statement only when it named a declared
+// object -- and that CREATE SEQUENCE contains neither `"probe"` nor a
+// word-bounded `probe`, so m8 dropped the library's correct statement and the
+// CREATE TABLE then failed on apply with 42P01.
 func TestSchemaApplyCreatesSerialTable(t *testing.T) {
 	conn, sqlDB, connStr, cleanup := testDB(t)
 	defer cleanup()
@@ -1413,5 +1417,182 @@ func TestFormatPlanOutputWarnsOnCleanUnvalidatedPlan(t *testing.T) {
 	}
 	if !strings.Contains(out, "No pending migrations") {
 		t.Errorf("warning replaced the up-to-date verdict instead of accompanying it:\n%s", out)
+	}
+}
+
+// TestSchemaApplyAddsSerialColumnToExistingTable pins the case a CREATE TABLE
+// fixup can never reach: the table already exists and the declared SERIAL
+// arrives as
+//
+//	CREATE SEQUENCE "public"."widget_seq_seq"
+//	ALTER TABLE "public"."widget" ADD COLUMN "seq" bigint DEFAULT nextval('widget_seq_seq'::regclass) NOT NULL
+//	ALTER SEQUENCE "public"."widget_seq_seq" OWNED BY "public"."widget"."seq"
+//
+// The middle statement names the declared table and survived the non-strict
+// filter; the CREATE SEQUENCE names only the derived sequence and did not, so
+// apply died with 42P01. m8's old synthesized fixup was anchored on CREATE
+// TABLE and never fired here at all.
+func TestSchemaApplyAddsSerialColumnToExistingTable(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if _, err := conn.Exec(ctx, `CREATE TABLE public.widget (id BIGINT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := setupMigrationsDir(t)
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "widget.sql"),
+		[]byte("CREATE TABLE public.widget (\n    id BIGINT PRIMARY KEY,\n    seq BIGSERIAL\n);"), 0644)
+
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+
+	if _, err := eng.Apply(ctx); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	var seq1, seq2 int64
+	if err := conn.QueryRow(ctx, `INSERT INTO public.widget (id) VALUES (1) RETURNING seq`).Scan(&seq1); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := conn.QueryRow(ctx, `INSERT INTO public.widget (id) VALUES (2) RETURNING seq`).Scan(&seq2); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if seq2 <= seq1 {
+		t.Errorf("sequence did not advance: %d then %d", seq1, seq2)
+	}
+
+	var owned bool
+	if err := conn.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_depend d
+			JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+			JOIN pg_class t ON t.oid = d.refobjid
+			WHERE t.relname = 'widget' AND d.deptype = 'a'
+		)
+	`).Scan(&owned); err != nil {
+		t.Fatal(err)
+	}
+	if !owned {
+		t.Error("sequence is not OWNED BY the widget.seq column")
+	}
+}
+
+// TestSchemaApplySerialSequenceMatchesColumnType pins that the sequence behind a
+// SERIAL (int4) column is an int4 sequence. m8 used to synthesize every fixup
+// sequence as "AS bigint" regardless of the column, so a SERIAL column got a
+// bigint sequence whose upper range the column cannot hold.
+func TestSchemaApplySerialSequenceMatchesColumnType(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	dir := setupMigrationsDir(t)
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "counter.sql"),
+		[]byte("CREATE TABLE public.counter (\n    id SERIAL,\n    CONSTRAINT counter_pkey PRIMARY KEY (id)\n);"), 0644)
+
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+
+	if _, err := eng.Apply(ctx); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	var schemaName, dataType string
+	if err := conn.QueryRow(ctx, `
+		SELECT schemaname, data_type::text FROM pg_sequences WHERE sequencename = 'counter_id_seq'
+	`).Scan(&schemaName, &dataType); err != nil {
+		t.Fatalf("counter_id_seq: %v", err)
+	}
+	if dataType != "integer" {
+		t.Errorf("sequence for a SERIAL column is %s, want integer", dataType)
+	}
+	if schemaName != "public" {
+		t.Errorf("sequence landed in schema %q, want public", schemaName)
+	}
+}
+
+// TestSchemaDiffReclaimsOwnedSequencesOnly pins how the non-strict filter decides
+// a sequence is m8's to touch.
+//
+// A sequence behind a SERIAL column is never named in the DDL that declares it,
+// so the declared-object set cannot contain it. Resolving it from pg_depend --
+// the column each sequence actually hangs off -- adopts exactly the sequences of
+// declared tables. Guessing by name prefix instead would adopt probe_history's
+// sequence the moment "probe" is declared, and then drop it.
+func TestSchemaDiffReclaimsOwnedSequencesOnly(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.probe (id BIGSERIAL PRIMARY KEY, note TEXT);
+		CREATE TABLE public.probe_history (hid BIGSERIAL PRIMARY KEY);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := setupMigrationsDir(t)
+	// probe is declared, and no longer SERIAL. probe_history is not declared at
+	// all -- its name merely starts with "probe_".
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "probe.sql"),
+		[]byte("CREATE TABLE public.probe (\n    id BIGINT NOT NULL,\n    note TEXT,\n    CONSTRAINT probe_pkey PRIMARY KEY (id)\n);"), 0644)
+
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+
+	result, err := eng.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sawDrop := false
+	for _, s := range result.Schema {
+		if s.Error != nil {
+			t.Fatalf("diff error: %v", s.Error)
+		}
+		if s.Diff == nil {
+			continue
+		}
+		for _, stmt := range s.Diff.Statements {
+			lower := strings.ToLower(stmt.DDL)
+			if strings.Contains(lower, "probe_history") {
+				t.Errorf("plan reached an undeclared table's sequence: %s", stmt.DDL)
+			}
+			if strings.Contains(lower, "drop sequence") && strings.Contains(lower, "probe_id_seq") {
+				sawDrop = true
+			}
+		}
+	}
+	if !sawDrop {
+		t.Error("plan left probe_id_seq behind: a declared table that stops being SERIAL must reclaim its own sequence")
+	}
+
+	if _, err := eng.Apply(ctx); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	var probeSeq, historySeq bool
+	if err := conn.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_sequences WHERE sequencename = 'probe_id_seq'),
+		        EXISTS (SELECT 1 FROM pg_sequences WHERE sequencename = 'probe_history_hid_seq')`,
+	).Scan(&probeSeq, &historySeq); err != nil {
+		t.Fatal(err)
+	}
+	if probeSeq {
+		t.Error("probe_id_seq survived: the declared table no longer uses it")
+	}
+	if !historySeq {
+		t.Error("probe_history_hid_seq was dropped: probe_history is not declared and must not be touched")
 	}
 }

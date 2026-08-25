@@ -53,7 +53,7 @@ func TestIsValidationFailureDegradesOnlyOnTheShadowRebuild(t *testing.T) {
 			err: wrapAsPgSchemaDiff(
 				fmt.Errorf("fetching schema from migrated database: %w", errors.New("connection reset by peer")),
 				"diff.Plan{Statements: []diff.Statement{...}}"),
-			want:  false,
+			want: false,
 		},
 		{
 			name: "not a validation failure at all",
