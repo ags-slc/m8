@@ -12,11 +12,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
-          # go.mod is the single source of truth for the Go version.
+          # go.mod is the single source of truth: setup-go v6+ pins
+          # GOTOOLCHAIN=local, so an installed version below go.mod's `go`
+          # directive fails every command that loads the module graph.
           go-version-file: go.mod
 
       - name: Build
@@ -42,11 +44,13 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
-          # go.mod is the single source of truth for the Go version.
+          # go.mod is the single source of truth: setup-go v6+ pins
+          # GOTOOLCHAIN=local, so an installed version below go.mod's `go`
+          # directive fails every command that loads the module graph.
           go-version-file: go.mod
 
       # golangci-lint v2 requires action v7 or later: on v6 the job died at
