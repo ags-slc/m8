@@ -18,6 +18,14 @@ func TestResolveLogicFileNamesSeparatesOverloads(t *testing.T) {
 	if names[zeroArg] == "" || names[oneArg] == "" {
 		t.Fatalf("missing filename: %q / %q", names[zeroArg], names[oneArg])
 	}
+	// The suffix disambiguates on arguments only; it must not repeat the name
+	// that is already in the prefix.
+	if got, want := names[oneArg], "materialized_proc_lcb_backfill__in_p_start_date_date.sql"; got != want {
+		t.Errorf("overload filename: got %q, want %q", got, want)
+	}
+	if got, want := names[zeroArg], "materialized_proc_lcb_backfill__noargs.sql"; got != want {
+		t.Errorf("zero-arg overload filename: got %q, want %q", got, want)
+	}
 	for _, n := range []string{names[zeroArg], names[oneArg]} {
 		if n[len(n)-4:] != ".sql" {
 			t.Errorf("filename %q is not a .sql file", n)
@@ -57,8 +65,8 @@ func TestResolveLogicFileNamesSeparatesCrossKindCollisions(t *testing.T) {
 // Filenames must be reproducible: the same set of objects in a different order
 // must yield the same names, or every re-dump churns the tree.
 func TestResolveLogicFileNamesIsDeterministic(t *testing.T) {
-	a := LogicObject{Schema: "materialized", Name: "f", Identity: "IN b integer"}
-	b := LogicObject{Schema: "materialized", Name: "f", Identity: "IN a integer"}
+	a := LogicObject{Schema: "materialized", Name: "f", Identity: "f(IN b integer)"}
+	b := LogicObject{Schema: "materialized", Name: "f", Identity: "f(IN a integer)"}
 
 	first := ResolveLogicFileNames([]LogicObject{a, b})
 	second := ResolveLogicFileNames([]LogicObject{b, a})

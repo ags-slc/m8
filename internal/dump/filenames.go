@@ -31,7 +31,14 @@ var nonFilenameChars = regexp.MustCompile(`[^a-z0-9]+`)
 
 // argSlug renders an argument list into a short, filename-safe, deterministic
 // suffix: "IN p_start_date date" -> "in_p_start_date_date", "" -> "noargs".
+//
+// Identity may be either a bare argument list or a full "name(args)"
+// signature; only the arguments distinguish overloads, so a wrapping name is
+// stripped to keep the suffix from repeating the name already in the prefix.
 func argSlug(identity string) string {
+	if open := strings.Index(identity, "("); open >= 0 && strings.HasSuffix(identity, ")") {
+		identity = identity[open+1 : len(identity)-1]
+	}
 	s := nonFilenameChars.ReplaceAllString(strings.ToLower(identity), "_")
 	s = strings.Trim(s, "_")
 	if s == "" {
