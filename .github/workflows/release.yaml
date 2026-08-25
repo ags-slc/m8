@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write  # required for cosign keyless signing via OIDC
 
 jobs:
   release:
@@ -20,13 +21,22 @@ jobs:
         with:
           go-version: "1.24"
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # -p 1: package-parallel execution of the testcontainers suites is flaky
+      # under contention, and a flake here aborts a release whose tag already
+      # exists. CI has already run these on the merge commit.
       - name: Run tests
-        run: go test ./... -count=1 -timeout 300s
+        run: go test ./... -count=1 -p 1 -timeout 600s
 
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:
-          version: latest
+          # homebrew_casks needs GoReleaser >= 2.10 and `formats` >= 2.6; pin the
+          # major so a future breaking release cannot fail an already-tagged build.
+          version: "~> v2"
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
