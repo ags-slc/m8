@@ -45,7 +45,10 @@ jobs:
         with:
           go-version: "1.24"
 
+      # golangci-lint v2 requires action v7 or later: on v6 the job died at
+      # install ("golangci-lint v2 is not supported by golangci-lint-action v6")
+      # and never linted anything, which is how the backlog accumulated.
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.1.6
+          version: v2.13.1

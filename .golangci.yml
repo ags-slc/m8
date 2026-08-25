@@ -1,0 +1,13 @@
+# https://golangci-lint.run/docs/configuration/file/
+version: "2"
+
+issues:
+  # Report everything. The defaults cap at 3 occurrences of the same issue and
+  # 50 per linter, which is how two thirds of this repo's backlog stayed
+  # invisible even in local runs.
+  max-same-issues: 0
+  max-issues-per-linter: 0
+
+formatters:
+  enable:
+    - gofmt
