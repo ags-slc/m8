@@ -24,8 +24,10 @@ type Config struct {
 	Strict        bool   `yaml:"strict"`
 }
 
-// Load reads .m8.yaml from the current directory. Returns an empty config
-// if the file doesn't exist (not an error).
+// Load reads .m8.yaml from the current directory. A missing file yields an
+// empty config and no error; a file that exists but cannot be read or parsed is
+// an error, and callers must treat it as fatal -- silently falling back to an
+// empty config turns every safety setting in the file off.
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

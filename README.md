@@ -260,6 +260,13 @@ m8 supports standard PostgreSQL environment variables and `.env` files:
 | `PGSSLMODE` | `--sslmode` | `sslmode` | prefer |
 | `DATABASE_URL` | `--database-url` | `database_url` | -- |
 | `SHADOW_DATABASE_URL` | `--shadow-url` | `shadow_url` | -- |
+| `M8_REQUIRE_SHADOW` | -- | `require_shadow` | false |
+
+A `.m8.yaml` that exists but cannot be parsed is a **fatal error**, not a
+warning: falling back to an empty config would turn every safety setting in the
+file off at exactly the moment the file is wrong. A *missing* `.m8.yaml` is
+still fine. Boolean environment overrides must parse — `M8_REQUIRE_SHADOW=ture`
+is an error rather than a silent `false`.
 
 ### Shadow Instance for Schema Diffing
 

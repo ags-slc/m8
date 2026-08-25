@@ -26,6 +26,14 @@ Types and naming:
 		migType := strings.ToLower(args[0])
 		name := args[1]
 
+		// The same resolution apply uses: scaffolding into migrations/ while
+		// apply reads .m8.yaml's migrations_dir writes files nothing runs.
+		st, err := resolveSettings()
+		if err != nil {
+			return err
+		}
+		migrationsDir := st.MigrationsDir
+
 		var filePath string
 
 		switch migType {
@@ -36,28 +44,28 @@ Types and naming:
 				return fmt.Errorf("schema name must include PG schema: m8 new schema public/users")
 			}
 			pgSchema, objName := parts[0], parts[1]
-			dir := filepath.Join(flagMigrationsDir, "schema", pgSchema)
+			dir := filepath.Join(migrationsDir, "schema", pgSchema)
 			if err := os.MkdirAll(dir, 0755); err != nil {
 				return fmt.Errorf("failed to create directory %s: %w", dir, err)
 			}
 			filePath = filepath.Join(dir, objName+".sql")
 
 		case "logic":
-			dir := filepath.Join(flagMigrationsDir, "logic")
+			dir := filepath.Join(migrationsDir, "logic")
 			if err := os.MkdirAll(dir, 0755); err != nil {
 				return fmt.Errorf("failed to create directory %s: %w", dir, err)
 			}
 			filePath = filepath.Join(dir, name+".sql")
 
 		case "permissions":
-			dir := filepath.Join(flagMigrationsDir, "permissions")
+			dir := filepath.Join(migrationsDir, "permissions")
 			if err := os.MkdirAll(dir, 0755); err != nil {
 				return fmt.Errorf("failed to create directory %s: %w", dir, err)
 			}
 			filePath = filepath.Join(dir, name+".sql")
 
 		case "ops":
-			dir := filepath.Join(flagMigrationsDir, "ops")
+			dir := filepath.Join(migrationsDir, "ops")
 			if err := os.MkdirAll(dir, 0755); err != nil {
 				return fmt.Errorf("failed to create directory %s: %w", dir, err)
 			}

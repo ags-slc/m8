@@ -89,21 +89,75 @@ func Execute() {
 	}
 }
 
-// loadConfig loads .m8.yaml from the current directory (if it exists).
-func loadConfig() *config.Config {
+// loadConfig reads .m8.yaml from the current directory.
+//
+// A parse failure is FATAL. It used to log slog.Warn and hand back an empty
+// config, so a YAML typo silently turned require_shadow -- the one setting whose
+// entire job is to refuse a degrade -- back off, and the run carried on against
+// the target as if the file had never existed. A missing file is still fine; a
+// file that exists and cannot be read or parsed is not.
+func loadConfig() (*config.Config, error) {
 	cfg, err := config.Load(".m8.yaml")
 	if err != nil {
-		slog.Warn("failed to load .m8.yaml", "error", err)
-		return &config.Config{}
+		return nil, fmt.Errorf("reading .m8.yaml: %w", err)
 	}
-	return cfg
+	return cfg, nil
+}
+
+// settings is the effective configuration for one command invocation: flags,
+// environment, and .m8.yaml collapsed in that priority order.
+//
+// It is resolved once per command. The previous shape re-read .m8.yaml from
+// four separate resolvers, which meant the same run could read the file four
+// times and, on a parse error, disagree with itself about what it said.
+type settings struct {
+	ConnStr       string
+	ShadowConnStr string
+	MigrationsDir string
+	Strict        bool
+	RequireShadow bool
+}
+
+func resolveSettings() (*settings, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	// M8_REQUIRE_SHADOW lets CI enforce the refusal independently of the file,
+	// which matters precisely because the file is the thing an editing mistake
+	// can disarm.
+	requireShadow, err := envBool("M8_REQUIRE_SHADOW", cfg.RequireShadow)
+	if err != nil {
+		return nil, err
+	}
+	return &settings{
+		ConnStr:       resolveConnStr(cfg),
+		ShadowConnStr: resolveShadowConnStr(cfg),
+		MigrationsDir: resolveMigrationsDir(cfg),
+		Strict:        flagStrict || cfg.Strict,
+		RequireShadow: requireShadow,
+	}, nil
+}
+
+// envBool reads a boolean override from the environment. Unset or empty leaves
+// the file's value alone; anything else must parse, so "M8_REQUIRE_SHADOW=ture"
+// in a CI job is an error rather than a silent false.
+func envBool(name string, fallback bool) (bool, error) {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s=%q is not a boolean", name, raw)
+	}
+	return v, nil
 }
 
 // resolveConnStr builds a PostgreSQL connection string.
 // Priority: flag > env > .m8.yaml > default
-func resolveConnStr() string {
-	cfg := loadConfig()
-
+func resolveConnStr(cfg *config.Config) string {
 	// --database-url or DATABASE_URL or config takes highest priority
 	if flagDatabaseURL != "" {
 		return flagDatabaseURL
@@ -160,22 +214,18 @@ const teardownTimeout = 30 * time.Second
 // hosts schema-diff temp databases. Priority: flag > SHADOW_DATABASE_URL env >
 // .m8.yaml shadow_url. Returns "" when none is configured (temp DBs then land
 // on the target instance).
-func resolveShadowConnStr() string {
+func resolveShadowConnStr(cfg *config.Config) string {
 	if flagShadowURL != "" {
 		return flagShadowURL
 	}
 	if url := os.Getenv("SHADOW_DATABASE_URL"); url != "" {
 		return url
 	}
-	if cfg := loadConfig(); cfg.ShadowURL != "" {
-		return cfg.ShadowURL
-	}
-	return ""
+	return cfg.ShadowURL
 }
 
 // resolveMigrationsDir returns the migrations directory from flag or config.
-func resolveMigrationsDir() string {
-	cfg := loadConfig()
+func resolveMigrationsDir(cfg *config.Config) string {
 	if flagMigrationsDir != "migrations" {
 		return flagMigrationsDir // explicit flag overrides
 	}
@@ -185,27 +235,22 @@ func resolveMigrationsDir() string {
 	return flagMigrationsDir
 }
 
-// resolveStrict returns the strict setting from flag or config.
-func resolveStrict() bool {
-	if flagStrict {
-		return true
-	}
-	cfg := loadConfig()
-	return cfg.Strict
-}
-
 // connectAndBuildEngine creates a pgx connection, sql.DB, and engine. When
 // needDiffer is true it also constructs the schema differ — which connects to
 // the shadow instance and sweeps orphaned temp databases. Commands that never
 // diff (status, baseline) pass false so they don't open a shadow connection or
 // perform DROP DATABASE side effects.
 func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *engine.Engine, func(), error) {
-	connStr := resolveConnStr()
+	st, err := resolveSettings()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	connStr := st.ConnStr
 
 	// Checked before connecting: a missing shadow is a configuration error, and
 	// there is no reason to open a session on the target -- possibly a
 	// production primary -- only to refuse a moment later.
-	if needDiffer && resolveShadowConnStr() == "" && loadConfig().RequireShadow {
+	if needDiffer && st.ShadowConnStr == "" && st.RequireShadow {
 		// A warning is not enough when the target is a production primary:
 		// falling back means CREATE DATABASE / DROP DATABASE churn on it.
 		// Repositories that can never accept that set require_shadow in
@@ -229,7 +274,7 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 
 	var differ *schema.Differ
 	if needDiffer {
-		shadowConnStr := resolveShadowConnStr()
+		shadowConnStr := st.ShadowConnStr
 		if shadowConnStr == "" {
 			slog.Warn("no shadow instance configured: schema-diff temp databases will be created on the TARGET instance " +
 				"(set --shadow-url / SHADOW_DATABASE_URL to an isolated non-production instance to avoid CREATE/DROP DATABASE churn on the target)")
@@ -273,9 +318,9 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 
 	logger := slog.Default()
 	eng := engine.New(conn, sqlDB, differ, &engine.Config{
-		MigrationsDir: resolveMigrationsDir(),
+		MigrationsDir: st.MigrationsDir,
 		ConnStr:       connStr,
-		Strict:        resolveStrict(),
+		Strict:        st.Strict,
 	}, logger)
 
 	cleanup := func() {

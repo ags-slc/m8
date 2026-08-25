@@ -32,9 +32,12 @@ Examples:
   m8 dump --database mydb --user postgres --stdout`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
-		connStr := resolveConnStr()
+		st, err := resolveSettings()
+		if err != nil {
+			return err
+		}
 
-		conn, err := pgx.Connect(ctx, connStr)
+		conn, err := pgx.Connect(ctx, st.ConnStr)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
@@ -80,7 +83,7 @@ Examples:
 				if dumpStdout {
 					fmt.Printf("-- schema/%s/%s.sql\n%s\n", schema, tableName, ddl)
 				} else {
-					if err := writeFile(filepath.Join(flagMigrationsDir, "schema", schema), tableName+".sql", ddl); err != nil {
+					if err := writeFile(filepath.Join(st.MigrationsDir, "schema", schema), tableName+".sql", ddl); err != nil {
 						return err
 					}
 				}
@@ -142,7 +145,7 @@ Examples:
 				if dumpStdout {
 					fmt.Printf("-- permissions/%s\n%s\n", filename, rendered)
 				} else {
-					if err := writeFile(filepath.Join(flagMigrationsDir, "permissions"), filename, rendered); err != nil {
+					if err := writeFile(filepath.Join(st.MigrationsDir, "permissions"), filename, rendered); err != nil {
 						return err
 					}
 				}
@@ -160,7 +163,7 @@ Examples:
 			if dumpStdout {
 				fmt.Printf("-- logic/%s\n%s\n", filename, e.rendered)
 			} else {
-				if err := writeFile(filepath.Join(flagMigrationsDir, "logic"), filename, e.rendered); err != nil {
+				if err := writeFile(filepath.Join(st.MigrationsDir, "logic"), filename, e.rendered); err != nil {
 					return err
 				}
 			}
