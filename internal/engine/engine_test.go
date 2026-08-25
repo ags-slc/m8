@@ -2198,3 +2198,57 @@ func TestApplyRefusesBeforeAnyFolderIsApplied(t *testing.T) {
 		}
 	}
 }
+
+// An unvalidated diff that proposes NOTHING must not be refused. Validation
+// replays the generated statements against a rebuilt schema; with no
+// statements there is nothing to replay, so refusing protects nothing -- and
+// because m8 scopes each diff to one schema, the rebuild fails on any object
+// defined in terms of another schema. A database with one cross-schema view
+// would otherwise refuse every clean plan forever, and a gate that is always
+// red is a gate somebody turns off.
+func TestUnvalidatedSchemasIgnoresAnEmptyDiff(t *testing.T) {
+	result := &ApplyResult{
+		Schema: []SchemaResult{{
+			Migration: &migration.Migration{Filename: "schema/materialized/x.sql"},
+			Skipped:   true,
+			Diff: &schema.DiffResult{
+				Name:                    "materialized",
+				HasChanges:              false,
+				ValidationSkipped:       true,
+				ValidationSkippedReason: "view materialized.admin_revenue_orphans reaches outside the schema",
+			},
+		}},
+	}
+
+	if names := UnvalidatedSchemas(result); len(names) != 0 {
+		t.Errorf("empty unvalidated diff was reported as refusable: %v", names)
+	}
+
+	// The warning must still be printed -- ignoring it and hiding it are
+	// different things.
+	if out := FormatPlanOutput(result); !strings.Contains(out, "PLAN_NOT_VALIDATED") {
+		t.Errorf("the warning was suppressed along with the refusal:\n%s", out)
+	}
+}
+
+// The other half: an unvalidated diff that DOES propose DDL is exactly the
+// case --fail-on-unvalidated exists for, and must still be refused.
+func TestUnvalidatedSchemasReportsADiffWithStatements(t *testing.T) {
+	result := &ApplyResult{
+		Schema: []SchemaResult{{
+			Migration: &migration.Migration{Filename: "schema/materialized/x.sql"},
+			Diff: &schema.DiffResult{
+				Name:                    "materialized",
+				HasChanges:              true,
+				Statements:              []schema.DiffStatement{{DDL: "ALTER TABLE materialized.x ADD COLUMN y int"}},
+				ValidationSkipped:       true,
+				ValidationSkippedReason: "view materialized.admin_revenue_orphans reaches outside the schema",
+			},
+		}},
+	}
+
+	names := UnvalidatedSchemas(result)
+	if len(names) != 1 || names[0] != "materialized" {
+		t.Errorf("unvalidated diff with statements was not reported: %v", names)
+	}
+}

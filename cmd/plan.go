@@ -38,9 +38,12 @@ var planCmd = &cobra.Command{
 		if eng.FailsOnUnvalidatedPlan() {
 			if names := engine.UnvalidatedSchemas(result); len(names) > 0 {
 				return fmt.Errorf(
-					"plan for %s could not be validated; refusing to report it as a plan "+
-						"(--fail-on-unvalidated / require_shadow is set -- configure a shadow instance "+
-						"with --shadow-url / SHADOW_DATABASE_URL)",
+					"plan for %s proposes statements and was not validated; refusing to "+
+						"report it as a plan (--fail-on-unvalidated / require_shadow is set). "+
+						"Validation rebuilds the current schema in a throwaway database; it fails "+
+						"when an object in this schema is defined in terms of another schema. "+
+						"Dry-run the statements against the shadow by hand, or pass "+
+						"--fail-on-unvalidated=false once you have",
 					strings.Join(names, ", "))
 			}
 		}

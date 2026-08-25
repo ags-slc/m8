@@ -574,12 +574,18 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 		}
 		diffResult.Name = pgSchema
 
-		if diffResult.ValidationSkipped && e.config.FailOnUnvalidated {
+		// Only refuse an unvalidated diff that actually proposes DDL. An empty
+		// diff has nothing to validate, and refusing it would block every clean
+		// run on any database whose views cross schema boundaries.
+		if diffResult.ValidationSkipped && len(diffResult.Statements) > 0 && e.config.FailOnUnvalidated {
 			refusal := fmt.Errorf(
-				"plan for schema %s was not validated (%s); refusing to apply it "+
-					"(--fail-on-unvalidated / require_shadow is set -- configure a shadow instance "+
-					"with --shadow-url / SHADOW_DATABASE_URL so the plan can be checked)",
-				pgSchema, firstLine(diffResult.ValidationSkippedReason))
+				"plan for schema %s proposes %d statement(s) and was not validated (%s); "+
+					"refusing to apply it (--fail-on-unvalidated / require_shadow is set). "+
+					"Validation rebuilds the current schema in a throwaway database; it fails when "+
+					"an object in this schema is defined in terms of another schema. Dry-run the "+
+					"statements against the shadow by hand, or pass --fail-on-unvalidated=false "+
+					"once you have",
+				pgSchema, len(diffResult.Statements), firstLine(diffResult.ValidationSkippedReason))
 			results = append(results, attributeSchemaError(pgMigrations, refusal, diffResult)...)
 			return results, refusal
 		}
@@ -1106,14 +1112,27 @@ func (e *Engine) FailsOnUnvalidatedPlan() bool {
 }
 
 // UnvalidatedSchemas returns the PostgreSQL schemas whose diff was produced
-// without the plan-validation step. `plan` turns this into a non-zero exit when
-// --fail-on-unvalidated is set: PLAN_NOT_VALIDATED printed to stdout is not
-// something a CI pipeline can gate on.
+// without the plan-validation step AND proposes at least one statement. `plan`
+// turns this into a non-zero exit when --fail-on-unvalidated is set:
+// PLAN_NOT_VALIDATED printed to stdout is not something a CI pipeline can gate
+// on.
+//
+// The statement count is part of the condition, not a detail. Validation
+// rebuilds the current schema in a throwaway database and replays the generated
+// statements against it, so an empty diff has nothing to validate and refusing
+// it protects nothing. Scoping the diff to one schema — which is what makes it
+// correct and affordable — means that rebuild fails on any object whose
+// definition reaches outside the schema, so a database with a single
+// cross-schema view would otherwise refuse every clean plan forever. A gate
+// that is always red is a gate somebody turns off.
 func UnvalidatedSchemas(r *ApplyResult) []string {
 	var names []string
 	seen := make(map[string]bool)
 	for _, s := range r.Schema {
 		if s.Diff == nil || !s.Diff.ValidationSkipped || seen[s.Diff.Name] {
+			continue
+		}
+		if len(s.Diff.Statements) == 0 {
 			continue
 		}
 		seen[s.Diff.Name] = true
