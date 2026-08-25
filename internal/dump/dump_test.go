@@ -727,3 +727,64 @@ func TestDumpRoutineGrants(t *testing.T) {
 		t.Errorf("replay did not restore the grant: %+v", after)
 	}
 }
+
+// information_schema.role_table_grants only shows grants the CURRENT role can
+// see -- ones where it is the grantor, the grantee, or a member of the grantee.
+// Dumped by an ordinary application role, a grant to an unrelated service role
+// disappears without a trace, and the permissions file looks complete while
+// leaving that service without access on a rebuilt database.
+func TestDumpGrantsSeesGrantsToUnrelatedRoles(t *testing.T) {
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := conn.Exec(ctx, `
+		CREATE SCHEMA radar;
+		CREATE ROLE owner_role;
+		CREATE ROLE app LOGIN;
+		CREATE ROLE unrelated_service;
+		GRANT owner_role TO postgres;
+		GRANT CREATE, USAGE ON SCHEMA radar TO owner_role;
+		SET ROLE owner_role;
+		CREATE TABLE radar.outcome (id int);
+		GRANT SELECT, INSERT ON radar.outcome TO app;
+		GRANT SELECT ON radar.outcome TO unrelated_service;
+		RESET ROLE;
+		GRANT USAGE ON SCHEMA radar TO app;
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Dump as `app`: a role that is neither the owner nor a member of
+	// unrelated_service. This is the shape of a real dump run by a service
+	// account, and the case information_schema silently truncates.
+	if _, err := conn.Exec(ctx, "SET ROLE app"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = conn.Exec(ctx, "RESET ROLE") }()
+
+	d := NewDumper(conn)
+	grants, err := d.ListGrants(ctx, "radar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string][]string{}
+	for _, g := range grants {
+		seen[g.Grantee] = append(seen[g.Grantee], g.Privilege)
+	}
+
+	if len(seen["unrelated_service"]) == 0 {
+		t.Errorf(
+			"grant to a role the dumping user is unrelated to was lost; captured only %v",
+			seen,
+		)
+	}
+	if len(seen["app"]) != 2 {
+		t.Errorf("expected SELECT+INSERT for app, got %v", seen["app"])
+	}
+	if _, ok := seen["owner_role"]; ok {
+		t.Errorf("the owner's own implicit privileges should not be emitted: %v", seen)
+	}
+}

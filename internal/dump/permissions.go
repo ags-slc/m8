@@ -14,22 +14,34 @@ type Grant struct {
 	Privilege string // SELECT, INSERT, UPDATE, DELETE, etc.
 }
 
-// ListGrants returns all non-default table grants in a schema.
-// Excludes grants to the table owner and to pg_ system roles.
+// ListGrants returns all non-owner privileges on a schema's relations.
+//
+// Read from pg_class.relacl, NOT information_schema.role_table_grants: the
+// information_schema views are filtered to grants the CURRENT role can see --
+// ones where it is the grantor, the grantee, or a member of the grantee. Dumped
+// by an ordinary application role, they silently omit every grant to a role
+// that role is not a member of, and a permissions file that looks complete
+// leaves whole services without access on a rebuilt database.
 func (d *Dumper) ListGrants(ctx context.Context, schema string) ([]Grant, error) {
 	rows, err := d.conn.Query(ctx, `
 		SELECT
-			t.table_schema,
-			t.table_name,
-			t.grantee,
-			t.privilege_type
-		FROM information_schema.role_table_grants t
-		WHERE t.table_schema = $1
-		  AND t.grantee != t.grantor
-		  AND t.grantee NOT LIKE 'pg_%'
-		  AND t.grantee != 'PUBLIC'
-		  AND t.table_name NOT LIKE '_m8%'
-		ORDER BY t.table_name, t.grantee, t.privilege_type
+			n.nspname,
+			c.relname,
+			pg_catalog.pg_get_userbyid(a.grantee),
+			a.privilege_type
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		CROSS JOIN LATERAL aclexplode(c.relacl) a
+		WHERE n.nspname = $1
+		  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+		  AND c.relacl IS NOT NULL
+		  AND a.grantee <> 0                       -- PUBLIC, handled separately
+		  AND a.grantee <> c.relowner              -- the owner's implicit grants
+		  AND pg_catalog.pg_get_userbyid(a.grantee) NOT LIKE 'pg\_%'
+		  AND c.relname NOT LIKE '_m8%'
+		ORDER BY c.relname,
+		         pg_catalog.pg_get_userbyid(a.grantee),
+		         a.privilege_type
 	`, schema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list grants in %s: %w", schema, err)
@@ -47,19 +59,20 @@ func (d *Dumper) ListGrants(ctx context.Context, schema string) ([]Grant, error)
 	return grants, rows.Err()
 }
 
-// ListPublicGrants returns all grants to PUBLIC in a schema.
+// ListPublicGrants returns privileges granted to PUBLIC on a schema's
+// relations. Read from pg_class.relacl for the same reason as ListGrants.
 func (d *Dumper) ListPublicGrants(ctx context.Context, schema string) ([]Grant, error) {
 	rows, err := d.conn.Query(ctx, `
-		SELECT
-			t.table_schema,
-			t.table_name,
-			'PUBLIC',
-			t.privilege_type
-		FROM information_schema.role_table_grants t
-		WHERE t.table_schema = $1
-		  AND t.grantee = 'PUBLIC'
-		  AND t.table_name NOT LIKE '_m8%'
-		ORDER BY t.table_name, t.privilege_type
+		SELECT n.nspname, c.relname, 'PUBLIC', a.privilege_type
+		FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		CROSS JOIN LATERAL aclexplode(c.relacl) a
+		WHERE n.nspname = $1
+		  AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+		  AND c.relacl IS NOT NULL
+		  AND a.grantee = 0
+		  AND c.relname NOT LIKE '_m8%'
+		ORDER BY c.relname, a.privilege_type
 	`, schema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list public grants in %s: %w", schema, err)
