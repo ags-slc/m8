@@ -172,3 +172,61 @@ func TestResolveLogicFileNamesBoundsFilenameLength(t *testing.T) {
 		}
 	}
 }
+
+// The per-group reasoning cannot see across groups. BaseFileName is
+// Schema + "_" + Name, so a base can itself contain "__" and collide with
+// another group's disambiguated name.
+func TestResolveLogicFileNamesSeparatesCrossGroupCollisions(t *testing.T) {
+	// rpt.totals(date) is disambiguated to rpt_totals__date.sql; rpt."totals__date"
+	// bases to exactly that.
+	byDate := LogicObject{Schema: "rpt", Name: "totals", Identity: "totals(date)"}
+	byInt := LogicObject{Schema: "rpt", Name: "totals", Identity: "totals(integer)"}
+	helper := LogicObject{Schema: "rpt", Name: "totals__date"}
+
+	assertDistinctFilenames(t, []LogicObject{byDate, byInt, helper})
+}
+
+// A case-insensitive filesystem -- APFS, NTFS -- makes Foo.sql and foo.sql one
+// file however distinct the map keys are, so one object overwrites the other on
+// the machine most dumps are taken from.
+func TestResolveLogicFileNamesSeparatesCaseOnlyCollisions(t *testing.T) {
+	upper := LogicObject{Schema: "public", Name: "Report"}
+	lower := LogicObject{Schema: "public", Name: "report"}
+
+	names := ResolveLogicFileNames([]LogicObject{upper, lower})
+	if strings.EqualFold(names[upper], names[lower]) {
+		t.Errorf("case-only difference resolves to one file: %q and %q", names[upper], names[lower])
+	}
+}
+
+// assertDistinctFilenames checks that every object gets a filename, that no two
+// share one (compared case-folded), and that the mapping does not depend on the
+// order the objects were passed in.
+func assertDistinctFilenames(t *testing.T, objects []LogicObject) {
+	t.Helper()
+	names := ResolveLogicFileNames(objects)
+
+	seen := make(map[string]LogicObject, len(objects))
+	for _, o := range objects {
+		n := names[o]
+		if n == "" {
+			t.Fatalf("no filename for %+v", o)
+		}
+		key := strings.ToLower(n)
+		if prev, dup := seen[key]; dup {
+			t.Errorf("%+v and %+v both write to %q -- one is silently lost", prev, o, n)
+		}
+		seen[key] = o
+	}
+
+	reversed := make([]LogicObject, len(objects))
+	for i, o := range objects {
+		reversed[len(objects)-1-i] = o
+	}
+	again := ResolveLogicFileNames(reversed)
+	for _, o := range objects {
+		if names[o] != again[o] {
+			t.Errorf("filename for %+v depends on input order: %q vs %q", o, names[o], again[o])
+		}
+	}
+}

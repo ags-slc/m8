@@ -1556,3 +1556,46 @@ func TestListViewsRefusesMaterializedViews(t *testing.T) {
 		t.Errorf("expected only the plain view, got %+v", views)
 	}
 }
+
+// TestListTablesExcludesExtensionOwnedTables pins that the dump does not
+// describe a table CREATE EXTENSION owns.
+//
+// ListFunctions and ListViews already excluded extension-owned objects;
+// ListTables did not. pg-schema-diff excludes them from its own introspection,
+// so a schema/ file describing one is a table the differ cannot see on the live
+// side: it reads as "must create" on every run, and the generated CREATE TABLE
+// fails on apply with 42P07.
+func TestListTablesExcludesExtensionOwnedTables(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.ordinary  (id BIGINT PRIMARY KEY);
+		CREATE TABLE public.ext_owned (id BIGINT PRIMARY KEY);
+		-- Attach the table to an installed extension the way CREATE EXTENSION
+		-- would: ALTER EXTENSION ... ADD writes exactly the pg_depend 'e' row
+		-- that marks extension ownership, which is what both m8 and
+		-- pg-schema-diff key on.
+		ALTER EXTENSION plpgsql ADD TABLE public.ext_owned;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	tables, err := NewDumper(conn).ListTables(ctx, "public")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawOrdinary := false
+	for _, name := range tables {
+		if name == "ext_owned" {
+			t.Errorf("an extension-owned table was dumped: %v", tables)
+		}
+		if name == "ordinary" {
+			sawOrdinary = true
+		}
+	}
+	if !sawOrdinary {
+		t.Errorf("the filter also removed an ordinary table: %v", tables)
+	}
+}

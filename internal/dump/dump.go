@@ -121,6 +121,13 @@ func (d *Dumper) ListSchemas(ctx context.Context) ([]string, error) {
 }
 
 // ListTables returns all regular tables in a schema (excludes partitions, foreign tables, temp tables).
+//
+// Extension-owned tables are excluded, as ListFunctions and ListViews already
+// exclude extension-owned routines and views. They are recreated by CREATE
+// EXTENSION, not by a migration file -- and pg-schema-diff excludes them from
+// its own introspection, so a schema/ file describing one is a table the differ
+// cannot see on the live side. It reads as "must create" on every run and the
+// generated CREATE TABLE fails on apply with 42P07 (relation already exists).
 func (d *Dumper) ListTables(ctx context.Context, schema string) ([]string, error) {
 	rows, err := d.conn.Query(ctx, `
 		SELECT c.relname
@@ -129,6 +136,12 @@ func (d *Dumper) ListTables(ctx context.Context, schema string) ([]string, error
 		WHERE n.nspname = $1
 		  AND c.relkind IN ('r', 'p')  -- regular tables and partitioned tables
 		  AND NOT c.relispartition      -- exclude child partitions
+		  AND NOT EXISTS (
+			  SELECT 1 FROM pg_depend d
+			  WHERE d.objid = c.oid
+			    AND d.classid = 'pg_class'::regclass
+			    AND d.deptype = 'e'     -- installed by an extension
+		  )
 		ORDER BY c.relname
 	`, schema)
 	if err != nil {

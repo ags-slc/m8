@@ -62,12 +62,14 @@ func argSlug(identity string) string {
 }
 
 // objectHash is a short discriminator derived from everything that
-// distinguishes one logic object from another. Length-prefixed so ("ab", "c")
-// and ("a", "bc") cannot hash alike, and truncated to 48 bits -- ample for the
-// handful of objects that ever share one slug, and short enough to keep the
-// filename readable.
-func objectHash(o LogicObject) string {
+// distinguishes one logic object from another, plus a round number so a second
+// pass over an unlucky collision produces a different suffix. Length-prefixed so
+// ("ab", "c") and ("a", "bc") cannot hash alike, and truncated to 48 bits --
+// ample for the handful of objects that ever share a path, and short enough to
+// keep the filename readable.
+func objectHash(o LogicObject, round int) string {
 	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%d;", round)
 	for _, part := range []string{o.Schema, o.Name, o.Identity} {
 		_, _ = fmt.Fprintf(h, "%d:%s", len(part), part)
 	}
@@ -81,8 +83,8 @@ func objectHash(o LogicObject) string {
 // the baseline. Colliding objects are disambiguated by their argument list;
 // objects with no collision keep the short, stable name.
 //
-// A name is a pure function of the object and of which slugs collide with it.
-// Nothing depends on position:
+// A name is a pure function of the object and of which other objects it collides
+// with. Nothing depends on position:
 //
 //   - The disambiguator used to be an ordinal (__2, __3), which made the
 //     filename depend on where an object fell in a sorted group. Removing one
@@ -126,10 +128,47 @@ func ResolveLogicFileNames(objects []LogicObject) map[LogicObject]string {
 				// argSlug collapses every run of non-[a-z0-9] to a single "_",
 				// so a slug can never contain "__" and base__slug can never be
 				// mistaken for base__slug__hash.
-				slug += "__" + objectHash(o)
+				slug += "__" + objectHash(o, 0)
 			}
 			names[o] = base + "__" + slug + ".sql"
 		}
 	}
+
+	// Everything above reasons WITHIN one base group, which is not enough. A
+	// base can itself contain "__", because BaseFileName is Schema + "_" + Name:
+	// the overload app.x(text) lands on app_x__text.sql, and so does the
+	// unrelated helper app_x."_text"(), whose base IS app_x__text. And on a
+	// case-insensitive filesystem -- APFS, NTFS -- Foo.sql and foo.sql are one
+	// file however distinct the map keys are. Either way one object silently
+	// overwrites the other, which is the failure this whole function exists to
+	// prevent, so uniqueness is settled once, globally, over the finished set.
+	deduplicate(names)
 	return names
+}
+
+// deduplicate gives every object still sharing a path (compared case-folded, as
+// a case-insensitive filesystem would) a hash suffix. Bounded: each round hashes
+// with a different seed, and one round has always been enough -- the cap exists
+// so an adversarial input cannot spin here.
+func deduplicate(names map[LogicObject]string) {
+	for round := 0; round < 4; round++ {
+		byPath := make(map[string][]LogicObject, len(names))
+		for o, n := range names {
+			key := strings.ToLower(n)
+			byPath[key] = append(byPath[key], o)
+		}
+		collided := false
+		for _, group := range byPath {
+			if len(group) < 2 {
+				continue
+			}
+			collided = true
+			for _, o := range group {
+				names[o] = strings.TrimSuffix(names[o], ".sql") + "__" + objectHash(o, round) + ".sql"
+			}
+		}
+		if !collided {
+			return
+		}
+	}
 }
