@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # No branch filter: restricting to [main] meant a pull request based on
+  # another branch — a stacked PR — matched nothing and ran no checks at all,
+  # silently, which looks identical to a PR whose checks all passed.
   pull_request:
-    branches: [main]
 
 jobs:
   test:
