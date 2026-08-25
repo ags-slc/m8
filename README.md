@@ -289,6 +289,15 @@ created from `template0`, so the shadow instance needs:
   (TimescaleDB, PostGIS, `pg_cron`, etc.). The cleanest way to guarantee this is
   to point the shadow at a restore/clone of the target rather than an empty
   instance.
+- **PostgreSQL 13 or later**, since cleanup issues `DROP DATABASE ... WITH
+  (FORCE)`. On older versions the sweeps log a warning and do nothing; diffing
+  itself still works.
+
+Both the temp databases pg-schema-diff creates and m8's own cleanup statements
+are anchored to the database named in `shadow_url`, so the shadow host does not
+need a separate `postgres` database — some managed providers don't offer one, or
+don't let your role connect to it. (pg-schema-diff defaults that anchor to
+`postgres`; m8 overrides it.)
 
 If the shadow is **explicitly configured** but the differ can't initialize
 (unreachable, bad credentials, missing privilege), m8 fails loudly rather than
@@ -300,8 +309,16 @@ migrations exist but cannot be diffed.
 orphaned `pgschemadiff_tmp_*` databases (the residue of an interrupted drop) on
 whichever instance hosts temp databases. When a dedicated shadow is configured,
 it additionally reclaims *valid* temp databases older than one hour that have no
-active connections — abandoned leftovers from a killed process. Read-only
-commands (`status`, `baseline`) never touch temp databases.
+active connections — abandoned leftovers from a killed process.
+
+As a command exits — including after a Ctrl-C — m8 reclaims the temp databases
+*it* created, by name, on a context detached from the cancelled one. That covers
+both kinds of residue an interrupted run leaves: a drop interrupted mid-flight,
+which leaves the database invalid, and one that was never sent at all, which
+leaves it valid and which no age-based sweep would touch for an hour. Going by
+name means this can never reach a database another m8 process owns, so it is
+safe when several runs share one shadow. Read-only commands (`status`,
+`baseline`) never touch temp databases.
 
 ## License
 
