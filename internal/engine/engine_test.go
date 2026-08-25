@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ags-slc/m8/internal/migration"
 	"github.com/ags-slc/m8/internal/schema"
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -1380,5 +1381,37 @@ func TestSchemaDiffDegradesWhenPlanCannotBeValidated(t *testing.T) {
 	// And the warning must reach the operator, not just the struct.
 	if out := FormatPlanOutput(result); !strings.Contains(out, "PLAN_NOT_VALIDATED") {
 		t.Errorf("plan output does not warn that validation was skipped:\n%s", out)
+	}
+}
+
+// A plan that produced no statements is marked Skipped, so the pending loop in
+// FormatPlanOutput never reaches it. If the warning is only emitted from that
+// loop, a clean-but-unvalidated plan prints "Database is up to date." with no
+// hint that the check did not run -- which is exactly the reading an operator
+// must not be allowed to take away.
+func TestFormatPlanOutputWarnsOnCleanUnvalidatedPlan(t *testing.T) {
+	result := &ApplyResult{
+		Schema: []SchemaResult{{
+			Migration: &migration.Migration{Filename: "schema/materialized/x.sql"},
+			Skipped:   true, // no statements => Skipped
+			Diff: &schema.DiffResult{
+				Name:                    "materialized",
+				HasChanges:              false,
+				ValidationSkipped:       true,
+				ValidationSkippedReason: "view materialized.admin_revenue_orphans reaches outside the schema",
+			},
+		}},
+	}
+
+	out := FormatPlanOutput(result)
+
+	if !strings.Contains(out, "PLAN_NOT_VALIDATED") {
+		t.Errorf("clean unvalidated plan does not warn:\n%s", out)
+	}
+	if !strings.Contains(out, "materialized") {
+		t.Errorf("warning does not name the schema it applies to:\n%s", out)
+	}
+	if !strings.Contains(out, "No pending migrations") {
+		t.Errorf("warning replaced the up-to-date verdict instead of accompanying it:\n%s", out)
 	}
 }

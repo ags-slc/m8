@@ -825,12 +825,25 @@ func FormatPlanOutput(result *ApplyResult) string {
 		}
 	}
 
+	// A diff that produced no statements is marked Skipped, so the loop above
+	// never reaches it -- but "clean" and "clean, and we could not verify it"
+	// are different answers. Surface the warning either way, without counting
+	// it as pending: an unvalidated empty diff is still an empty diff.
+	var w strings.Builder
+	for _, s := range result.Schema {
+		if s.Skipped && s.Diff != nil && s.Diff.ValidationSkipped {
+			fmt.Fprintf(&w, "  ⚠ PLAN_NOT_VALIDATED %s (schema) — the current schema could not be rebuilt in isolation\n",
+				s.Diff.Name)
+			fmt.Fprintf(&w, "      (%s)\n", firstLine(s.Diff.ValidationSkippedReason))
+		}
+	}
+
 	if pending == 0 {
-		return "No pending migrations. Database is up to date.\n"
+		return w.String() + "No pending migrations. Database is up to date.\n"
 	}
 
 	header := fmt.Sprintf("Plan: %d migration(s) to apply.\n\n", pending)
-	return header + b.String()
+	return header + w.String() + b.String()
 }
 
 // FormatApplyOutput returns a human-readable summary of an apply result.
