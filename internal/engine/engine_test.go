@@ -710,18 +710,8 @@ func TestSweepStaleTempDBs(t *testing.T) {
 	mustExec(conn, `CREATE DATABASE pgschemadiff_tmp_nometa TEMPLATE template0`)
 
 	// Seed pg-schema-diff's metadata table inside the temp DBs with a chosen age.
-	setupMeta := func(dbName, createdAt string) {
-		c, err := pgx.Connect(ctx, strings.Replace(connStr, "/m8test?", "/"+dbName+"?", 1))
-		if err != nil {
-			t.Fatalf("connect %s: %v", dbName, err)
-		}
-		defer c.Close(ctx)
-		mustExec(c, `CREATE SCHEMA pgschemadiff_tmp_metadata`)
-		mustExec(c, `CREATE TABLE pgschemadiff_tmp_metadata.metadata (db_created_at timestamptz NOT NULL DEFAULT current_timestamp)`)
-		mustExec(c, `INSERT INTO pgschemadiff_tmp_metadata.metadata (db_created_at) VALUES (`+createdAt+`)`)
-	}
-	setupMeta("pgschemadiff_tmp_stale", "now() - interval '2 hours'")
-	setupMeta("pgschemadiff_tmp_fresh", "now()")
+	seedTempDBMetadata(t, connStr, "pgschemadiff_tmp_stale", "now() - interval '2 hours'")
+	seedTempDBMetadata(t, connStr, "pgschemadiff_tmp_fresh", "now()")
 	// pgschemadiff_tmp_nometa intentionally has no metadata table.
 
 	n, err := differ.SweepStaleTempDBs(ctx, time.Hour)
@@ -747,5 +737,279 @@ func TestSweepStaleTempDBs(t *testing.T) {
 	}
 	if !exists("pgschemadiff_tmp_nometa") {
 		t.Error("temp database without metadata was incorrectly dropped")
+	}
+}
+
+// tempDBConnStr rewrites a test container connection string to point at another
+// database on the same instance.
+func tempDBConnStr(connStr, dbName string) string {
+	return strings.Replace(connStr, "/m8test?", "/"+dbName+"?", 1)
+}
+
+// seedTempDBMetadata writes pg-schema-diff's metadata table into dbName with a
+// chosen creation time, so the TTL-based stale sweep has something to vet.
+// createdAt is a SQL expression, e.g. "now() - interval '2 hours'".
+func seedTempDBMetadata(t *testing.T, connStr, dbName, createdAt string) {
+	t.Helper()
+	ctx := context.Background()
+	c, err := pgx.Connect(ctx, tempDBConnStr(connStr, dbName))
+	if err != nil {
+		t.Fatalf("connect %s: %v", dbName, err)
+	}
+	defer func() { _ = c.Close(ctx) }()
+	for _, stmt := range []string{
+		`CREATE SCHEMA pgschemadiff_tmp_metadata`,
+		`CREATE TABLE pgschemadiff_tmp_metadata.metadata (db_created_at timestamptz NOT NULL DEFAULT current_timestamp)`,
+		`INSERT INTO pgschemadiff_tmp_metadata.metadata (db_created_at) VALUES (` + createdAt + `)`,
+	} {
+		if _, err := c.Exec(ctx, stmt); err != nil {
+			t.Fatalf("seeding metadata in %s (%s): %v", dbName, stmt, err)
+		}
+	}
+}
+
+// dbExists reports whether a database exists on the instance behind conn.
+func dbExists(t *testing.T, conn *pgx.Conn, name string) bool {
+	t.Helper()
+	var ok bool
+	if err := conn.QueryRow(context.Background(),
+		`SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)`, name).Scan(&ok); err != nil {
+		t.Fatalf("exists(%s): %v", name, err)
+	}
+	return ok
+}
+
+// countTempDBs returns the number of pgschemadiff_tmp_* databases on the
+// instance behind conn.
+func countTempDBs(t *testing.T, conn *pgx.Conn) int {
+	t.Helper()
+	var n int
+	if err := conn.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_database WHERE datname LIKE 'pgschemadiff\_tmp\_%'`).Scan(&n); err != nil {
+		t.Fatalf("counting temp databases: %v", err)
+	}
+	return n
+}
+
+// TestShadowInstanceRouting is the cross-instance counterpart to the same-instance
+// sweep tests: the shadow is a *different* PostgreSQL server from the target, and
+// nothing — temp databases or sweeps — may touch the target.
+//
+// The target is reached through a role that lacks CREATEDB. That is what makes the
+// assertions real rather than vacuous: if a temp database were hosted on the target
+// the diff would fail outright, which the final subtest demonstrates by taking the
+// shadow away and watching the identical call fail.
+func TestShadowInstanceRouting(t *testing.T) {
+	targetConn, _, targetSuperConnStr, targetCleanup := testDB(t)
+	defer targetCleanup()
+	shadowConn, _, shadowConnStr, shadowCleanup := testDB(t)
+	defer shadowCleanup()
+
+	ctx := context.Background()
+
+	mustExec := func(c *pgx.Conn, stmt string) {
+		t.Helper()
+		if _, err := c.Exec(ctx, stmt); err != nil {
+			t.Fatalf("exec %q: %v", stmt, err)
+		}
+	}
+	mustExec(targetConn, `CREATE ROLE m8_nocreatedb LOGIN PASSWORD 'm8pwd' NOSUPERUSER NOCREATEDB`)
+	mustExec(targetConn, `GRANT ALL ON SCHEMA public TO m8_nocreatedb`)
+
+	targetConnStr := strings.Replace(targetSuperConnStr, "postgres:testpwd@", "m8_nocreatedb:m8pwd@", 1)
+	if targetConnStr == targetSuperConnStr {
+		t.Fatalf("could not derive a restricted connection string from %q", targetSuperConnStr)
+	}
+	targetDB, err := sql.Open("pgx", targetConnStr)
+	if err != nil {
+		t.Fatalf("open restricted target: %v", err)
+	}
+	defer func() { _ = targetDB.Close() }()
+
+	differ, err := schema.NewDiffer(ctx, targetConnStr, shadowConnStr)
+	if err != nil {
+		t.Fatalf("NewDiffer with separate shadow: %v", err)
+	}
+	defer differ.Close()
+
+	t.Run("diff hosts temp databases on the shadow", func(t *testing.T) {
+		res, err := differ.Diff(ctx, targetDB, "public",
+			[]string{"CREATE TABLE users (id bigint PRIMARY KEY, email text NOT NULL);"}, false)
+		if err != nil {
+			t.Fatalf("Diff across a separate shadow instance: %v", err)
+		}
+		if !res.HasChanges {
+			t.Fatal("expected the undeclared table to produce diff statements")
+		}
+		var mentionsUsers bool
+		for _, st := range res.Statements {
+			if strings.Contains(strings.ToLower(st.DDL), "users") {
+				mentionsUsers = true
+			}
+		}
+		if !mentionsUsers {
+			t.Errorf("no statement mentions the users table: %+v", res.Statements)
+		}
+		if n := countTempDBs(t, targetConn); n != 0 {
+			t.Errorf("%d temp database(s) on the TARGET instance; they belong on the shadow", n)
+		}
+		if n := countTempDBs(t, shadowConn); n != 0 {
+			t.Errorf("%d temp database(s) left on the shadow; the factory should have dropped them", n)
+		}
+	})
+
+	t.Run("sweeps reclaim on the shadow and leave the target alone", func(t *testing.T) {
+		// Identically named orphans on both instances: only the shadow's may go.
+		for _, c := range []*pgx.Conn{targetConn, shadowConn} {
+			mustExec(c, `CREATE DATABASE pgschemadiff_tmp_invalid TEMPLATE template0`)
+			mustExec(c, `UPDATE pg_database SET datconnlimit = -2 WHERE datname = 'pgschemadiff_tmp_invalid'`)
+			mustExec(c, `CREATE DATABASE pgschemadiff_tmp_stale TEMPLATE template0`)
+		}
+		seedTempDBMetadata(t, targetSuperConnStr, "pgschemadiff_tmp_stale", "now() - interval '2 hours'")
+		seedTempDBMetadata(t, shadowConnStr, "pgschemadiff_tmp_stale", "now() - interval '2 hours'")
+
+		n, err := differ.SweepInvalidTempDBs(ctx)
+		if err != nil {
+			t.Fatalf("SweepInvalidTempDBs: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("invalid sweep dropped = %d, want 1 (the shadow's only)", n)
+		}
+		if dbExists(t, shadowConn, "pgschemadiff_tmp_invalid") {
+			t.Error("invalid orphan on the shadow was not dropped")
+		}
+		if !dbExists(t, targetConn, "pgschemadiff_tmp_invalid") {
+			t.Error("a database on the TARGET instance was dropped by the invalid sweep")
+		}
+
+		n, err = differ.SweepStaleTempDBs(ctx, time.Hour)
+		if err != nil {
+			t.Fatalf("SweepStaleTempDBs: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("stale sweep dropped = %d, want 1 (the shadow's only)", n)
+		}
+		if dbExists(t, shadowConn, "pgschemadiff_tmp_stale") {
+			t.Error("stale orphan on the shadow was not dropped")
+		}
+		if !dbExists(t, targetConn, "pgschemadiff_tmp_stale") {
+			t.Error("a database on the TARGET instance was dropped by the stale sweep")
+		}
+	})
+
+	t.Run("without a shadow the same diff is refused by the target", func(t *testing.T) {
+		// Negative control: proves the subtests above pass because temp databases
+		// went to the shadow, not because the target would have accepted them.
+		noShadow, err := schema.NewDiffer(ctx, targetConnStr, "")
+		if err == nil {
+			defer func() { _ = noShadow.Close() }()
+			_, err = noShadow.Diff(ctx, targetDB, "public",
+				[]string{"CREATE TABLE users (id bigint PRIMARY KEY);"}, false)
+		}
+		if err == nil {
+			t.Fatal("expected temp database creation on the target to be denied, got no error")
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "permission denied") {
+			t.Fatalf("expected a permission error creating a temp database on the target, got: %v", err)
+		}
+	})
+}
+
+// TestShadowInstanceWithoutPostgresDatabase pins down what a shadow host must
+// actually provide. pg-schema-diff's factory defaults its root connection to a
+// database named "postgres" and asserts at construction that it landed there;
+// NewDiffer overrides that with the database the shadow connection string names.
+// Without the override this test fails at NewDiffer, and the documented promise
+// that no separate "postgres" database is required would be false.
+func TestShadowInstanceWithoutPostgresDatabase(t *testing.T) {
+	_, targetDB, targetConnStr, targetCleanup := testDB(t)
+	defer targetCleanup()
+	shadowConn, _, shadowConnStr, shadowCleanup := testDB(t)
+	defer shadowCleanup()
+
+	ctx := context.Background()
+
+	// The shadow connection string names m8test; nothing may depend on "postgres".
+	if _, err := shadowConn.Exec(ctx, `DROP DATABASE postgres`); err != nil {
+		t.Fatalf("dropping the postgres database on the shadow: %v", err)
+	}
+
+	differ, err := schema.NewDiffer(ctx, targetConnStr, shadowConnStr)
+	if err != nil {
+		t.Fatalf("NewDiffer against a shadow with no postgres database: %v", err)
+	}
+	defer func() { _ = differ.Close() }()
+
+	if _, err := differ.Diff(ctx, targetDB, "public",
+		[]string{"CREATE TABLE users (id bigint PRIMARY KEY);"}, false); err != nil {
+		t.Fatalf("Diff against a shadow with no postgres database: %v", err)
+	}
+	if n := countTempDBs(t, shadowConn); n != 0 {
+		t.Errorf("%d temp database(s) left on the shadow after the diff", n)
+	}
+	if _, err := differ.SweepInvalidTempDBs(ctx); err != nil {
+		t.Errorf("SweepInvalidTempDBs against a shadow with no postgres database: %v", err)
+	}
+	if _, err := differ.SweepStaleTempDBs(ctx, time.Hour); err != nil {
+		t.Errorf("SweepStaleTempDBs against a shadow with no postgres database: %v", err)
+	}
+}
+
+// TestDropCreatedTempDBs covers the residue an interrupted run leaves behind: a
+// temp database whose drop never ran is perfectly valid, so neither the invalid
+// sweep nor the one-hour TTL sweep reaches it. Reclaiming strictly by the names
+// this process created must get it, and must not touch anyone else's.
+func TestDropCreatedTempDBs(t *testing.T) {
+	_, targetDB, targetConnStr, targetCleanup := testDB(t)
+	defer targetCleanup()
+	shadowConn, _, shadowConnStr, shadowCleanup := testDB(t)
+	defer shadowCleanup()
+
+	ctx := context.Background()
+
+	differ, err := schema.NewDiffer(ctx, targetConnStr, shadowConnStr)
+	if err != nil {
+		t.Fatalf("NewDiffer: %v", err)
+	}
+	defer func() { _ = differ.Close() }()
+
+	if _, err := differ.Diff(ctx, targetDB, "public",
+		[]string{"CREATE TABLE users (id bigint PRIMARY KEY);"}, false); err != nil {
+		t.Fatalf("Diff: %v", err)
+	}
+
+	created := differ.CreatedTempDBs()
+	if len(created) == 0 {
+		t.Fatal("the diff reported creating no temp databases")
+	}
+	// pg-schema-diff dropped them itself, so there is nothing left to reclaim.
+	if n, err := differ.DropCreatedTempDBs(ctx); err != nil {
+		t.Fatalf("DropCreatedTempDBs after a clean diff: %v", err)
+	} else if n != 0 {
+		t.Errorf("reclaimed %d database(s) after a clean diff, want 0", n)
+	}
+
+	// Now stage what a cancelled run leaves: one of this run's temp databases
+	// still present and valid, alongside another process's, which is off limits.
+	leaked := created[0]
+	if _, err := shadowConn.Exec(ctx, `CREATE DATABASE `+pgx.Identifier{leaked}.Sanitize()+` TEMPLATE template0`); err != nil {
+		t.Fatalf("recreating %s: %v", leaked, err)
+	}
+	if _, err := shadowConn.Exec(ctx, `CREATE DATABASE pgschemadiff_tmp_someone_else TEMPLATE template0`); err != nil {
+		t.Fatalf("creating another process's temp database: %v", err)
+	}
+
+	n, err := differ.DropCreatedTempDBs(ctx)
+	if err != nil {
+		t.Fatalf("DropCreatedTempDBs: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("reclaimed = %d, want 1 (only this run's leftover)", n)
+	}
+	if dbExists(t, shadowConn, leaked) {
+		t.Errorf("%s was not reclaimed", leaked)
+	}
+	if !dbExists(t, shadowConn, "pgschemadiff_tmp_someone_else") {
+		t.Error("another process's temp database was dropped")
 	}
 }
