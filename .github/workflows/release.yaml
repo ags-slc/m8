@@ -13,13 +13,16 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
-          go-version: "1.26"
+          # go.mod is the single source of truth: setup-go v6+ pins
+          # GOTOOLCHAIN=local, so an installed version below go.mod's `go`
+          # directive fails every command that loads the module graph.
+          go-version-file: go.mod
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
@@ -31,7 +34,7 @@ jobs:
         run: go test ./... -count=1 -p 1 -timeout 600s
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           # homebrew_casks needs GoReleaser >= 2.10 and `formats` >= 2.6; pin the
           # major so a future breaking release cannot fail an already-tagged build.
