@@ -465,9 +465,7 @@ func extractDirectives(content []byte) Directive {
 		case strings.HasPrefix(directive, "requires "):
 			val := strings.TrimPrefix(directive, "requires ")
 			val = strings.TrimSpace(val)
-			for _, req := range strings.Fields(val) {
-				d.Requires = append(d.Requires, req)
-			}
+			d.Requires = append(d.Requires, strings.Fields(val)...)
 		}
 	}
 	return d
