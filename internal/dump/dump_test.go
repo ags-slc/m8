@@ -133,7 +133,7 @@ func TestDumpTableWithFK(t *testing.T) {
 	}
 
 	ddl := RenderDDL(table)
-	if !strings.Contains(ddl, "REFERENCES public.users") {
+	if !strings.Contains(ddl, `REFERENCES "public"."users"`) {
 		t.Error("expected FK reference in DDL")
 	}
 	if !strings.Contains(ddl, "ON DELETE CASCADE") {
@@ -324,7 +324,7 @@ func TestDumpView(t *testing.T) {
 	}
 
 	rendered := RenderView(&views[0])
-	if !strings.Contains(rendered, "CREATE OR REPLACE VIEW public.active_users") {
+	if !strings.Contains(rendered, `CREATE OR REPLACE VIEW "public"."active_users"`) {
 		t.Errorf("expected schema-qualified CREATE OR REPLACE VIEW, got:\n%s", rendered)
 	}
 }
@@ -362,7 +362,7 @@ func TestDumpViewIsQualifiedAndKeepsOptions(t *testing.T) {
 
 	rendered := RenderView(&views[0])
 
-	if !strings.HasPrefix(rendered, "CREATE OR REPLACE VIEW reporting.safe_accounts") {
+	if !strings.HasPrefix(rendered, `CREATE OR REPLACE VIEW "reporting"."safe_accounts"`) {
 		t.Errorf("view name is not schema-qualified:\n%s", rendered)
 	}
 	if strings.Contains(rendered, ";;") {
@@ -432,10 +432,10 @@ func TestDumpGrants(t *testing.T) {
 
 	allGrants := append(grants, publicGrants...)
 	rendered := RenderGrants(allGrants, "public")
-	if !strings.Contains(rendered, "GRANT SELECT ON public.docs TO reader") {
+	if !strings.Contains(rendered, `GRANT SELECT ON "public"."docs" TO "reader"`) {
 		t.Errorf("expected grant to reader in:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "GRANT SELECT ON public.docs TO PUBLIC") {
+	if !strings.Contains(rendered, `GRANT SELECT ON "public"."docs" TO PUBLIC`) {
 		t.Errorf("expected grant to PUBLIC in:\n%s", rendered)
 	}
 }
@@ -469,7 +469,7 @@ func TestRenderDDLRoundtrip(t *testing.T) {
 	ddl := RenderDDL(table)
 
 	// The DDL should be valid SQL that recreates the table
-	if !strings.Contains(ddl, "CREATE TABLE public.products") {
+	if !strings.Contains(ddl, `CREATE TABLE "public"."products"`) {
 		t.Error("expected CREATE TABLE")
 	}
 	if !strings.Contains(ddl, "BIGSERIAL") {
@@ -521,10 +521,10 @@ func TestRenderDDLQualifiesNonPublicSchema(t *testing.T) {
 
 	ddl := RenderDDL(table)
 
-	if !strings.Contains(ddl, "CREATE TABLE materialized.rpt_thing") {
+	if !strings.Contains(ddl, `CREATE TABLE "materialized"."rpt_thing"`) {
 		t.Errorf("expected schema-qualified CREATE TABLE, got:\n%s", ddl)
 	}
-	if !strings.Contains(ddl, "REFERENCES materialized.parent") {
+	if !strings.Contains(ddl, `REFERENCES "materialized"."parent"`) {
 		t.Errorf("expected schema-qualified FK target, got:\n%s", ddl)
 	}
 	if !strings.Contains(ddl, "ON materialized.rpt_thing") {
@@ -579,7 +579,7 @@ func TestDumpGrantsAreSchemaQualified(t *testing.T) {
 	}
 
 	rendered := RenderGrants(grants, "radar")
-	if !strings.Contains(rendered, "ON radar.audit_log TO viewport_readonly") {
+	if !strings.Contains(rendered, `ON "radar"."audit_log" TO "viewport_readonly"`) {
 		t.Errorf("grant target is not schema-qualified:\n%s", rendered)
 	}
 
@@ -714,10 +714,10 @@ func TestDumpRoutineGrants(t *testing.T) {
 	}
 
 	rendered := RenderRoutineGrants(grants)
-	if !strings.Contains(rendered, "radar.record_decision(") {
+	if !strings.Contains(rendered, `"radar"."record_decision"(`) {
 		t.Errorf("grant is not schema-qualified with a signature:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "TO app") {
+	if !strings.Contains(rendered, `TO "app"`) {
 		t.Errorf("grantee missing:\n%s", rendered)
 	}
 
@@ -893,5 +893,215 @@ func TestRenderDDLGeneratedColumnPreservesStringLiterals(t *testing.T) {
 	if gotValue != wantValue {
 		t.Errorf("replayed column computes a different value:\n  live:     %q\n  replayed: %q",
 			wantValue, gotValue)
+	}
+}
+
+// TestDumpQuotesEveryIdentifier pins that dumped DDL survives identifiers that
+// are not all-lowercase-simple: mixed case, spaces, and reserved words.
+//
+// None of it was quoted. QualifiedName was plain concatenation, column and
+// constraint names went out bare, and internal/schema's quoteIdent was never
+// reachable from internal/dump. On an all-lowercase database that is invisible;
+// on anything else the dump either fails to replay or -- see
+// TestDumpQuotesForeignKeyTargets -- replays against the wrong object.
+func TestDumpQuotesEveryIdentifier(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE SCHEMA "My Reports";
+		CREATE TABLE "My Reports"."Users" (
+			"Id" BIGINT NOT NULL,
+			CONSTRAINT "Users pkey" PRIMARY KEY ("Id")
+		);
+		CREATE TABLE "My Reports"."Order" (
+			"Id"       BIGINT NOT NULL,
+			"select"   TEXT NOT NULL,
+			"Group Id" BIGINT,
+			"limit"    INTEGER NOT NULL DEFAULT 0,
+			CONSTRAINT "Order pkey" PRIMARY KEY ("Id"),
+			CONSTRAINT "Order uniq" UNIQUE ("select"),
+			CONSTRAINT "Order limit ck" CHECK ("limit" >= 0),
+			CONSTRAINT "Order user fk" FOREIGN KEY ("Group Id")
+				REFERENCES "My Reports"."Users" ("Id") ON DELETE CASCADE
+		);
+		CREATE INDEX "Order select idx" ON "My Reports"."Order" ("select");
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDumper(conn)
+	table, err := d.DumpTable(ctx, "My Reports", "Order")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddl := RenderDDL(table)
+
+	// Replaying is the whole test: unquoted, this is a syntax error at CREATE
+	// TABLE My Reports.Order, and if it got past that, at the column named
+	// select.
+	if _, err := conn.Exec(ctx, `DROP TABLE "My Reports"."Order"`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, ddl); err != nil {
+		t.Fatalf("dumped DDL does not replay: %v\n%s", err, ddl)
+	}
+
+	// Every name must come back exactly as it went in -- not case-folded.
+	var cols []string
+	rows, err := conn.Query(ctx, `
+		SELECT a.attname FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'My Reports' AND c.relname = 'Order'
+		  AND a.attnum > 0 AND NOT a.attisdropped
+		ORDER BY a.attnum`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		cols = append(cols, name)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"Id", "select", "Group Id", "limit"}
+	if strings.Join(cols, "|") != strings.Join(want, "|") {
+		t.Errorf("columns came back as %v, want %v", cols, want)
+	}
+
+	for _, con := range []string{"Order pkey", "Order uniq", "Order limit ck", "Order user fk"} {
+		var exists bool
+		if err := conn.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_constraint con
+				JOIN pg_class c ON c.oid = con.conrelid
+				JOIN pg_namespace n ON n.oid = c.relnamespace
+				WHERE n.nspname = 'My Reports' AND c.relname = 'Order' AND con.conname = $1
+			)`, con).Scan(&exists); err != nil {
+			t.Fatal(err)
+		}
+		if !exists {
+			t.Errorf("constraint %q did not survive the round trip:\n%s", con, ddl)
+		}
+	}
+}
+
+// TestDumpQuotesForeignKeyTargets pins the case where missing quotes do not
+// error at all.
+//
+// Everything here except one table name is lowercase-simple, so the unquoted
+// DDL parses and replays without complaint. But an unquoted REFERENCES
+// public.Users is folded to users by the server, and users also exists: the
+// constraint is created against a DIFFERENT table. Nothing surfaces at dump
+// time, at replay time, or in any error -- only later, in whichever row the
+// wrong key does or does not reject.
+func TestDumpQuotesForeignKeyTargets(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public."Users" (id BIGINT PRIMARY KEY);
+		CREATE TABLE public.users     (id BIGINT PRIMARY KEY);
+		CREATE TABLE public.membership (
+			id      BIGINT PRIMARY KEY,
+			user_id BIGINT,
+			CONSTRAINT membership_user_fk FOREIGN KEY (user_id) REFERENCES public."Users" (id)
+		);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDumper(conn)
+	table, err := d.DumpTable(ctx, "public", "membership")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddl := RenderDDL(table)
+
+	if _, err := conn.Exec(ctx, `DROP TABLE public.membership`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, ddl); err != nil {
+		t.Fatalf("dumped DDL does not replay: %v\n%s", err, ddl)
+	}
+
+	var target string
+	if err := conn.QueryRow(ctx, `
+		SELECT cr.relname
+		FROM pg_constraint con
+		JOIN pg_class c ON c.oid = con.conrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_class cr ON cr.oid = con.confrelid
+		WHERE n.nspname = 'public' AND c.relname = 'membership' AND con.contype = 'f'
+	`).Scan(&target); err != nil {
+		t.Fatal(err)
+	}
+	if target != "Users" {
+		t.Errorf("the replayed foreign key points at %q, not the \"Users\" it was captured from\n%s",
+			target, ddl)
+	}
+}
+
+// A view and its grants carry identifiers too.
+func TestDumpQuotesViewAndGrantIdentifiers(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE ROLE "Read Only";
+		CREATE SCHEMA "My Reports";
+		CREATE TABLE "My Reports"."Order" (id BIGINT PRIMARY KEY);
+		CREATE VIEW "My Reports"."Order List" AS SELECT id FROM "My Reports"."Order";
+		GRANT SELECT ON "My Reports"."Order List" TO "Read Only";
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDumper(conn)
+	views, err := d.ListViews(ctx, "My Reports")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("expected 1 view, got %d", len(views))
+	}
+	rendered := RenderView(&views[0])
+
+	grants, err := d.ListGrants(ctx, "My Reports")
+	if err != nil {
+		t.Fatal(err)
+	}
+	renderedGrants := RenderGrants(grants, "My Reports")
+
+	if _, err := conn.Exec(ctx, `DROP VIEW "My Reports"."Order List"`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "SET search_path TO public"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, rendered); err != nil {
+		t.Fatalf("dumped view does not replay: %v\n%s", err, rendered)
+	}
+	if _, err := conn.Exec(ctx, renderedGrants); err != nil {
+		t.Fatalf("dumped grants do not replay: %v\n%s", err, renderedGrants)
+	}
+
+	var canSelect bool
+	if err := conn.QueryRow(ctx,
+		`SELECT has_table_privilege('Read Only', '"My Reports"."Order List"', 'SELECT')`,
+	).Scan(&canSelect); err != nil {
+		t.Fatal(err)
+	}
+	if !canSelect {
+		t.Errorf("the replayed grant did not restore SELECT for \"Read Only\":\n%s", renderedGrants)
 	}
 }

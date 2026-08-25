@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ags-slc/m8/internal/pgident"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stripe/pg-schema-diff/pkg/diff"
 	"github.com/stripe/pg-schema-diff/pkg/tempdb"
@@ -197,7 +198,7 @@ func (d *Differ) DropCreatedTempDBs(ctx context.Context) (int, error) {
 		if !existing[n] {
 			continue
 		}
-		stmt := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", quoteIdent(n))
+		stmt := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", pgident.Quote(n))
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return dropped, fmt.Errorf("dropping temp database %s left by this run: %w", n, err)
 		}
@@ -240,7 +241,7 @@ func (d *Differ) SweepInvalidTempDBs(ctx context.Context) (int, error) {
 
 	dropped := 0
 	for _, n := range names {
-		stmt := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", quoteIdent(n))
+		stmt := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", pgident.Quote(n))
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return dropped, fmt.Errorf("dropping orphaned temp database %s: %w", n, err)
 		}
@@ -300,7 +301,7 @@ func (d *Differ) SweepStaleTempDBs(ctx context.Context, maxAge time.Duration) (i
 		if old, err := d.tempDBOlderThan(ctx, n, maxAge); err != nil || !old {
 			continue
 		}
-		stmt := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", quoteIdent(n))
+		stmt := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", pgident.Quote(n))
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return dropped, fmt.Errorf("dropping stale temp database %s: %w", n, err)
 		}
@@ -376,11 +377,6 @@ func databaseName(connStr string) (string, error) {
 		return "", fmt.Errorf("connection string names no database")
 	}
 	return cfg.Database, nil
-}
-
-// quoteIdent double-quotes a PostgreSQL identifier, escaping embedded quotes.
-func quoteIdent(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 // Close cleans up the temp database factory.

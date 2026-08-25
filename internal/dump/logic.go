@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/ags-slc/m8/internal/pgident"
 )
 
 // Function represents a function or procedure.
@@ -23,9 +25,9 @@ type View struct {
 	Options    []string // reloptions (security_barrier, security_invoker, check_option)
 }
 
-// QualifiedName returns schema.name, matching Table.QualifiedName.
+// QualifiedName returns the quoted schema.name, matching Table.QualifiedName.
 func (v *View) QualifiedName() string {
-	return v.Schema + "." + v.Name
+	return pgident.Qualify(v.Schema, v.Name)
 }
 
 // ListFunctions returns all user-defined functions and procedures in a schema.

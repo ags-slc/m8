@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/ags-slc/m8/internal/pgident"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -20,9 +21,10 @@ type Table struct {
 	Indexes []Index
 }
 
-// QualifiedName returns the schema-qualified table name, e.g. "materialized.rpt_invoice_detail".
+// QualifiedName returns the schema-qualified, quoted table name, e.g.
+// `"materialized"."rpt_invoice_detail"`.
 func (t *Table) QualifiedName() string {
-	return t.Schema + "." + t.Name
+	return pgident.Qualify(t.Schema, t.Name)
 }
 
 // Column represents a table column.
@@ -414,7 +416,7 @@ func RenderDDL(t *Table) string {
 
 	// Columns
 	for i, col := range t.Columns {
-		fmt.Fprintf(&b, "    %s %s", col.Name, col.DataType)
+		fmt.Fprintf(&b, "    %s %s", pgident.Quote(col.Name), col.DataType)
 		if col.IsIdentity {
 			fmt.Fprintf(&b, " GENERATED %s AS IDENTITY", col.IdentityKind)
 		}
@@ -457,7 +459,8 @@ func RenderDDL(t *Table) string {
 	// Primary key
 	if t.PK != nil {
 		remaining := len(t.Uniques) + len(t.Checks) + len(t.FKs)
-		fmt.Fprintf(&b, "    CONSTRAINT %s PRIMARY KEY (%s)", t.PK.Name, strings.Join(t.PK.Columns, ", "))
+		fmt.Fprintf(&b, "    CONSTRAINT %s PRIMARY KEY (%s)",
+			pgident.Quote(t.PK.Name), strings.Join(pgident.QuoteAll(t.PK.Columns), ", "))
 		if remaining > 0 {
 			b.WriteString(",")
 		}
@@ -467,7 +470,8 @@ func RenderDDL(t *Table) string {
 	// Unique constraints
 	for i, u := range t.Uniques {
 		remaining := len(t.Checks) + len(t.FKs)
-		fmt.Fprintf(&b, "    CONSTRAINT %s UNIQUE (%s)", u.Name, strings.Join(u.Columns, ", "))
+		fmt.Fprintf(&b, "    CONSTRAINT %s UNIQUE (%s)",
+			pgident.Quote(u.Name), strings.Join(pgident.QuoteAll(u.Columns), ", "))
 		if i < len(t.Uniques)-1 || remaining > 0 {
 			b.WriteString(",")
 		}
@@ -477,7 +481,9 @@ func RenderDDL(t *Table) string {
 	// Check constraints
 	for i, ck := range t.Checks {
 		remaining := len(t.FKs)
-		fmt.Fprintf(&b, "    CONSTRAINT %s %s", ck.Name, ck.Expression)
+		// The expression comes from pg_get_constraintdef, which already quotes
+		// what needs quoting; only the constraint name is ours to render.
+		fmt.Fprintf(&b, "    CONSTRAINT %s %s", pgident.Quote(ck.Name), ck.Expression)
 		if i < len(t.Checks)-1 || remaining > 0 {
 			b.WriteString(",")
 		}
@@ -486,12 +492,14 @@ func RenderDDL(t *Table) string {
 
 	// Foreign keys
 	for i, fk := range t.FKs {
-		refTable := fk.RefSchema + "." + fk.RefTable
+		// The FK target is the sharpest case for quoting: an unquoted,
+		// wrongly-cased reference does not error, it resolves to a DIFFERENT
+		// table -- the constraint is created, against the wrong object.
 		fmt.Fprintf(&b, "    CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
-			fk.Name,
-			strings.Join(fk.Columns, ", "),
-			refTable,
-			strings.Join(fk.RefColumns, ", "))
+			pgident.Quote(fk.Name),
+			strings.Join(pgident.QuoteAll(fk.Columns), ", "),
+			pgident.Qualify(fk.RefSchema, fk.RefTable),
+			strings.Join(pgident.QuoteAll(fk.RefColumns), ", "))
 		if fk.OnDelete != "NO ACTION" {
 			fmt.Fprintf(&b, " ON DELETE %s", fk.OnDelete)
 		}

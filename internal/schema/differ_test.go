@@ -2,21 +2,6 @@ package schema
 
 import "testing"
 
-func TestQuoteIdent(t *testing.T) {
-	tests := []struct {
-		in   string
-		want string
-	}{
-		{"pgschemadiff_tmp_abc", `"pgschemadiff_tmp_abc"`},
-		{`weird"name`, `"weird""name"`},
-	}
-	for _, tt := range tests {
-		if got := quoteIdent(tt.in); got != tt.want {
-			t.Errorf("quoteIdent(%q) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
-}
-
 // TestTempConnComposition mirrors how the temp-DB factory builds a connection
 // string: replace the db name first, then append statement_timeout. Appending
 // options before replaceDBName would corrupt a key=value DSN (replaceDBName

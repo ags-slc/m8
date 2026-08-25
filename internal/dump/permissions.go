@@ -4,14 +4,32 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/ags-slc/m8/internal/pgident"
 )
 
 // Grant represents a table-level privilege.
+//
+// Grantee is a role name, EXCEPT for the sentinel "PUBLIC", which stands for
+// the pseudo-role and is rendered unquoted. PostgreSQL reserves the name
+// (CREATE ROLE public is refused), so no real role can produce the sentinel.
 type Grant struct {
 	Schema    string
 	Table     string
 	Grantee   string
 	Privilege string // SELECT, INSERT, UPDATE, DELETE, etc.
+}
+
+// publicRole is the sentinel Grantee for PUBLIC. See Grant.
+const publicRole = "PUBLIC"
+
+// quoteGrantee renders a grantee: PUBLIC is a keyword and must stay unquoted;
+// every real role name is quoted like any other identifier.
+func quoteGrantee(grantee string) string {
+	if grantee == publicRole {
+		return publicRole
+	}
+	return pgident.Quote(grantee)
 }
 
 // ListGrants returns all non-owner privileges on a schema's relations.
@@ -92,9 +110,16 @@ func (d *Dumper) ListPublicGrants(ctx context.Context, schema string) ([]Grant, 
 
 // RoutineGrant represents a non-default EXECUTE privilege on a function or
 // procedure.
+//
+// Name and Args are kept apart because only Name is an identifier: it must be
+// quoted, while Args is a rendered type list from
+// pg_get_function_identity_arguments that must not be. Args is required --
+// EXECUTE is granted per overload, so an unsignatured GRANT is ambiguous the
+// moment a function is overloaded.
 type RoutineGrant struct {
 	Schema    string
-	Signature string // name(identity args) -- required, EXECUTE is per-overload
+	Name      string
+	Args      string
 	Grantee   string
 	Privilege string
 }
@@ -109,7 +134,8 @@ func (d *Dumper) ListRoutineGrants(ctx context.Context, schema string) ([]Routin
 	rows, err := d.conn.Query(ctx, `
 		SELECT
 			n.nspname,
-			p.proname || '(' || pg_catalog.pg_get_function_identity_arguments(p.oid) || ')',
+			p.proname,
+			pg_catalog.pg_get_function_identity_arguments(p.oid),
 			pg_catalog.pg_get_userbyid(a.grantee),
 			a.privilege_type
 		FROM pg_proc p
@@ -126,7 +152,7 @@ func (d *Dumper) ListRoutineGrants(ctx context.Context, schema string) ([]Routin
 			  SELECT 1 FROM pg_depend d
 			  WHERE d.objid = p.oid AND d.deptype = 'e'
 		  )
-		ORDER BY 2, 3, 4
+		ORDER BY 2, 3, 4, 5
 	`, schema)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list routine grants in %s: %w", schema, err)
@@ -136,7 +162,7 @@ func (d *Dumper) ListRoutineGrants(ctx context.Context, schema string) ([]Routin
 	var grants []RoutineGrant
 	for rows.Next() {
 		var g RoutineGrant
-		if err := rows.Scan(&g.Schema, &g.Signature, &g.Grantee, &g.Privilege); err != nil {
+		if err := rows.Scan(&g.Schema, &g.Name, &g.Args, &g.Grantee, &g.Privilege); err != nil {
 			return nil, err
 		}
 		grants = append(grants, g)
@@ -155,8 +181,8 @@ func RenderRoutineGrants(grants []RoutineGrant) string {
 	}
 	var b strings.Builder
 	for _, g := range grants {
-		fmt.Fprintf(&b, "GRANT %s ON ROUTINE %s.%s TO %s;\n",
-			g.Privilege, g.Schema, g.Signature, g.Grantee)
+		fmt.Fprintf(&b, "GRANT %s ON ROUTINE %s.%s(%s) TO %s;\n",
+			g.Privilege, pgident.Quote(g.Schema), pgident.Quote(g.Name), g.Args, quoteGrantee(g.Grantee))
 	}
 	return b.String()
 }
@@ -192,14 +218,10 @@ func RenderGrants(grants []Grant, schema string) string {
 	// silently lands on a same-named relation in public.
 	for _, k := range order {
 		privs := grouped[k]
-		target := k.table
-		if k.schema != "" {
-			target = k.schema + "." + k.table
-		}
 		fmt.Fprintf(&b, "GRANT %s ON %s TO %s;\n",
 			strings.Join(privs, ", "),
-			target,
-			k.grantee)
+			pgident.Qualify(k.schema, k.table),
+			quoteGrantee(k.grantee))
 	}
 
 	return b.String()

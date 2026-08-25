@@ -11,6 +11,7 @@ import (
 
 	"github.com/ags-slc/m8/internal/migration"
 	"github.com/ags-slc/m8/internal/parser"
+	"github.com/ags-slc/m8/internal/pgident"
 	"github.com/ags-slc/m8/internal/schema"
 	"github.com/ags-slc/m8/internal/state"
 	"github.com/jackc/pgx/v5"
@@ -227,7 +228,7 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 			var combinedDDL []string
 			// Ensure the PG schema exists in the temp DB for DDL parsing
 			if pgSchema != "public" {
-				combinedDDL = append(combinedDDL, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", pgSchema))
+				combinedDDL = append(combinedDDL, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", pgident.Quote(pgSchema)))
 			}
 			for _, m := range migrations {
 				combinedDDL = append(combinedDDL, string(m.Content))
@@ -526,7 +527,7 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 	for pgSchema, pgMigrations := range grouped {
 		var combinedDDL []string
 		if pgSchema != "public" {
-			combinedDDL = append(combinedDDL, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", pgSchema))
+			combinedDDL = append(combinedDDL, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", pgident.Quote(pgSchema)))
 		}
 		for _, m := range pgMigrations {
 			combinedDDL = append(combinedDDL, string(m.Content))
@@ -826,7 +827,9 @@ func (e *Engine) ensurePGSchemas(ctx context.Context, migrations []*migration.Mi
 			continue
 		}
 		seen[m.PGSchema] = true
-		_, err := e.conn.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", m.PGSchema))
+		// Quoted: an unquoted schema/MySchema/ folder creates "myschema" while
+		// the diff is scoped to "MySchema", which then reads as empty.
+		_, err := e.conn.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", pgident.Quote(m.PGSchema)))
 		if err != nil {
 			return fmt.Errorf("failed to create schema %s: %w", m.PGSchema, err)
 		}
