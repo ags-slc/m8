@@ -19,11 +19,22 @@ jobs:
       - name: Build
         run: go build ./...
 
+      # We publish darwin/linux/windows on amd64 and arm64; make sure they all
+      # still compile before a tag finds out for us.
+      - name: Cross-compile release targets
+        run: |
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            echo "==> $target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0 go build ./...
+          done
+
       - name: Unit tests
         run: go test ./internal/parser/... ./internal/migration/... ./internal/schema/... ./internal/config/... -v -count=1
 
+      # -p 1: these two packages each spin up PostgreSQL containers; running them
+      # in parallel has produced intermittent failures.
       - name: Integration tests
-        run: go test ./internal/engine/... ./internal/dump/... -v -count=1 -timeout 300s
+        run: go test ./internal/engine/... ./internal/dump/... -v -count=1 -p 1 -timeout 600s
 
   lint:
     runs-on: ubuntu-latest
