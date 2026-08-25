@@ -635,12 +635,25 @@ func TestRenderDDLGeneratedColumn(t *testing.T) {
 	if strings.Contains(ddl, "DEFAULT CASE") || strings.Contains(ddl, "DEFAULT\nCASE") {
 		t.Errorf("generation expression was emitted as a DEFAULT:\n%s", ddl)
 	}
-	// The expression must be folded onto one line, not pretty-printed across
-	// several, or the column definition is unreadable.
-	for _, line := range strings.Split(ddl, "\n") {
-		if strings.Contains(line, "GENERATED ALWAYS AS (") && !strings.Contains(line, ") STORED") {
-			t.Errorf("generated-column clause spans multiple lines: %q", line)
-		}
+	// pg_get_expr pretty-prints a CASE across several lines. The dumper emits
+	// it byte-for-byte anyway -- reflowing it would mean rewriting arbitrary
+	// SQL without parsing it, which is how whitespace inside string literals
+	// used to get eaten (see
+	// TestRenderDDLGeneratedColumnPreservesStringLiterals). pg_dump makes the
+	// same call and the same choice.
+	var catalogExpr string
+	if err := conn.QueryRow(ctx, `
+		SELECT pg_get_expr(ad.adbin, ad.adrelid)
+		FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid
+		JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+		WHERE c.relname = 'progress' AND a.attname = 'duration_seconds'
+	`).Scan(&catalogExpr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(ddl, "GENERATED ALWAYS AS ("+catalogExpr+") STORED") {
+		t.Errorf("generation expression was rewritten on the way out.\ncatalog:\n%s\n\ndumped:\n%s",
+			catalogExpr, ddl)
 	}
 
 	// The real proof: the dumped DDL must replay.
@@ -786,5 +799,99 @@ func TestDumpGrantsSeesGrantsToUnrelatedRoles(t *testing.T) {
 	}
 	if _, ok := seen["owner_role"]; ok {
 		t.Errorf("the owner's own implicit privileges should not be emitted: %v", seen)
+	}
+}
+
+// TestRenderDDLGeneratedColumnPreservesStringLiterals pins that the dumper does
+// not rewrite the expression it captured.
+//
+// The generated-column path used to fold the expression onto one line with
+// strings.Fields/Join, which collapses whitespace inside STRING LITERALS as
+// well as between SQL tokens. A column generated from
+//
+//	a || E'\n  two spaces  here'
+//
+// dumped as (a || ' two spaces here'::text): valid SQL, replays cleanly, and
+// computes different values from the column it claims to describe. The sibling
+// DEFAULT path was never collapsed, so the two halves of the same CREATE TABLE
+// disagreed about whether literals were safe to touch.
+func TestRenderDDLGeneratedColumnPreservesStringLiterals(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE literals (
+			id BIGINT PRIMARY KEY,
+			a  TEXT NOT NULL,
+			padded TEXT NOT NULL DEFAULT 'two  spaces',
+			g  TEXT GENERATED ALWAYS AS (a || E'\n  two spaces  here') STORED
+		);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	// What the live column actually computes, and how the catalog spells it.
+	if _, err := conn.Exec(ctx, `INSERT INTO literals (id, a) VALUES (1, 'x')`); err != nil {
+		t.Fatal(err)
+	}
+	var wantValue, wantExpr, wantDefault string
+	if err := conn.QueryRow(ctx, `SELECT g FROM literals WHERE id = 1`).Scan(&wantValue); err != nil {
+		t.Fatal(err)
+	}
+	const exprQuery = `
+		SELECT pg_get_expr(ad.adbin, ad.adrelid)
+		FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid
+		JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+		WHERE c.relname = 'literals' AND a.attname = $1`
+	if err := conn.QueryRow(ctx, exprQuery, "g").Scan(&wantExpr); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.QueryRow(ctx, exprQuery, "padded").Scan(&wantDefault); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDumper(conn)
+	table, err := d.DumpTable(ctx, "public", "literals")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddl := RenderDDL(table)
+
+	if _, err := conn.Exec(ctx, `DROP TABLE literals`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, ddl); err != nil {
+		t.Fatalf("replaying dumped DDL failed: %v\n%s", err, ddl)
+	}
+
+	var gotExpr, gotDefault string
+	if err := conn.QueryRow(ctx, exprQuery, "g").Scan(&gotExpr); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.QueryRow(ctx, exprQuery, "padded").Scan(&gotDefault); err != nil {
+		t.Fatal(err)
+	}
+	if gotExpr != wantExpr {
+		t.Errorf("generation expression changed across the round trip:\n  live:    %q\n  replayed: %q\n\n%s",
+			wantExpr, gotExpr, ddl)
+	}
+	if gotDefault != wantDefault {
+		t.Errorf("column default changed across the round trip:\n  live:    %q\n  replayed: %q",
+			wantDefault, gotDefault)
+	}
+
+	// The point of the expression is the value it computes.
+	if _, err := conn.Exec(ctx, `INSERT INTO literals (id, a) VALUES (1, 'x')`); err != nil {
+		t.Fatal(err)
+	}
+	var gotValue string
+	if err := conn.QueryRow(ctx, `SELECT g FROM literals WHERE id = 1`).Scan(&gotValue); err != nil {
+		t.Fatal(err)
+	}
+	if gotValue != wantValue {
+		t.Errorf("replayed column computes a different value:\n  live:     %q\n  replayed: %q",
+			wantValue, gotValue)
 	}
 }

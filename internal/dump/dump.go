@@ -419,8 +419,25 @@ func RenderDDL(t *Table) string {
 			fmt.Fprintf(&b, " GENERATED %s AS IDENTITY", col.IdentityKind)
 		}
 		if col.Generated != nil {
-			// Rendered before NOT NULL, which is the order Postgres accepts.
-			fmt.Fprintf(&b, " GENERATED ALWAYS AS (%s) STORED", collapseWhitespace(*col.Generated))
+			// Rendered before NOT NULL, which is the order Postgres accepts,
+			// and byte-for-byte as pg_get_expr wrote it.
+			//
+			// The expression used to be folded onto one line with
+			// strings.Fields/Join. That collapses whitespace INSIDE string
+			// literals too, so
+			//
+			//	(a || '
+			//	  two spaces  here'::text)
+			//
+			// dumped as (a || ' two spaces here'::text) and the replayed column
+			// computed different values -- the baseline in git stopped
+			// describing the database. Re-indenting a pretty-printed expression
+			// has the same defect: a literal containing a newline gets indented
+			// along with the SQL. There is no cosmetic transformation of an
+			// arbitrary SQL expression that is safe without parsing it, and
+			// readability is not worth a wrong expression. The sibling DEFAULT
+			// path a few lines down has always emitted verbatim.
+			fmt.Fprintf(&b, " GENERATED ALWAYS AS (%s) STORED", *col.Generated)
 		}
 		if !col.Nullable {
 			b.WriteString(" NOT NULL")
@@ -497,11 +514,4 @@ func RenderDDL(t *Table) string {
 	}
 
 	return b.String()
-}
-
-// collapseWhitespace folds a multi-line catalog expression onto one line.
-// pg_get_expr pretty-prints CASE expressions across several lines, which is
-// valid SQL but renders a column definition unreadable inside a CREATE TABLE.
-func collapseWhitespace(s string) string {
-	return strings.Join(strings.Fields(s), " ")
 }
