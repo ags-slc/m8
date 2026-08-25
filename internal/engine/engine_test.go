@@ -1981,3 +1981,154 @@ func TestDumpedSchemaPlansClean(t *testing.T) {
 		}
 	}
 }
+
+// TestNonStrictPlanLeavesUndeclaredAttachedObjects pins that a dumped baseline
+// does not propose destroying the things `m8 dump` cannot capture.
+//
+// pg-schema-diff introspects triggers, row-level security policies, the RLS flag
+// and replica identity. m8's dumper captures none of them, so on a database
+// bootstrapped by `m8 dump` the desired state never mentions them and the diff
+// proposes removing them -- and the declared-object filter keeps those
+// statements, because each one NAMES the declared table it hangs off. Applied
+// against a production primary that means audit triggers gone, RLS disabled,
+// the tenant-isolation policy dropped, and REPLICA IDENTITY FULL reset out from
+// under a logical-replication consumer. The plan validates cleanly, so
+// --fail-on-unvalidated catches none of it.
+func TestNonStrictPlanLeavesUndeclaredAttachedObjects(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.t (id BIGINT PRIMARY KEY, tenant TEXT NOT NULL);
+		CREATE FUNCTION public.t_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER t_audit_trg BEFORE INSERT ON public.t FOR EACH ROW EXECUTE FUNCTION public.t_audit();
+		ALTER TABLE public.t ENABLE ROW LEVEL SECURITY;
+		CREATE POLICY t_tenant_isolation ON public.t USING (true);
+		ALTER TABLE public.t REPLICA IDENTITY FULL;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	// The baseline a `m8 dump` would produce: the table, and nothing attached.
+	dir := setupMigrationsDir(t)
+	tbl, err := dump.NewDumper(conn).DumpTable(ctx, "public", "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "t.sql"),
+		[]byte(dump.RenderDDL(tbl)), 0644)
+
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+
+	result, err := eng.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range result.Schema {
+		if s.Error != nil {
+			t.Fatalf("diff error: %v", s.Error)
+		}
+		if s.Diff == nil {
+			continue
+		}
+		for _, stmt := range s.Diff.Statements {
+			t.Errorf("plan proposes acting on an object the migration files never declared: %s", stmt.DDL)
+		}
+	}
+
+	// And apply must actually leave them in place.
+	if _, err := eng.Apply(ctx); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	var trigger, policy, rls bool
+	var replicaIdentity string
+	if err := conn.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 't_audit_trg' AND NOT tgisinternal),
+		       EXISTS (SELECT 1 FROM pg_policy WHERE polname = 't_tenant_isolation'),
+		       c.relrowsecurity,
+		       c.relreplident::text
+		FROM pg_class c WHERE c.oid = 'public.t'::regclass
+	`).Scan(&trigger, &policy, &rls, &replicaIdentity); err != nil {
+		t.Fatal(err)
+	}
+	if !trigger {
+		t.Error("apply dropped an undeclared trigger")
+	}
+	if !policy {
+		t.Error("apply dropped an undeclared row-level security policy")
+	}
+	if !rls {
+		t.Error("apply disabled row-level security")
+	}
+	if replicaIdentity != "f" {
+		t.Errorf("apply reset REPLICA IDENTITY to %q, breaking logical replication", replicaIdentity)
+	}
+}
+
+// The protection is per class, not blanket: a schema folder that DOES declare
+// triggers keeps the old behaviour, because then a trigger the files omit really
+// is one the desired state says should not exist.
+func TestNonStrictPlanStillManagesDeclaredAttachedClasses(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.t (id BIGINT PRIMARY KEY);
+		CREATE FUNCTION public.t_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+		CREATE TRIGGER t_old_trg BEFORE INSERT ON public.t FOR EACH ROW EXECUTE FUNCTION public.t_audit();
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	// The folder declares the table AND a different trigger, so triggers are a
+	// class this schema manages.
+	dir := setupMigrationsDir(t)
+	// The trigger function has to be declared too: the desired state is parsed
+	// by replaying this DDL into an empty database.
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "t.sql"), []byte(`
+CREATE TABLE public.t (id BIGINT PRIMARY KEY);
+CREATE FUNCTION public.t_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$;
+CREATE TRIGGER t_new_trg BEFORE UPDATE ON public.t FOR EACH ROW EXECUTE FUNCTION public.t_audit();
+`), 0644)
+
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+
+	result, err := eng.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawDrop, sawCreate bool
+	for _, s := range result.Schema {
+		if s.Error != nil {
+			t.Fatalf("diff error: %v", s.Error)
+		}
+		if s.Diff == nil {
+			continue
+		}
+		for _, stmt := range s.Diff.Statements {
+			lower := strings.ToLower(stmt.DDL)
+			if strings.Contains(lower, "drop trigger") && strings.Contains(lower, "t_old_trg") {
+				sawDrop = true
+			}
+			if strings.Contains(lower, "create trigger") && strings.Contains(lower, "t_new_trg") {
+				sawCreate = true
+			}
+		}
+	}
+	if !sawCreate {
+		t.Error("a declared trigger was not created")
+	}
+	if !sawDrop {
+		t.Error("a folder that declares triggers must still reconcile the ones it omits")
+	}
+}

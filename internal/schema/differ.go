@@ -452,8 +452,10 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 	// In default (non-strict) mode, only include statements targeting objects
 	// defined in the DDL. In strict mode, include everything except _m8 internals.
 	var definedObjects map[string]bool
+	var undeclaredClasses []*regexp.Regexp
 	if !strict {
 		definedObjects = extractDefinedObjects(desiredDDL)
+		undeclaredClasses = undeclaredAttachedClasses(desiredDDL)
 		// A sequence behind a SERIAL or IDENTITY column is never named in the
 		// DDL that declares it — the column says BIGSERIAL and Postgres derives
 		// "<table>_<column>_seq" — so the desired state alone cannot say which
@@ -492,6 +494,13 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 		}
 
 		if !strict {
+			// An object attached to a declared table -- a trigger, a policy, the
+			// RLS flag, replica identity -- is not "unrelated" to the name test:
+			// the statement that removes it names the table, so the name test
+			// keeps it. Whether it is ours to remove is decided by class, above.
+			if matchesAny(undeclaredClasses, stmt.DDL) {
+				continue
+			}
 			if !statementTargetsDefinedObject(stmt.DDL, definedObjects) {
 				continue
 			}
@@ -645,6 +654,76 @@ func statementTargetsDefinedObject(ddl string, defined map[string]bool) bool {
 	return false
 }
 
+// attachedClasses are object classes that hang off a table rather than standing
+// on their own. pg-schema-diff introspects every one of them; `m8 dump` captures
+// none of them; so on a database bootstrapped by `m8 dump` the desired state
+// never mentions them and the diff proposes removing them -- and because the
+// statement that removes one NAMES THE TABLE it hangs off, the declared-object
+// test keeps it. A dumped baseline therefore planned, and applied:
+//
+//	DROP TRIGGER "t_audit_trg" ON "public"."t"
+//	DROP POLICY "t_tenant_isolation" ON "public"."t"
+//	ALTER TABLE "public"."t" DISABLE ROW LEVEL SECURITY
+//	ALTER TABLE "public"."t" REPLICA IDENTITY DEFAULT
+//
+// against a database whose migration files never mentioned any of them. The plan
+// validates cleanly, so --fail-on-unvalidated is no protection either.
+//
+// Non-strict mode's contract is that objects the migration files do not declare
+// are left alone, so the test is per CLASS: if nothing in this schema folder
+// declares a trigger, no statement may remove one. A folder that DOES declare
+// triggers gets the old behaviour, because then an undeclared trigger really is
+// one the desired state says should not exist. --strict is unaffected: it means
+// "these files are the whole truth", and removing what they omit is the point.
+var attachedClasses = []struct {
+	name      string
+	declared  *regexp.Regexp // the class appears in the desired DDL
+	statement *regexp.Regexp // a generated statement acts on the class
+}{
+	{
+		name:      "trigger",
+		declared:  regexp.MustCompile(`(?is)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\b`),
+		statement: regexp.MustCompile(`(?is)^\s*(?:CREATE|ALTER|DROP)\s+(?:OR\s+REPLACE\s+)?(?:CONSTRAINT\s+)?TRIGGER\b`),
+	},
+	{
+		name:      "policy",
+		declared:  regexp.MustCompile(`(?is)\bCREATE\s+POLICY\b`),
+		statement: regexp.MustCompile(`(?is)^\s*(?:CREATE|ALTER|DROP)\s+POLICY\b`),
+	},
+	{
+		name:      "row level security",
+		declared:  regexp.MustCompile(`(?is)\bROW\s+LEVEL\s+SECURITY\b`),
+		statement: regexp.MustCompile(`(?is)\bROW\s+LEVEL\s+SECURITY\b`),
+	},
+	{
+		name:      "replica identity",
+		declared:  regexp.MustCompile(`(?is)\bREPLICA\s+IDENTITY\b`),
+		statement: regexp.MustCompile(`(?is)\bREPLICA\s+IDENTITY\b`),
+	},
+}
+
+// undeclaredAttachedClasses returns the statement patterns for every attached
+// class this desired state says nothing about.
+func undeclaredAttachedClasses(desiredDDL []string) []*regexp.Regexp {
+	combined := strings.Join(desiredDDL, "\n")
+	var out []*regexp.Regexp
+	for _, c := range attachedClasses {
+		if !c.declared.MatchString(combined) {
+			out = append(out, c.statement)
+		}
+	}
+	return out
+}
+
+func matchesAny(patterns []*regexp.Regexp, s string) bool {
+	for _, re := range patterns {
+		if re.MatchString(s) {
+			return true
+		}
+	}
+	return false
+}
+
 // ownedSequences returns the sequences in targetSchema that belong to a column,
 // mapped to the (lowercased) name of the table that owns them. These are the
 // sequences SERIAL and GENERATED … AS IDENTITY create: they carry an automatic
@@ -666,6 +745,10 @@ func ownedSequences(ctx context.Context, liveDB *sql.DB, targetSchema string) (m
 		 AND d.refclassid = 'pg_class'::regclass
 		 AND d.deptype IN ('a', 'i')
 		JOIN pg_class t ON t.oid = d.refobjid
+		-- Same schema on both sides: definedObjects holds bare table names, so a
+		-- sequence owned by a same-named table in ANOTHER schema would otherwise
+		-- be adopted on the strength of the name alone.
+		 AND t.relnamespace = n.oid
 		WHERE s.relkind = 'S'
 		  AND n.nspname = $1`, targetSchema)
 	if err != nil {

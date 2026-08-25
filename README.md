@@ -213,8 +213,25 @@ recreated, so losing the revoke is a privilege escalation, not just a gap.
 **Not captured:** materialized views. They have no `CREATE OR REPLACE` form, so
 they cannot be re-applied idempotently the way a `logic/` file must be. `m8 dump`
 names them and refuses rather than leaving them out silently; pass
-`--allow-unsupported` to skip them deliberately. Row-level security policies,
-event triggers, and roles themselves are also outside the dump's scope.
+`--allow-unsupported` to skip them deliberately.
+
+Also not captured: **triggers, row-level security (the flag and its policies),
+and replica identity**, plus roles themselves, event triggers, and
+`ALTER DEFAULT PRIVILEGES`.
+
+> **Triggers, RLS, and replica identity, and `--strict`.** pg-schema-diff *does*
+> introspect these, so on a database bootstrapped by `m8 dump` the desired state
+> never mentions them and the raw diff proposes removing them. In default
+> (non-strict) mode m8 drops those statements: if nothing in a `schema/` folder
+> declares a trigger, no generated statement may drop one — and likewise for
+> policies, RLS, and replica identity. A folder that *does* declare triggers gets
+> the normal treatment for that class, because then a trigger the files omit
+> really is one the desired state says should not exist.
+>
+> **`--strict` has no such protection, by design** — it means "these files are the
+> whole truth". Do not run `--strict` against a database whose triggers, RLS
+> policies, or `REPLICA IDENTITY FULL` (logical replication / CDC) are not
+> declared in the migration files: it will remove them.
 
 ## Commands
 
