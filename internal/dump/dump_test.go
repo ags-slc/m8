@@ -432,10 +432,10 @@ func TestDumpGrants(t *testing.T) {
 
 	allGrants := append(grants, publicGrants...)
 	rendered := RenderGrants(allGrants, "public")
-	if !strings.Contains(rendered, "GRANT SELECT ON docs TO reader") {
+	if !strings.Contains(rendered, "GRANT SELECT ON public.docs TO reader") {
 		t.Errorf("expected grant to reader in:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "GRANT SELECT ON docs TO PUBLIC") {
+	if !strings.Contains(rendered, "GRANT SELECT ON public.docs TO PUBLIC") {
 		t.Errorf("expected grant to PUBLIC in:\n%s", rendered)
 	}
 }
@@ -550,5 +550,115 @@ func TestRenderDDLQualifiesNonPublicSchema(t *testing.T) {
 	}
 	if landedIn != "materialized" {
 		t.Errorf("replayed table landed in schema %q, want \"materialized\"", landedIn)
+	}
+}
+
+// Grants must be schema-qualified for the same reason view DDL must be: they
+// are replayed over a connection pool, where no session search_path survives
+// to the next statement. An unqualified GRANT either errors out or lands on a
+// same-named relation in public.
+func TestDumpGrantsAreSchemaQualified(t *testing.T) {
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := conn.Exec(ctx, `
+		CREATE SCHEMA radar;
+		CREATE TABLE radar.audit_log (id INT);
+		CREATE ROLE viewport_readonly;
+		GRANT SELECT ON radar.audit_log TO viewport_readonly;
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDumper(conn)
+	grants, err := d.ListGrants(ctx, "radar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rendered := RenderGrants(grants, "radar")
+	if !strings.Contains(rendered, "ON radar.audit_log TO viewport_readonly") {
+		t.Errorf("grant target is not schema-qualified:\n%s", rendered)
+	}
+
+	if _, err := conn.Exec(ctx, "REVOKE ALL ON radar.audit_log FROM viewport_readonly"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "SET search_path TO public"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, rendered); err != nil {
+		t.Fatalf("rendered grants failed to replay without a search_path: %v\n%s", err, rendered)
+	}
+}
+
+// TestRenderDDLGeneratedColumn pins that a GENERATED ALWAYS AS (...) STORED
+// column round-trips. Postgres keeps the generation expression in pg_attrdef
+// next to ordinary defaults, so a dump that reads pg_attrdef without checking
+// attgenerated emits it as a DEFAULT — and a DEFAULT may not reference sibling
+// columns, so Postgres rejects the DDL with 0A000. Because m8 diffs a whole
+// schema folder as one batch, a single such table poisons every diff in it.
+func TestRenderDDLGeneratedColumn(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	_, err := conn.Exec(ctx, `
+		CREATE TABLE progress (
+			id BIGINT PRIMARY KEY,
+			started_at  TIMESTAMPTZ,
+			finished_at TIMESTAMPTZ,
+			duration_seconds INTEGER GENERATED ALWAYS AS (
+				CASE WHEN finished_at IS NOT NULL AND started_at IS NOT NULL
+				     THEN (EXTRACT(epoch FROM (finished_at - started_at)))::integer
+				     ELSE NULL::integer
+				END
+			) STORED
+		);
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDumper(conn)
+	table, err := d.DumpTable(ctx, "public", "progress")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddl := RenderDDL(table)
+
+	if !strings.Contains(ddl, "GENERATED ALWAYS AS (") || !strings.Contains(ddl, ") STORED") {
+		t.Errorf("expected a generated-column clause, got:\n%s", ddl)
+	}
+	if strings.Contains(ddl, "DEFAULT CASE") || strings.Contains(ddl, "DEFAULT\nCASE") {
+		t.Errorf("generation expression was emitted as a DEFAULT:\n%s", ddl)
+	}
+	// The expression must be folded onto one line, not pretty-printed across
+	// several, or the column definition is unreadable.
+	for _, line := range strings.Split(ddl, "\n") {
+		if strings.Contains(line, "GENERATED ALWAYS AS (") && !strings.Contains(line, ") STORED") {
+			t.Errorf("generated-column clause spans multiple lines: %q", line)
+		}
+	}
+
+	// The real proof: the dumped DDL must replay.
+	if _, err := conn.Exec(ctx, `DROP TABLE progress`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, ddl); err != nil {
+		t.Fatalf("replaying dumped DDL failed: %v\n%s", err, ddl)
+	}
+	var isGenerated string
+	if err := conn.QueryRow(ctx, `
+		SELECT a.attgenerated::text FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid
+		WHERE c.relname = 'progress' AND a.attname = 'duration_seconds'
+	`).Scan(&isGenerated); err != nil {
+		t.Fatal(err)
+	}
+	if isGenerated != "s" {
+		t.Errorf("replayed column is not stored-generated (attgenerated=%q)", isGenerated)
 	}
 }

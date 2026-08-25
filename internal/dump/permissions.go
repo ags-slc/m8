@@ -83,15 +83,16 @@ func RenderGrants(grants []Grant, schema string) string {
 		return ""
 	}
 
-	// Group by (grantee, table) → privileges
+	// Group by (grantee, schema, table) → privileges
 	type key struct {
 		grantee string
+		schema  string
 		table   string
 	}
 	grouped := make(map[key][]string)
 	var order []key
 	for _, g := range grants {
-		k := key{g.Grantee, g.Table}
+		k := key{g.Grantee, g.Schema, g.Table}
 		if _, exists := grouped[k]; !exists {
 			order = append(order, k)
 		}
@@ -101,12 +102,19 @@ func RenderGrants(grants []Grant, schema string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "-- Grants for schema %s\n\n", schema)
 
+	// Schema-qualify every target. Permissions are replayed through a
+	// connection pool, so a session-level SET search_path cannot be relied on
+	// to reach the statement after it -- an unqualified GRANT either errors or
+	// silently lands on a same-named relation in public.
 	for _, k := range order {
 		privs := grouped[k]
-		table := k.table
+		target := k.table
+		if k.schema != "" {
+			target = k.schema + "." + k.table
+		}
 		fmt.Fprintf(&b, "GRANT %s ON %s TO %s;\n",
 			strings.Join(privs, ", "),
-			table,
+			target,
 			k.grantee)
 	}
 
