@@ -15,7 +15,7 @@ import (
 	"github.com/ags-slc/m8/internal/engine"
 	"github.com/ags-slc/m8/internal/schema"
 	"github.com/jackc/pgx/v5"
-	_ "github.com/jackc/pgx/v5/stdlib" // register pgx as database/sql driver
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
 	"github.com/spf13/cobra"
 )
@@ -201,14 +201,12 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 		return nil, nil, nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	// database/sql connection for pg-schema-diff
-	sqlDB, err := sql.Open("pgx", connStr)
+	// database/sql handle pg-schema-diff introspects the live target through.
+	sqlDB, err := openTargetPool(connStr)
 	if err != nil {
-		conn.Close(ctx)
-		return nil, nil, nil, fmt.Errorf("failed to open sql.DB: %w", err)
+		_ = conn.Close(ctx)
+		return nil, nil, nil, err
 	}
-	// Disable statement_timeout for schema diffing operations (CREATE/DROP temp DBs)
-	sqlDB.ExecContext(ctx, "SET statement_timeout = 0")
 
 	var differ *schema.Differ
 	if needDiffer {
@@ -291,6 +289,29 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 	}
 
 	return conn, eng, cleanup, nil
+}
+
+// openTargetPool opens the pool pg-schema-diff reads the live schema through,
+// with statement_timeout disabled.
+//
+// The timeout is disabled in the connection configuration rather than by running
+// "SET statement_timeout = 0" against the pool. A SET executes on one arbitrary
+// pooled connection, which database/sql may never hand out again — every other
+// connection the pool opens keeps whatever the role or database default says. A
+// runtime parameter is sent in each connection's startup packet, so it holds for
+// all of them. (The differ's own connections do the same thing through their
+// connection strings; only introspection runs through this pool, since temp
+// database DDL happens on the shadow instance.)
+func openTargetPool(connStr string) (*sql.DB, error) {
+	cfg, err := pgx.ParseConfig(connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse connection string: %w", err)
+	}
+	if cfg.RuntimeParams == nil {
+		cfg.RuntimeParams = map[string]string{}
+	}
+	cfg.RuntimeParams["statement_timeout"] = "0"
+	return stdlib.OpenDB(*cfg), nil
 }
 
 func coalesce(values ...string) string {
