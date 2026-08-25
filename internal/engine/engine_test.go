@@ -1596,3 +1596,144 @@ func TestSchemaDiffReclaimsOwnedSequencesOnly(t *testing.T) {
 		t.Error("probe_history_hid_seq was dropped: probe_history is not declared and must not be touched")
 	}
 }
+
+// TestFormatApplyOutputWarnsOnUnvalidatedPlan pins that the warning reaches the
+// operator who is actually writing to the database.
+//
+// The warning used to exist only in FormatPlanOutput, so `m8 apply` ran a
+// degraded, unvalidated plan against the target and printed nothing but
+// "✓ file (Nms, K statements)".
+func TestFormatApplyOutputWarnsOnUnvalidatedPlan(t *testing.T) {
+	result := &ApplyResult{
+		Schema: []SchemaResult{{
+			Migration: &migration.Migration{Filename: "schema/materialized/x.sql"},
+			Applied:   true,
+			ExecMs:    12,
+			Diff: &schema.DiffResult{
+				Name:                    "materialized",
+				HasChanges:              true,
+				Statements:              []schema.DiffStatement{{DDL: "ALTER TABLE x ADD COLUMN y text"}},
+				ValidationSkipped:       true,
+				ValidationSkippedReason: "view materialized.admin_revenue_orphans reaches outside the schema",
+			},
+		}},
+	}
+
+	out := FormatApplyOutput(result)
+
+	if !strings.Contains(out, "PLAN_NOT_VALIDATED") {
+		t.Errorf("apply output does not warn that the plan was never validated:\n%s", out)
+	}
+	if !strings.Contains(out, "materialized") {
+		t.Errorf("warning does not name the schema it applies to:\n%s", out)
+	}
+	if !strings.Contains(out, "Applied: 1") {
+		t.Errorf("warning replaced the summary instead of accompanying it:\n%s", out)
+	}
+}
+
+// A clean-but-unvalidated apply is Skipped and would otherwise carry no line at
+// all, exactly as in FormatPlanOutput.
+func TestFormatApplyOutputWarnsOnCleanUnvalidatedPlan(t *testing.T) {
+	result := &ApplyResult{
+		Schema: []SchemaResult{{
+			Migration: &migration.Migration{Filename: "schema/materialized/x.sql"},
+			Skipped:   true,
+			Diff: &schema.DiffResult{
+				Name:                    "materialized",
+				ValidationSkipped:       true,
+				ValidationSkippedReason: "view materialized.admin_revenue_orphans reaches outside the schema",
+			},
+		}},
+	}
+
+	if out := FormatApplyOutput(result); !strings.Contains(out, "PLAN_NOT_VALIDATED") {
+		t.Errorf("clean unvalidated apply does not warn:\n%s", out)
+	}
+}
+
+// TestApplyRefusesUnvalidatedPlanWhenConfigured pins that a printed warning is
+// not the only defence available. A repository whose target is a production
+// primary sets --fail-on-unvalidated (or require_shadow, which implies it) and
+// m8 then refuses the plan instead of running it.
+func TestApplyRefusesUnvalidatedPlanWhenConfigured(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE SCHEMA elsewhere;
+		CREATE TABLE elsewhere.source_rows (id BIGINT PRIMARY KEY, label TEXT);
+		CREATE SCHEMA managed;
+		CREATE TABLE managed.thing (id BIGINT PRIMARY KEY);
+		CREATE VIEW managed.reaching_out AS SELECT id, label FROM elsewhere.source_rows;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := setupMigrationsDir(t)
+	mustMkdirAll(t, filepath.Join(dir, "schema", "managed"), 0755)
+	mustWriteFile(t, filepath.Join(dir, "schema", "managed", "thing.sql"),
+		[]byte("CREATE TABLE managed.thing (id BIGINT PRIMARY KEY, note TEXT);"), 0644)
+
+	differ, err := schema.NewDiffer(ctx, connStr, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = differ.Close() }()
+
+	eng := New(conn, sqlDB, differ, &Config{
+		MigrationsDir:     dir,
+		ConnStr:           connStr,
+		FailOnUnvalidated: true,
+	}, slog.Default())
+
+	result, err := eng.Apply(ctx)
+	if err == nil {
+		t.Fatal("apply ran an unvalidated plan even though it was configured to refuse")
+	}
+	if !strings.Contains(err.Error(), "not validated") {
+		t.Errorf("refusal does not say why it refused: %v", err)
+	}
+	if !strings.Contains(err.Error(), "shadow") {
+		t.Errorf("refusal does not say how to fix it: %v", err)
+	}
+
+	// Nothing was applied.
+	var hasNote bool
+	if err := conn.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'managed' AND table_name = 'thing' AND column_name = 'note'
+		)`).Scan(&hasNote); err != nil {
+		t.Fatal(err)
+	}
+	if hasNote {
+		t.Error("the refused plan was applied anyway")
+	}
+
+	// And the refusal is legible in the rendered output, not just in the error.
+	if result == nil {
+		t.Fatal("no result to format")
+	}
+	if out := FormatApplyOutput(result); !strings.Contains(out, "not validated") {
+		t.Errorf("apply output does not carry the refusal:\n%s", out)
+	}
+
+	// Without the setting, the same plan applies -- the refusal is opt-in.
+	permissive := New(conn, sqlDB, differ, &Config{MigrationsDir: dir, ConnStr: connStr}, slog.Default())
+	if _, err := permissive.Apply(ctx); err != nil {
+		t.Fatalf("apply without --fail-on-unvalidated: %v", err)
+	}
+	if err := conn.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'managed' AND table_name = 'thing' AND column_name = 'note'
+		)`).Scan(&hasNote); err != nil {
+		t.Fatal(err)
+	}
+	if !hasNote {
+		t.Error("the permissive apply did not apply the plan either")
+	}
+}

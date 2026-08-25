@@ -43,6 +43,11 @@ type Config struct {
 	MigrationsDir string
 	ConnStr       string
 	Strict        bool // When true, schema diffs include DROPs for undeclared objects.
+	// FailOnUnvalidated refuses a schema diff whose plan could not be validated
+	// against a throwaway rebuild, instead of applying it with a warning. A CI
+	// gate can be built on the resulting exit code; a warning printed to stdout
+	// is not something a pipeline can fail on.
+	FailOnUnvalidated bool
 }
 
 // ApplyResult holds the outcome of an apply or plan operation.
@@ -537,9 +542,39 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 		}
 		diffResult.Name = pgSchema
 
+		// Refuse BEFORE the first statement runs. The diff itself is fine; what
+		// is missing is the check that its statements execute and converge, and
+		// finding that out halfway through a production primary is the outcome
+		// this exists to prevent.
+		if diffResult.ValidationSkipped && e.config.FailOnUnvalidated {
+			refusal := fmt.Errorf(
+				"plan for schema %s was not validated (%s); refusing to apply it "+
+					"(--fail-on-unvalidated / require_shadow is set -- configure a shadow instance "+
+					"with --shadow-url / SHADOW_DATABASE_URL so the plan can be checked)",
+				pgSchema, firstLine(diffResult.ValidationSkippedReason))
+			for i, m := range pgMigrations {
+				sr := SchemaResult{Migration: m}
+				if i == 0 {
+					sr.Error = refusal
+					sr.Diff = diffResult
+				} else {
+					sr.Skipped = true
+				}
+				results = append(results, sr)
+			}
+			return results, refusal
+		}
+
 		if !diffResult.HasChanges {
-			for _, m := range pgMigrations {
-				results = append(results, SchemaResult{Migration: m, Skipped: true})
+			// Attach the diff even though there is nothing to do: "clean" and
+			// "clean, and we could not verify it" are different answers, and the
+			// second one has to survive as far as the output formatter.
+			for i, m := range pgMigrations {
+				sr := SchemaResult{Migration: m, Skipped: true}
+				if i == 0 {
+					sr.Diff = diffResult
+				}
+				results = append(results, sr)
 			}
 			continue
 		}
@@ -847,9 +882,30 @@ func FormatPlanOutput(result *ApplyResult) string {
 }
 
 // FormatApplyOutput returns a human-readable summary of an apply result.
+//
+// An unvalidated plan is reported here, not only in `plan`. apply runs the same
+// Differ, so it can and does execute a degraded plan against the target; saying
+// so only in the read-only command means the one operator who most needs to know
+// -- the one holding the write connection -- is the one not told.
 func FormatApplyOutput(result *ApplyResult) string {
 	var b strings.Builder
 	var applied, skipped, failed int
+
+	// Warnings for results that get no line of their own, hoisted above the
+	// per-file lines so they are not lost at the end of a long apply.
+	var w strings.Builder
+	warnUnvalidated := func(s SchemaResult, applied bool) {
+		if s.Diff == nil || !s.Diff.ValidationSkipped {
+			return
+		}
+		verb := "were applied"
+		if !applied {
+			verb = "would have been applied"
+		}
+		fmt.Fprintf(&w, "  ⚠ PLAN_NOT_VALIDATED %s (schema) — the statements %s without the check that they execute\n",
+			s.Diff.Name, verb)
+		fmt.Fprintf(&w, "      (%s)\n", firstLine(s.Diff.ValidationSkippedReason))
+	}
 
 	writeResults := func(results []MigrationResult) {
 		for _, v := range results {
@@ -876,8 +932,10 @@ func FormatApplyOutput(result *ApplyResult) string {
 				stmtCount = len(s.Diff.Statements)
 			}
 			fmt.Fprintf(&b, "  ✓ %s (%dms, %d statements)\n", s.Migration.Filename, s.ExecMs, stmtCount)
+			warnUnvalidated(s, true)
 			applied++
 		} else if s.Skipped {
+			warnUnvalidated(s, false)
 			skipped++
 		}
 	}
@@ -885,7 +943,7 @@ func FormatApplyOutput(result *ApplyResult) string {
 	writeResults(result.Permissions)
 
 	summary := fmt.Sprintf("\nApplied: %d, Skipped: %d, Failed: %d\n", applied, skipped, failed)
-	return b.String() + summary
+	return w.String() + b.String() + summary
 }
 
 // FormatStatusOutput returns a human-readable summary of status.
@@ -937,6 +995,23 @@ func FormatStatusOutput(result *StatusResult) string {
 	}
 
 	return b.String()
+}
+
+// UnvalidatedSchemas returns the PostgreSQL schemas whose diff was produced
+// without the plan-validation step. `plan` turns this into a non-zero exit when
+// --fail-on-unvalidated is set: PLAN_NOT_VALIDATED printed to stdout is not
+// something a CI pipeline can gate on.
+func UnvalidatedSchemas(r *ApplyResult) []string {
+	var names []string
+	seen := make(map[string]bool)
+	for _, s := range r.Schema {
+		if s.Diff == nil || !s.Diff.ValidationSkipped || seen[s.Diff.Name] {
+			continue
+		}
+		seen[s.Diff.Name] = true
+		names = append(names, s.Diff.Name)
+	}
+	return names
 }
 
 // firstLine trims a multi-line error to its first line, so a plan stays

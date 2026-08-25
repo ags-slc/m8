@@ -33,6 +33,9 @@ var (
 	flagShadowURL     string
 	flagStrict        bool
 	flagJSON          bool
+	// flagFailOnUnvalidated turns an unvalidated plan into a refusal rather
+	// than a warning, so a CI gate can be built on the exit code.
+	flagFailOnUnvalidated bool
 )
 
 var rootCmd = &cobra.Command{
@@ -59,6 +62,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagMigrationsDir, "migrations-dir", "migrations", "Path to migrations directory")
 	rootCmd.PersistentFlags().BoolVar(&flagStrict, "strict", false, "Include DROP statements for DB objects not declared in migration files")
 	rootCmd.PersistentFlags().BoolVar(&flagJSON, "json", false, "Output in JSON format")
+	rootCmd.PersistentFlags().BoolVar(&flagFailOnUnvalidated, "fail-on-unvalidated", false,
+		"Refuse to plan or apply a schema diff whose plan could not be validated (env: M8_FAIL_ON_UNVALIDATED; implied by require_shadow)")
 }
 
 func loadEnv() {
@@ -111,11 +116,12 @@ func loadConfig() (*config.Config, error) {
 // four separate resolvers, which meant the same run could read the file four
 // times and, on a parse error, disagree with itself about what it said.
 type settings struct {
-	ConnStr       string
-	ShadowConnStr string
-	MigrationsDir string
-	Strict        bool
-	RequireShadow bool
+	ConnStr           string
+	ShadowConnStr     string
+	MigrationsDir     string
+	Strict            bool
+	RequireShadow     bool
+	FailOnUnvalidated bool
 }
 
 func resolveSettings() (*settings, error) {
@@ -131,12 +137,22 @@ func resolveSettings() (*settings, error) {
 	if err != nil {
 		return nil, err
 	}
+	failOnUnvalidated, err := envBool("M8_FAIL_ON_UNVALIDATED", cfg.FailOnUnvalidated)
+	if err != nil {
+		return nil, err
+	}
+
 	return &settings{
 		ConnStr:       resolveConnStr(cfg),
 		ShadowConnStr: resolveShadowConnStr(cfg),
 		MigrationsDir: resolveMigrationsDir(cfg),
 		Strict:        flagStrict || cfg.Strict,
 		RequireShadow: requireShadow,
+		// An unvalidated plan is the same degrade require_shadow exists to
+		// forbid, one layer in: the statements were never proved to execute.
+		// A repository that refuses to plan without a shadow instance cannot
+		// coherently accept applying a plan the shadow never checked.
+		FailOnUnvalidated: flagFailOnUnvalidated || failOnUnvalidated || requireShadow,
 	}, nil
 }
 
@@ -318,9 +334,10 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 
 	logger := slog.Default()
 	eng := engine.New(conn, sqlDB, differ, &engine.Config{
-		MigrationsDir: st.MigrationsDir,
-		ConnStr:       connStr,
-		Strict:        st.Strict,
+		MigrationsDir:     st.MigrationsDir,
+		ConnStr:           connStr,
+		Strict:            st.Strict,
+		FailOnUnvalidated: st.FailOnUnvalidated,
 	}, logger)
 
 	cleanup := func() {

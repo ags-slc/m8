@@ -238,6 +238,14 @@ sslmode: prefer
 migrations_dir: migrations
 ```
 
+Safety settings for a production target (see
+[Refusing to degrade](#refusing-to-degrade-require_shadow---fail-on-unvalidated)):
+
+```yaml
+require_shadow: true
+fail_on_unvalidated: true
+```
+
 Or use a connection URL:
 
 ```yaml
@@ -261,6 +269,7 @@ m8 supports standard PostgreSQL environment variables and `.env` files:
 | `DATABASE_URL` | `--database-url` | `database_url` | -- |
 | `SHADOW_DATABASE_URL` | `--shadow-url` | `shadow_url` | -- |
 | `M8_REQUIRE_SHADOW` | -- | `require_shadow` | false |
+| `M8_FAIL_ON_UNVALIDATED` | `--fail-on-unvalidated` | `fail_on_unvalidated` | false |
 
 A `.m8.yaml` that exists but cannot be parsed is a **fatal error**, not a
 warning: falling back to an empty config would turn every safety setting in the
@@ -311,6 +320,37 @@ If the shadow is **explicitly configured** but the differ can't initialize
 silently skipping schema migrations. With no shadow configured it warns and
 falls back to the target; either way the engine refuses to apply when schema
 migrations exist but cannot be diffed.
+
+### Refusing to degrade (`require_shadow`, `--fail-on-unvalidated`)
+
+Two settings turn m8's degrades into refusals. Set both in any repository whose
+target is a production primary:
+
+```yaml
+require_shadow: true        # or M8_REQUIRE_SHADOW=true
+fail_on_unvalidated: true   # implied by require_shadow
+```
+
+`require_shadow` refuses to run at all when no shadow instance is configured,
+*before* opening a session on the target, rather than falling back to
+`CREATE`/`DROP DATABASE` churn on the live cluster.
+
+`fail_on_unvalidated` (`--fail-on-unvalidated`, implied by `require_shadow`)
+covers the other degrade. pg-schema-diff validates a plan by rebuilding the
+current schema in a throwaway database and replaying the generated statements
+against it. Because m8 scopes each diff to one PostgreSQL schema, that rebuild
+cannot resolve an object whose definition reaches outside it — a view over
+another schema's tables, for instance — and m8 then produces the diff *without*
+that check, marked `PLAN_NOT_VALIDATED`.
+
+Only that one phase degrades. "The generated DDL does not execute" and "the plan
+does not converge to the desired state" always abort, in `plan` and `apply`
+alike.
+
+`PLAN_NOT_VALIDATED` is printed by both `plan` and `apply`. On its own it
+affects no exit code, so a CI gate cannot see it; `--fail-on-unvalidated` turns
+it into a non-zero exit from `plan` and a refusal to run the statements in
+`apply`.
 
 **Cleanup.** At startup (for `plan`/`apply`/`sync` only) m8 drops any *invalid*
 orphaned `pgschemadiff_tmp_*` databases (the residue of an interrupted drop) on

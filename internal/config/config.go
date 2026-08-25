@@ -19,9 +19,14 @@ type Config struct {
 	// RequireShadow makes m8 refuse to run rather than fall back to creating
 	// schema-diff temp databases on the target. Set it in the .m8.yaml of any
 	// repository whose target is a production primary.
-	RequireShadow bool   `yaml:"require_shadow"`
-	MigrationsDir string `yaml:"migrations_dir"`
-	Strict        bool   `yaml:"strict"`
+	RequireShadow bool `yaml:"require_shadow"`
+	// FailOnUnvalidated makes m8 refuse a schema diff whose plan could not be
+	// validated, rather than warning and carrying on. require_shadow implies it:
+	// an unvalidated plan is the same degrade one layer in. Also settable as
+	// M8_FAIL_ON_UNVALIDATED.
+	FailOnUnvalidated bool   `yaml:"fail_on_unvalidated"`
+	MigrationsDir     string `yaml:"migrations_dir"`
+	Strict            bool   `yaml:"strict"`
 }
 
 // Load reads .m8.yaml from the current directory. A missing file yields an

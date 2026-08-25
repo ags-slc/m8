@@ -71,7 +71,7 @@ func TestMissingConfigIsNotAnError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a missing .m8.yaml must not be an error: %v", err)
 	}
-	if st.RequireShadow || st.Strict {
+	if st.RequireShadow || st.FailOnUnvalidated || st.Strict {
 		t.Errorf("defaults changed with no config present: %+v", st)
 	}
 }
@@ -116,5 +116,41 @@ func TestBooleanEnvOverrideMustParse(t *testing.T) {
 		t.Fatal("expected an unparseable M8_REQUIRE_SHADOW to be an error")
 	} else if !strings.Contains(err.Error(), "M8_REQUIRE_SHADOW") {
 		t.Errorf("error does not name the variable: %v", err)
+	}
+}
+
+// require_shadow implies --fail-on-unvalidated: a repository that refuses to
+// plan without a shadow instance cannot coherently accept applying a plan the
+// shadow never checked.
+func TestRequireShadowImpliesFailOnUnvalidated(t *testing.T) {
+	inRepoDir(t, "require_shadow: true\n")
+	t.Setenv("M8_REQUIRE_SHADOW", "")
+	t.Setenv("M8_FAIL_ON_UNVALIDATED", "")
+
+	st, err := resolveSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.FailOnUnvalidated {
+		t.Error("require_shadow did not imply fail_on_unvalidated")
+	}
+}
+
+// And it is independently settable, for a repository that wants the plan gate
+// without mandating a shadow instance.
+func TestFailOnUnvalidatedIsIndependentlySettable(t *testing.T) {
+	inRepoDir(t, "fail_on_unvalidated: true\n")
+	t.Setenv("M8_REQUIRE_SHADOW", "")
+	t.Setenv("M8_FAIL_ON_UNVALIDATED", "")
+
+	st, err := resolveSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.FailOnUnvalidated {
+		t.Error("fail_on_unvalidated in .m8.yaml was ignored")
+	}
+	if st.RequireShadow {
+		t.Error("fail_on_unvalidated must not imply require_shadow")
 	}
 }

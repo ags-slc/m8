@@ -22,6 +22,11 @@ var planCmd = &cobra.Command{
 		}
 		defer cleanup()
 
+		st, err := resolveSettings()
+		if err != nil {
+			return err
+		}
+
 		result, err := eng.Plan(ctx)
 		if err != nil {
 			return err
@@ -29,6 +34,21 @@ var planCmd = &cobra.Command{
 
 		output := engine.FormatPlanOutput(result)
 		fmt.Print(output)
+
+		// PLAN_NOT_VALIDATED on stdout is not something a pipeline can gate on:
+		// it affects no exit code. --fail-on-unvalidated (implied by
+		// require_shadow) turns it into one, and it must be checked before the
+		// os.Exit(2) below -- exit 2 means "there are changes to apply", which
+		// CI gates read as success.
+		if st.FailOnUnvalidated {
+			if names := engine.UnvalidatedSchemas(result); len(names) > 0 {
+				return fmt.Errorf(
+					"plan for %s could not be validated; refusing to report it as a plan "+
+						"(--fail-on-unvalidated / require_shadow is set -- configure a shadow instance "+
+						"with --shadow-url / SHADOW_DATABASE_URL)",
+					strings.Join(names, ", "))
+			}
+		}
 
 		// A schema whose diff could not be computed is NOT "pending". Exit 2
 		// means "there are changes to apply", and CI gates are built to treat
