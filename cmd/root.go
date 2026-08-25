@@ -3,9 +3,13 @@ package cmd
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/ags-slc/m8/internal/config"
 	"github.com/ags-slc/m8/internal/engine"
@@ -34,6 +38,10 @@ var rootCmd = &cobra.Command{
 	Use:   "m8",
 	Short: "PostgreSQL migration tool",
 	Long:  "m8 (mate) -- a PostgreSQL-specific migration tool with schema, logic, permissions, and ops migrations.",
+	// A failed connection or migration is not a usage error: don't answer it
+	// with the full help text. Execute() is the single place errors are printed.
+	SilenceUsage:  true,
+	SilenceErrors: true,
 }
 
 func init() {
@@ -58,7 +66,23 @@ func loadEnv() {
 
 // Execute runs the root command.
 func Execute() {
-	if err := rootCmd.Execute(); err != nil {
+	// Cancel the command context on SIGINT/SIGTERM instead of dying where we
+	// stand: in-flight statements are cancelled and, more importantly, deferred
+	// cleanup still runs — including the temp database sweep, which is what
+	// keeps an interrupted schema diff from orphaning a database. A second
+	// signal restores the default disposition and kills the process outright.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
+
+	if err := rootCmd.ExecuteContext(ctx); err != nil {
+		if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, "interrupted")
+			os.Exit(130)
+		}
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -120,6 +144,11 @@ func resolveConnStr() string {
 	}
 	return connStr
 }
+
+// teardownTimeout bounds the cleanup that runs after a command finishes,
+// including after an interrupted one. Short enough that a Ctrl-C still returns
+// promptly, long enough for a DROP DATABASE to land.
+const teardownTimeout = 30 * time.Second
 
 // resolveShadowConnStr returns the connection string for the instance that
 // hosts schema-diff temp databases. Priority: flag > SHADOW_DATABASE_URL env >
@@ -195,8 +224,8 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 			if shadowConnStr != "" {
 				// An explicitly configured shadow that fails must not silently
 				// disable schema diffing — fail loudly rather than skip S__ work.
-				sqlDB.Close()
-				conn.Close(ctx)
+				_ = sqlDB.Close()
+				_ = conn.Close(ctx)
 				return nil, nil, nil, fmt.Errorf("schema differ unavailable with configured shadow instance: %w", derr)
 			}
 			// No shadow configured: degrade. The engine still refuses to skip
@@ -233,11 +262,32 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 	}, logger)
 
 	cleanup := func() {
+		// Teardown runs on a context detached from the command's, so an
+		// interrupted run still cleans up after itself.
+		teardownCtx, cancelTeardown := context.WithTimeout(context.WithoutCancel(ctx), teardownTimeout)
+		defer cancelTeardown()
+
 		if differ != nil {
-			differ.Close()
+			_ = differ.Close()
+			// pg-schema-diff issues its own DROP DATABASE on the caller's context, so
+			// a cancelled run leaves the temp database behind — invalid if the drop
+			// was interrupted mid-flight, perfectly valid if it never got sent at all.
+			// Reclaim this run's own databases by name, which covers both and cannot
+			// touch a database belonging to another m8 process.
+			if n, serr := differ.DropCreatedTempDBs(teardownCtx); serr != nil {
+				slog.Warn("failed to reclaim schema-diff temp databases left by this run", "error", serr)
+			} else if n > 0 {
+				slog.Info("reclaimed schema-diff temp databases left by this run", "dropped", n)
+			}
+			// Then anything an earlier run left invalid, which is always safe to drop.
+			if n, serr := differ.SweepInvalidTempDBs(teardownCtx); serr != nil {
+				slog.Warn("post-run sweep of invalid schema-diff temp databases failed", "error", serr)
+			} else if n > 0 {
+				slog.Info("swept orphaned invalid schema-diff temp databases", "dropped", n)
+			}
 		}
-		sqlDB.Close()
-		conn.Close(ctx)
+		_ = sqlDB.Close()
+		_ = conn.Close(teardownCtx)
 	}
 
 	return conn, eng, cleanup, nil
