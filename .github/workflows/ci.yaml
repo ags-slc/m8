@@ -16,7 +16,8 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          # go.mod is the single source of truth for the Go version.
+          go-version-file: go.mod
 
       - name: Build
         run: go build ./...
@@ -45,7 +46,8 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.24"
+          # go.mod is the single source of truth for the Go version.
+          go-version-file: go.mod
 
       # golangci-lint v2 requires action v7 or later: on v6 the job died at
       # install ("golangci-lint v2 is not supported by golangci-lint-action v6")
