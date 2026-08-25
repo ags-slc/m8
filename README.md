@@ -184,7 +184,9 @@ m8 dump --database mydb --user postgres
 This generates:
 - `schema/{pg_schema}/*.sql` -- one CREATE TABLE per table, with indexes and constraints
 - `logic/*.sql` -- one file per function, procedure, and view (CREATE OR REPLACE)
-- `permissions/grants_{schema}.sql` -- GRANT statements per schema
+- `permissions/grants_{schema}.sql` -- per schema, in this order: `GRANT ... ON
+  SCHEMA`, the `REVOKE ... FROM PUBLIC` statements that undo PostgreSQL's
+  defaults, then relation, column, sequence, and routine grants
 
 Then run `m8 plan` to verify the dump produces a clean diff (no pending changes).
 
@@ -193,6 +195,26 @@ To limit to specific schemas:
 ```bash
 m8 dump --database mydb --user postgres --schema public --schema materialized
 ```
+
+### What the dump captures
+
+Identifiers are always quoted, so mixed case, spaces, and reserved words
+(`order`, `select`) survive the round trip. Unquoted, a foreign-key target does
+not error -- it resolves to a different table.
+
+Privileges are read from the catalog (`relacl`, `attacl`, `nspacl`, `proacl`),
+not from `information_schema`, whose views are filtered to grants the *dumping*
+role can see. The capture covers schema `USAGE`/`CREATE`, relation and
+column-level grants, sequences, routine `EXECUTE`, `WITH GRANT OPTION`, and the
+`REVOKE ... FROM PUBLIC` statements a rebuilt database would otherwise hand back
+-- a `SECURITY DEFINER` function is `EXECUTE`-able by `PUBLIC` the moment it is
+recreated, so losing the revoke is a privilege escalation, not just a gap.
+
+**Not captured:** materialized views. They have no `CREATE OR REPLACE` form, so
+they cannot be re-applied idempotently the way a `logic/` file must be. `m8 dump`
+names them and refuses rather than leaving them out silently; pass
+`--allow-unsupported` to skip them deliberately. Row-level security policies,
+event triggers, and roles themselves are also outside the dump's scope.
 
 ## Commands
 
