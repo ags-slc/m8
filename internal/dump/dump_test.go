@@ -1433,3 +1433,47 @@ func mustListGrants(t *testing.T, ctx context.Context, d *Dumper, schema string)
 	}
 	return g
 }
+
+// TestListViewsRefusesMaterializedViews pins that an object m8 cannot represent
+// is named, not skipped.
+//
+// relkind = 'v' excluded materialized views silently. A baseline that omits
+// objects without saying so is indistinguishable from one taken against a
+// database that has none -- and if the filter had included them, RenderView
+// would have emitted CREATE OR REPLACE VIEW, replacing a materialized view with
+// a plain one on replay.
+func TestListViewsRefusesMaterializedViews(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.readings (id BIGINT PRIMARY KEY, v NUMERIC);
+		CREATE VIEW public.recent AS SELECT id FROM public.readings;
+		CREATE MATERIALIZED VIEW public.rollup AS SELECT count(*) AS n FROM public.readings;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDumper(conn)
+	_, err := d.ListViews(ctx, "public")
+	if err == nil {
+		t.Fatal("materialized view was skipped silently")
+	}
+	if !strings.Contains(err.Error(), "rollup") {
+		t.Errorf("refusal does not name the object it cannot dump: %v", err)
+	}
+	if !strings.Contains(err.Error(), "--allow-unsupported") {
+		t.Errorf("refusal does not say how to proceed: %v", err)
+	}
+
+	// The skip is available, but only deliberately.
+	d.AllowUnsupported = true
+	views, err := d.ListViews(ctx, "public")
+	if err != nil {
+		t.Fatalf("--allow-unsupported should permit the skip: %v", err)
+	}
+	if len(views) != 1 || views[0].Name != "recent" {
+		t.Errorf("expected only the plain view, got %+v", views)
+	}
+}

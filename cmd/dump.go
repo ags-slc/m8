@@ -12,8 +12,9 @@ import (
 )
 
 var (
-	dumpSchemas []string
-	dumpStdout  bool
+	dumpSchemas          []string
+	dumpStdout           bool
+	dumpAllowUnsupported bool
 )
 
 var dumpCmd = &cobra.Command{
@@ -44,6 +45,7 @@ Examples:
 		defer func() { _ = conn.Close(ctx) }()
 
 		d := dump.NewDumper(conn)
+		d.AllowUnsupported = dumpAllowUnsupported
 
 		schemas := dumpSchemas
 		if len(schemas) == 0 {
@@ -223,5 +225,7 @@ func writeFile(dir, filename, content string) error {
 func init() {
 	dumpCmd.Flags().StringSliceVar(&dumpSchemas, "schema", nil, "Schemas to dump (default: all user schemas)")
 	dumpCmd.Flags().BoolVar(&dumpStdout, "stdout", false, "Print DDL to stdout instead of writing files")
+	dumpCmd.Flags().BoolVar(&dumpAllowUnsupported, "allow-unsupported", false,
+		"Leave objects m8 cannot represent (materialized views) out of the dump instead of refusing")
 	rootCmd.AddCommand(dumpCmd)
 }

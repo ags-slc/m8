@@ -1256,10 +1256,20 @@ func TestSchemaApplyCreatesSerialTable(t *testing.T) {
 	}
 }
 
-// TestPlanOnVirginDatabaseIsReadOnly pins that plan writes nothing at all to a
-// database m8 has never touched — not even its own state schema. A CI plan gate
-// runs on every pull request; it must be safe to point at production.
-func TestPlanOnVirginDatabaseIsReadOnly(t *testing.T) {
+// TestPlanLeavesNoPersistentTraceOnTheTarget pins what `m8 plan` may and may
+// not write to a database it has never touched. A CI plan gate runs on every
+// pull request; it must be safe to point at production.
+//
+// "Plan writes nothing at all" would be the wrong claim, and the old version of
+// this test only appeared to prove it by using a fixture with no S__ files at
+// all, so the differ never ran. With a schema migration present -- and with an
+// empty shadow, which is the default -- planning CREATES AND DROPS databases on
+// the target instance. That is the churn --shadow-url exists to move elsewhere,
+// and it is asserted here rather than left implicit.
+//
+// What plan must not do is leave anything behind: no _m8 state schema, no
+// declared object, and no surviving temp database.
+func TestPlanLeavesNoPersistentTraceOnTheTarget(t *testing.T) {
 	conn, sqlDB, connStr, cleanup := testDB(t)
 	defer cleanup()
 
@@ -1270,17 +1280,40 @@ func TestPlanOnVirginDatabaseIsReadOnly(t *testing.T) {
 		[]byte("SELECT 1;"), 0644)
 	mustWriteFile(t, filepath.Join(dir, "logic", "helper.sql"),
 		[]byte("CREATE OR REPLACE FUNCTION helper() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$;"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "widget.sql"),
+		[]byte("CREATE TABLE public.widget (id BIGINT PRIMARY KEY);"), 0644)
 
 	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
-	if differ != nil {
-		defer func() { _ = differ.Close() }()
+	if differ == nil {
+		t.Fatal("differ unavailable; this test is about what the differ does to the target")
 	}
+	defer func() { _ = differ.Close() }()
 
 	result, err := eng.Plan(ctx)
 	if err != nil {
 		t.Fatalf("plan on a virgin database: %v", err)
 	}
 
+	// Planning a schema migration with no shadow instance configured DOES write
+	// to the target: pg-schema-diff creates temp databases there.
+	created := differ.CreatedTempDBs()
+	if len(created) == 0 {
+		t.Error("expected plan to create temp databases on the target with no shadow configured; " +
+			"if that is no longer true, the warning in connectAndBuildEngine is stale")
+	}
+
+	// None may survive.
+	var surviving int
+	if err := conn.QueryRow(ctx,
+		`SELECT count(*) FROM pg_database WHERE datname LIKE 'pgschemadiff\_tmp\_%'`,
+	).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving != 0 {
+		t.Errorf("plan left %d temp database(s) behind on the target", surviving)
+	}
+
+	// Nothing persistent: not m8's own state schema...
 	var stateExists bool
 	if err := conn.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = '_m8')`,
@@ -1291,15 +1324,7 @@ func TestPlanOnVirginDatabaseIsReadOnly(t *testing.T) {
 		t.Error("plan bootstrapped the _m8 state schema; plan must not write")
 	}
 
-	// With no history to read, everything is pending.
-	if len(result.Ops) != 1 || result.Ops[0].Skipped {
-		t.Errorf("expected the ops migration to be pending, got %+v", result.Ops)
-	}
-	if len(result.Logic) != 1 || result.Logic[0].Skipped {
-		t.Errorf("expected the logic migration to be pending, got %+v", result.Logic)
-	}
-
-	// The function it planned must not have been created either.
+	// ...not the function it planned...
 	var fnExists bool
 	if err := conn.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'helper')`,
@@ -1308,6 +1333,26 @@ func TestPlanOnVirginDatabaseIsReadOnly(t *testing.T) {
 	}
 	if fnExists {
 		t.Error("plan created the helper function")
+	}
+
+	// ...and not the table.
+	var tableExists bool
+	if err := conn.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		                WHERE n.nspname = 'public' AND c.relname = 'widget')`,
+	).Scan(&tableExists); err != nil {
+		t.Fatal(err)
+	}
+	if tableExists {
+		t.Error("plan created the declared table")
+	}
+
+	// With no history to read, everything is pending.
+	if len(result.Ops) != 1 || result.Ops[0].Skipped {
+		t.Errorf("expected the ops migration to be pending, got %+v", result.Ops)
+	}
+	if len(result.Logic) != 1 || result.Logic[0].Skipped {
+		t.Errorf("expected the logic migration to be pending, got %+v", result.Logic)
 	}
 }
 

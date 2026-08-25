@@ -83,6 +83,12 @@ type Index struct {
 // Dumper generates CREATE TABLE DDL from a live database.
 type Dumper struct {
 	conn *pgx.Conn
+	// AllowUnsupported downgrades a refusal to dump objects m8 cannot represent
+	// -- materialized views -- into a silent skip. Off by default: a baseline
+	// that quietly omits objects is worse than one that will not be produced,
+	// because nothing downstream can tell the difference between "this database
+	// has no materialized views" and "m8 did not look".
+	AllowUnsupported bool
 }
 
 // NewDumper creates a new Dumper.
