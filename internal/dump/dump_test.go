@@ -133,7 +133,7 @@ func TestDumpTableWithFK(t *testing.T) {
 	}
 
 	ddl := RenderDDL(table)
-	if !strings.Contains(ddl, "REFERENCES users") {
+	if !strings.Contains(ddl, "REFERENCES public.users") {
 		t.Error("expected FK reference in DDL")
 	}
 	if !strings.Contains(ddl, "ON DELETE CASCADE") {
@@ -401,7 +401,7 @@ func TestRenderDDLRoundtrip(t *testing.T) {
 	ddl := RenderDDL(table)
 
 	// The DDL should be valid SQL that recreates the table
-	if !strings.Contains(ddl, "CREATE TABLE products") {
+	if !strings.Contains(ddl, "CREATE TABLE public.products") {
 		t.Error("expected CREATE TABLE")
 	}
 	if !strings.Contains(ddl, "BIGSERIAL") {
@@ -415,5 +415,72 @@ func TestRenderDDLRoundtrip(t *testing.T) {
 	}
 	if !strings.Contains(ddl, "WHERE") {
 		t.Error("expected partial index WHERE clause")
+	}
+}
+
+// TestRenderDDLQualifiesNonPublicSchema pins the contract that dumped DDL is
+// schema-qualified. The desired state is replayed into a throwaway database
+// through a connection pool, where a "SET search_path" does not reliably reach
+// the next statement — so unqualified DDL from schema/materialized/ would be
+// created in public, the schema-scoped diff would see an empty desired state,
+// and the plan would propose dropping the real tables.
+func TestRenderDDLQualifiesNonPublicSchema(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	_, err := conn.Exec(ctx, `
+		CREATE SCHEMA materialized;
+		CREATE TABLE materialized.parent (
+			id BIGINT PRIMARY KEY
+		);
+		CREATE TABLE materialized.rpt_thing (
+			id BIGINT PRIMARY KEY,
+			parent_id BIGINT NOT NULL REFERENCES materialized.parent (id),
+			loaded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		CREATE INDEX idx_rpt_thing_loaded_at ON materialized.rpt_thing (loaded_at DESC);
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDumper(conn)
+	table, err := d.DumpTable(ctx, "materialized", "rpt_thing")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ddl := RenderDDL(table)
+
+	if !strings.Contains(ddl, "CREATE TABLE materialized.rpt_thing") {
+		t.Errorf("expected schema-qualified CREATE TABLE, got:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, "REFERENCES materialized.parent") {
+		t.Errorf("expected schema-qualified FK target, got:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, "ON materialized.rpt_thing") {
+		t.Errorf("expected schema-qualified index target, got:\n%s", ddl)
+	}
+
+	// The real proof: replaying the DDL into a database that has the schema but
+	// not the table must recreate it *in that schema*, not in public.
+	if _, err := conn.Exec(ctx, `DROP TABLE materialized.rpt_thing`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, ddl); err != nil {
+		t.Fatalf("replaying dumped DDL failed: %v\n%s", err, ddl)
+	}
+	var landedIn string
+	err = conn.QueryRow(ctx, `
+		SELECT n.nspname FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relname = 'rpt_thing' AND c.relkind = 'r'
+	`).Scan(&landedIn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if landedIn != "materialized" {
+		t.Errorf("replayed table landed in schema %q, want \"materialized\"", landedIn)
 	}
 }

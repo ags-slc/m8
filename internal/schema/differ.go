@@ -389,10 +389,24 @@ func (d *Differ) Close() error {
 // When strict is true, all diff statements are included, including DROPs for
 // objects that exist in the DB but not in the DDL.
 func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, desiredDDL []string, strict bool) (*DiffResult, error) {
+	// Scope introspection to the schema this diff is about. Without this,
+	// pg-schema-diff reads EVERY schema in the target database and diffs the
+	// whole thing against a desired state that only ever describes one schema.
+	// Two consequences, both severe on a real database:
+	//
+	//   - Cost: introspection walks every relation in the cluster. On a database
+	//     carrying CDC-replicated schemas and TimescaleDB chunks that is tens of
+	//     thousands of relations per diff, per schema folder — enough to make
+	//     `plan` appear to hang.
+	//   - Correctness: every object outside this schema reads as "not declared".
+	//     Non-strict mode only hides that after the fact, by dropping statements
+	//     that don't target a declared object; --strict has no such filter and
+	//     would emit DROPs across unrelated schemas.
 	plan, err := diff.Generate(ctx,
 		diff.DBSchemaSource(liveDB),
 		diff.DDLSchemaSource(desiredDDL),
 		diff.WithTempDbFactory(d.tempFactory),
+		diff.WithIncludeSchemas(targetSchema),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate schema diff: %w", err)

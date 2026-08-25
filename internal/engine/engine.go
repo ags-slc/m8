@@ -51,6 +51,10 @@ type ApplyResult struct {
 	Schema      []SchemaResult
 	Logic       []MigrationResult
 	Permissions []MigrationResult
+	// PendingPGSchemas lists PostgreSQL schemas implied by schema/ subfolders
+	// that do not exist yet on the target. Populated by Plan (which never
+	// creates them); Apply creates them instead of reporting them.
+	PendingPGSchemas []string
 }
 
 // MigrationResult holds the outcome of a single ops/logic/permissions migration.
@@ -188,11 +192,15 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		}
 	}
 
-	// Phase B: Schema — ensure PG schemas exist, then diff combined DDL
+	// Phase B: Schema — report (never create) missing PG schemas, then diff.
+	// Plan is a read-only command: it must not mutate the target, so unlike
+	// Apply it only records which schemas Apply would create.
 	schemaMigrations := filterByType(all, migration.TypeSchema)
-	if err := e.ensurePGSchemas(ctx, schemaMigrations); err != nil {
+	pendingSchemas, err := e.missingPGSchemas(ctx, schemaMigrations)
+	if err != nil {
 		return nil, err
 	}
+	result.PendingPGSchemas = pendingSchemas
 	if e.differ != nil {
 		grouped := groupByPGSchema(schemaMigrations)
 		for pgSchema, migrations := range grouped {
@@ -660,6 +668,32 @@ func (e *Engine) releaseLock(ctx context.Context) {
 // ensurePGSchemas creates any PostgreSQL schemas referenced by schema/ subfolders
 // that don't already exist. This means you don't need an ops/ migration just to
 // CREATE SCHEMA — the folder structure implies it.
+// missingPGSchemas returns the PostgreSQL schemas implied by schema/ subfolders
+// that do not exist on the target, in declaration order and without duplicates.
+// It only reads the catalog — Plan uses it so that planning a greenfield schema
+// does not create it as a side effect.
+func (e *Engine) missingPGSchemas(ctx context.Context, migrations []*migration.Migration) ([]string, error) {
+	var missing []string
+	seen := make(map[string]bool)
+	for _, m := range migrations {
+		if m.PGSchema == "" || m.PGSchema == "public" || seen[m.PGSchema] {
+			continue
+		}
+		seen[m.PGSchema] = true
+		var exists bool
+		err := e.conn.QueryRow(ctx,
+			"SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", m.PGSchema,
+		).Scan(&exists)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check schema %s: %w", m.PGSchema, err)
+		}
+		if !exists {
+			missing = append(missing, m.PGSchema)
+		}
+	}
+	return missing, nil
+}
+
 func (e *Engine) ensurePGSchemas(ctx context.Context, migrations []*migration.Migration) error {
 	seen := make(map[string]bool)
 	for _, m := range migrations {
@@ -710,6 +744,11 @@ func filterByType(migrations []*migration.Migration, typ migration.Type) []*migr
 func FormatPlanOutput(result *ApplyResult) string {
 	var b strings.Builder
 	var pending int
+
+	for _, sch := range result.PendingPGSchemas {
+		fmt.Fprintf(&b, "  + CREATE SCHEMA %s (schema)\n", sch)
+		pending++
+	}
 
 	for _, v := range result.Ops {
 		if !v.Skipped {

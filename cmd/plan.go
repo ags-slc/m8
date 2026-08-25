@@ -38,6 +38,9 @@ var planCmd = &cobra.Command{
 }
 
 func hasPending(r *engine.ApplyResult) bool {
+	if len(r.PendingPGSchemas) > 0 {
+		return true
+	}
 	for _, v := range r.Ops {
 		if !v.Skipped {
 			return true

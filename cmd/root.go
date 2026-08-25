@@ -317,8 +317,27 @@ func openTargetPool(connStr string) (*sql.DB, error) {
 		cfg.RuntimeParams = map[string]string{}
 	}
 	cfg.RuntimeParams["statement_timeout"] = "0"
-	return stdlib.OpenDB(*cfg), nil
+	db := stdlib.OpenDB(*cfg)
+	// pg-schema-diff introspects the target through this pool and fans out one
+	// query per relation. database/sql defaults to an UNBOUNDED number of open
+	// connections, so on a database with thousands of relations that fan-out
+	// opens connections as fast as the introspection loop asks for them —
+	// enough, against a pooler behind a load balancer, to exhaust the resolver
+	// or the pooler's client slots and fail mid-diff. pg-schema-diff's own
+	// documentation asks for a bounded pool; give it one.
+	db.SetMaxOpenConns(targetPoolMaxConns)
+	db.SetMaxIdleConns(targetPoolMaxConns)
+	db.SetConnMaxLifetime(targetPoolConnMaxLifetime)
+	return db, nil
 }
+
+// Bounds for the introspection pool opened by openTargetPool. Small enough to
+// stay polite to a shared pooler, large enough that per-relation introspection
+// still overlaps.
+const (
+	targetPoolMaxConns        = 8
+	targetPoolConnMaxLifetime = 5 * time.Minute
+)
 
 func coalesce(values ...string) string {
 	for _, v := range values {

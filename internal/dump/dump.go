@@ -20,6 +20,11 @@ type Table struct {
 	Indexes []Index
 }
 
+// QualifiedName returns the schema-qualified table name, e.g. "materialized.rpt_invoice_detail".
+func (t *Table) QualifiedName() string {
+	return t.Schema + "." + t.Name
+}
+
 // Column represents a table column.
 type Column struct {
 	Name         string
@@ -383,7 +388,14 @@ func (d *Dumper) loadIndexes(ctx context.Context, t *Table) error {
 func RenderDDL(t *Table) string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "CREATE TABLE %s (\n", t.Name)
+	// Schema-qualify every object. The desired-state DDL is replayed into a
+	// throwaway database through a *connection pool*, so a leading
+	// "SET search_path" cannot be relied on to reach the statement that follows
+	// it. Unqualified DDL therefore lands in public no matter which
+	// schema/{pg_schema}/ folder it came from, and the diff — which reads the
+	// live side scoped to that schema — sees an empty desired state and proposes
+	// dropping every table in it.
+	fmt.Fprintf(&b, "CREATE TABLE %s (\n", t.QualifiedName())
 
 	// Columns
 	for i, col := range t.Columns {
@@ -438,10 +450,7 @@ func RenderDDL(t *Table) string {
 
 	// Foreign keys
 	for i, fk := range t.FKs {
-		refTable := fk.RefTable
-		if fk.RefSchema != t.Schema {
-			refTable = fk.RefSchema + "." + fk.RefTable
-		}
+		refTable := fk.RefSchema + "." + fk.RefTable
 		fmt.Fprintf(&b, "    CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
 			fk.Name,
 			strings.Join(fk.Columns, ", "),
@@ -461,15 +470,11 @@ func RenderDDL(t *Table) string {
 
 	b.WriteString(");\n")
 
-	// Indexes (non-constraint)
-	// Strip schema qualification from pg_get_indexdef() output so the DDL
-	// is portable across schema contexts (e.g., "ON materialized.table" → "ON table")
+	// Indexes (non-constraint). pg_get_indexdef() already emits a
+	// schema-qualified target ("ON materialized.foo"); keep it, for the same
+	// reason the CREATE TABLE above is qualified.
 	for _, idx := range t.Indexes {
-		def := idx.Definition
-		if t.Schema != "public" {
-			def = strings.ReplaceAll(def, t.Schema+".", "")
-		}
-		fmt.Fprintf(&b, "\n%s;\n", def)
+		fmt.Fprintf(&b, "\n%s;\n", idx.Definition)
 	}
 
 	return b.String()

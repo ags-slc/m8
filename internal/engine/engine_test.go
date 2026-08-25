@@ -1044,3 +1044,134 @@ func mustMkdirAll(t *testing.T, path string, perm os.FileMode) {
 		t.Fatalf("creating %s: %v", path, err)
 	}
 }
+
+// TestPlanDoesNotCreateSchemas pins that `m8 plan` is read-only. Apply creates
+// the PostgreSQL schemas implied by schema/{pg_schema}/ folders; Plan must only
+// report them, or a CI "plan" gate silently mutates production.
+func TestPlanDoesNotCreateSchemas(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	dir := setupMigrationsDir(t)
+	mustMkdirAll(t, filepath.Join(dir, "schema", "warehouse"), 0755)
+	mustWriteFile(t, filepath.Join(dir, "schema", "warehouse", "widget.sql"),
+		[]byte("CREATE TABLE warehouse.widget (id BIGINT PRIMARY KEY);"), 0644)
+
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+
+	result, err := eng.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var exists bool
+	if err := conn.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'warehouse')`,
+	).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if exists {
+		t.Error("plan created schema \"warehouse\" on the target; plan must not write")
+	}
+
+	found := false
+	for _, s := range result.PendingPGSchemas {
+		if s == "warehouse" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected \"warehouse\" in PendingPGSchemas, got %v", result.PendingPGSchemas)
+	}
+
+	// Apply, by contrast, does create it.
+	if _, err := eng.Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'warehouse')`,
+	).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Error("apply should have created schema \"warehouse\"")
+	}
+}
+
+// TestSchemaDiffIsScopedToItsSchema pins that a diff for one schema never
+// reaches into another. The desired state only ever describes the schema folder
+// being diffed, so an unscoped introspection reads every other schema in the
+// database as undeclared — harmless-looking in default mode, which filters
+// statements down to declared objects afterwards, but in --strict mode it emits
+// DROPs across schemas the migration files never mentioned.
+func TestSchemaDiffIsScopedToItsSchema(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	_, err := conn.Exec(ctx, `
+		CREATE SCHEMA declared;
+		CREATE SCHEMA untouched;
+		CREATE TABLE declared.thing (id BIGINT PRIMARY KEY);
+		CREATE TABLE untouched.bystander (id BIGINT PRIMARY KEY);
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := setupMigrationsDir(t)
+	mustMkdirAll(t, filepath.Join(dir, "schema", "declared"), 0755)
+	// Declares a new column, so the diff is non-empty and we can inspect it.
+	mustWriteFile(t, filepath.Join(dir, "schema", "declared", "thing.sql"),
+		[]byte("CREATE TABLE declared.thing (id BIGINT PRIMARY KEY, label TEXT);"), 0644)
+
+	// --strict is the sharp case: no post-filter hides out-of-scope statements.
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, true)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+
+	result, err := eng.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sawExpectedChange := false
+	for _, s := range result.Schema {
+		if s.Error != nil {
+			t.Fatalf("diff error: %v", s.Error)
+		}
+		if s.Diff == nil {
+			continue
+		}
+		for _, stmt := range s.Diff.Statements {
+			if strings.Contains(strings.ToLower(stmt.DDL), "untouched") {
+				t.Errorf("diff for schema \"declared\" reached into schema \"untouched\": %s", stmt.DDL)
+			}
+			if strings.Contains(strings.ToLower(stmt.DDL), "label") {
+				sawExpectedChange = true
+			}
+		}
+	}
+	if !sawExpectedChange {
+		t.Error("expected the diff to add the declared \"label\" column")
+	}
+
+	// The bystander must still be there.
+	var exists bool
+	if err := conn.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		               WHERE n.nspname = 'untouched' AND c.relname = 'bystander')
+	`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Error("untouched.bystander disappeared")
+	}
+}
