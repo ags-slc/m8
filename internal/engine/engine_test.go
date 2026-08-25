@@ -1096,6 +1096,21 @@ func TestPlanDoesNotCreateSchemas(t *testing.T) {
 		t.Errorf("expected \"warehouse\" in PendingPGSchemas, got %v", result.PendingPGSchemas)
 	}
 
+	// And exactly once. A schema/{pg_schema}/ folder implies its schema and the
+	// engine owns creating it, so the diff must not also carry a CREATE SCHEMA
+	// -- which would double-report it here and, if the engine's ordering ever
+	// changed, run a second CREATE against a schema that already exists (42P06).
+	for _, s := range result.Schema {
+		if s.Diff == nil {
+			continue
+		}
+		for _, stmt := range s.Diff.Statements {
+			if strings.Contains(strings.ToLower(stmt.DDL), "create schema") {
+				t.Errorf("the diff carries schema creation the engine already owns: %s", stmt.DDL)
+			}
+		}
+	}
+
 	// Apply, by contrast, does create it.
 	if _, err := eng.Apply(ctx); err != nil {
 		t.Fatal(err)

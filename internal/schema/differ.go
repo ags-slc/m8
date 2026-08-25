@@ -482,6 +482,15 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 			continue
 		}
 
+		// CREATE SCHEMA is m8's, not the diff's. A schema/{pg_schema}/ folder
+		// implies its schema, and the engine creates it (Apply) or reports it
+		// as pending (Plan) before the diff runs — so a CREATE SCHEMA here is
+		// either a duplicate of that report or, if the ordering ever changed, a
+		// second CREATE against a schema that already exists (42P06).
+		if createSchemaRe.MatchString(stmt.DDL) {
+			continue
+		}
+
 		if !strict {
 			if !statementTargetsDefinedObject(stmt.DDL, definedObjects) {
 				continue
@@ -576,10 +585,14 @@ func extractDefinedObjects(ddlStatements []string) map[string]bool {
 	return objects
 }
 
-// createStatementRe matches a statement that brings a new object into
-// existence. Anchored: only the leading keyword counts, never CREATE appearing
-// inside a body or a string literal.
-var createStatementRe = regexp.MustCompile(`(?is)^\s*CREATE\s`)
+var (
+	// createStatementRe matches a statement that brings a new object into
+	// existence. Anchored: only the leading keyword counts, never CREATE
+	// appearing inside a body or a string literal.
+	createStatementRe = regexp.MustCompile(`(?is)^\s*CREATE\s`)
+	// createSchemaRe matches the schema creation m8 does for itself.
+	createSchemaRe = regexp.MustCompile(`(?is)^\s*CREATE\s+SCHEMA\s`)
+)
 
 // statementTargetsDefinedObject returns true if the DDL statement modifies an
 // object that was defined in the S__ file. This prevents pg-schema-diff from
