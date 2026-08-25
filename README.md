@@ -184,7 +184,9 @@ m8 dump --database mydb --user postgres
 This generates:
 - `schema/{pg_schema}/*.sql` -- one CREATE TABLE per table, with indexes and constraints
 - `logic/*.sql` -- one file per function, procedure, and view (CREATE OR REPLACE)
-- `permissions/grants_{schema}.sql` -- GRANT statements per schema
+- `permissions/grants_{schema}.sql` -- per schema, in this order: `GRANT ... ON
+  SCHEMA`, the `REVOKE ... FROM PUBLIC` statements that undo PostgreSQL's
+  defaults, then relation, column, sequence, and routine grants
 
 Then run `m8 plan` to verify the dump produces a clean diff (no pending changes).
 
@@ -193,6 +195,43 @@ To limit to specific schemas:
 ```bash
 m8 dump --database mydb --user postgres --schema public --schema materialized
 ```
+
+### What the dump captures
+
+Identifiers are always quoted, so mixed case, spaces, and reserved words
+(`order`, `select`) survive the round trip. Unquoted, a foreign-key target does
+not error -- it resolves to a different table.
+
+Privileges are read from the catalog (`relacl`, `attacl`, `nspacl`, `proacl`),
+not from `information_schema`, whose views are filtered to grants the *dumping*
+role can see. The capture covers schema `USAGE`/`CREATE`, relation and
+column-level grants, sequences, routine `EXECUTE`, `WITH GRANT OPTION`, and the
+`REVOKE ... FROM PUBLIC` statements a rebuilt database would otherwise hand back
+-- a `SECURITY DEFINER` function is `EXECUTE`-able by `PUBLIC` the moment it is
+recreated, so losing the revoke is a privilege escalation, not just a gap.
+
+**Not captured:** materialized views. They have no `CREATE OR REPLACE` form, so
+they cannot be re-applied idempotently the way a `logic/` file must be. `m8 dump`
+names them and refuses rather than leaving them out silently; pass
+`--allow-unsupported` to skip them deliberately.
+
+Also not captured: **triggers, row-level security (the flag and its policies),
+and replica identity**, plus roles themselves, event triggers, and
+`ALTER DEFAULT PRIVILEGES`.
+
+> **Triggers, RLS, and replica identity, and `--strict`.** pg-schema-diff *does*
+> introspect these, so on a database bootstrapped by `m8 dump` the desired state
+> never mentions them and the raw diff proposes removing them. In default
+> (non-strict) mode m8 drops those statements: if nothing in a `schema/` folder
+> declares a trigger, no generated statement may drop one — and likewise for
+> policies, RLS, and replica identity. A folder that *does* declare triggers gets
+> the normal treatment for that class, because then a trigger the files omit
+> really is one the desired state says should not exist.
+>
+> **`--strict` has no such protection, by design** — it means "these files are the
+> whole truth". Do not run `--strict` against a database whose triggers, RLS
+> policies, or `REPLICA IDENTITY FULL` (logical replication / CDC) are not
+> declared in the migration files: it will remove them.
 
 ## Commands
 
@@ -223,6 +262,33 @@ ALTER TABLE large_table ADD COLUMN new_col TEXT;
 
 m8 also auto-detects `CREATE INDEX CONCURRENTLY` and runs those migrations outside a transaction automatically.
 
+### Timeouts on generated schema statements
+
+pg-schema-diff attaches a `lock_timeout` and a `statement_timeout` to every
+statement it generates, derived from that statement's hazards: 3 seconds for
+ordinary DDL, 20 minutes for a concurrent index build or a table drop. m8
+applies both, session-level, around each statement and resets them afterwards.
+(Session-level, not `SET LOCAL`: the plan contains `CREATE INDEX CONCURRENTLY`,
+which cannot run inside a transaction, and `SET LOCAL` outside one does
+nothing.)
+
+A `lock_timeout` means a schema statement that cannot get its `ACCESS EXCLUSIVE`
+lock **fails fast instead of queueing behind a long transaction** — which on a
+busy primary is what stops one DDL statement from blocking every reader behind
+it. If a legitimate statement needs longer than the derived value, raise it:
+
+```bash
+m8 apply --statement-timeout 5m --lock-timeout 10s
+```
+
+```yaml
+statement_timeout: 5m
+lock_timeout: 10s
+```
+
+Either override replaces the derived value for **every** generated statement,
+including the 20-minute index-build allowance, so prefer the flag for a one-off.
+
 ## Configuration
 
 ### .m8.yaml
@@ -236,6 +302,14 @@ port: 5432
 user: postgres
 sslmode: prefer
 migrations_dir: migrations
+```
+
+Safety settings for a production target (see
+[Refusing to degrade](#refusing-to-degrade-require_shadow---fail-on-unvalidated)):
+
+```yaml
+require_shadow: true
+fail_on_unvalidated: true
 ```
 
 Or use a connection URL:
@@ -260,6 +334,14 @@ m8 supports standard PostgreSQL environment variables and `.env` files:
 | `PGSSLMODE` | `--sslmode` | `sslmode` | prefer |
 | `DATABASE_URL` | `--database-url` | `database_url` | -- |
 | `SHADOW_DATABASE_URL` | `--shadow-url` | `shadow_url` | -- |
+| `M8_REQUIRE_SHADOW` | -- | `require_shadow` | false |
+| `M8_FAIL_ON_UNVALIDATED` | `--fail-on-unvalidated` | `fail_on_unvalidated` | false |
+
+A `.m8.yaml` that exists but cannot be parsed is a **fatal error**, not a
+warning: falling back to an empty config would turn every safety setting in the
+file off at exactly the moment the file is wrong. A *missing* `.m8.yaml` is
+still fine. Boolean environment overrides must parse — `M8_REQUIRE_SHADOW=ture`
+is an error rather than a silent `false`.
 
 ### Shadow Instance for Schema Diffing
 
@@ -304,6 +386,37 @@ If the shadow is **explicitly configured** but the differ can't initialize
 silently skipping schema migrations. With no shadow configured it warns and
 falls back to the target; either way the engine refuses to apply when schema
 migrations exist but cannot be diffed.
+
+### Refusing to degrade (`require_shadow`, `--fail-on-unvalidated`)
+
+Two settings turn m8's degrades into refusals. Set both in any repository whose
+target is a production primary:
+
+```yaml
+require_shadow: true        # or M8_REQUIRE_SHADOW=true
+fail_on_unvalidated: true   # implied by require_shadow
+```
+
+`require_shadow` refuses to run at all when no shadow instance is configured,
+*before* opening a session on the target, rather than falling back to
+`CREATE`/`DROP DATABASE` churn on the live cluster.
+
+`fail_on_unvalidated` (`--fail-on-unvalidated`, implied by `require_shadow`)
+covers the other degrade. pg-schema-diff validates a plan by rebuilding the
+current schema in a throwaway database and replaying the generated statements
+against it. Because m8 scopes each diff to one PostgreSQL schema, that rebuild
+cannot resolve an object whose definition reaches outside it — a view over
+another schema's tables, for instance — and m8 then produces the diff *without*
+that check, marked `PLAN_NOT_VALIDATED`.
+
+Only that one phase degrades. "The generated DDL does not execute" and "the plan
+does not converge to the desired state" always abort, in `plan` and `apply`
+alike.
+
+`PLAN_NOT_VALIDATED` is printed by both `plan` and `apply`. On its own it
+affects no exit code, so a CI gate cannot see it; `--fail-on-unvalidated` turns
+it into a non-zero exit from `plan` and a refusal to run the statements in
+`apply`.
 
 **Cleanup.** At startup (for `plan`/`apply`/`sync` only) m8 drops any *invalid*
 orphaned `pgschemadiff_tmp_*` databases (the residue of an interrupted drop) on

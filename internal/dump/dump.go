@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/ags-slc/m8/internal/pgident"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -20,6 +21,12 @@ type Table struct {
 	Indexes []Index
 }
 
+// QualifiedName returns the schema-qualified, quoted table name, e.g.
+// `"materialized"."rpt_invoice_detail"`.
+func (t *Table) QualifiedName() string {
+	return pgident.Qualify(t.Schema, t.Name)
+}
+
 // Column represents a table column.
 type Column struct {
 	Name         string
@@ -28,6 +35,12 @@ type Column struct {
 	Default      *string
 	IsIdentity   bool
 	IdentityKind string // "ALWAYS" or "BY DEFAULT"
+	// Generated holds the expression of a GENERATED ALWAYS AS (...) STORED
+	// column. Postgres stores that expression in pg_attrdef alongside ordinary
+	// defaults, but it is not a default: it references sibling columns, which a
+	// DEFAULT may not do. Emitting one as a DEFAULT produces DDL Postgres
+	// rejects with 0A000.
+	Generated *string
 }
 
 // PrimaryKey represents a primary key constraint.
@@ -70,6 +83,12 @@ type Index struct {
 // Dumper generates CREATE TABLE DDL from a live database.
 type Dumper struct {
 	conn *pgx.Conn
+	// AllowUnsupported downgrades a refusal to dump objects m8 cannot represent
+	// -- materialized views -- into a silent skip. Off by default: a baseline
+	// that quietly omits objects is worse than one that will not be produced,
+	// because nothing downstream can tell the difference between "this database
+	// has no materialized views" and "m8 did not look".
+	AllowUnsupported bool
 }
 
 // NewDumper creates a new Dumper.
@@ -102,6 +121,13 @@ func (d *Dumper) ListSchemas(ctx context.Context) ([]string, error) {
 }
 
 // ListTables returns all regular tables in a schema (excludes partitions, foreign tables, temp tables).
+//
+// Extension-owned tables are excluded, as ListFunctions and ListViews already
+// exclude extension-owned routines and views. They are recreated by CREATE
+// EXTENSION, not by a migration file -- and pg-schema-diff excludes them from
+// its own introspection, so a schema/ file describing one is a table the differ
+// cannot see on the live side. It reads as "must create" on every run and the
+// generated CREATE TABLE fails on apply with 42P07 (relation already exists).
 func (d *Dumper) ListTables(ctx context.Context, schema string) ([]string, error) {
 	rows, err := d.conn.Query(ctx, `
 		SELECT c.relname
@@ -110,6 +136,12 @@ func (d *Dumper) ListTables(ctx context.Context, schema string) ([]string, error
 		WHERE n.nspname = $1
 		  AND c.relkind IN ('r', 'p')  -- regular tables and partitioned tables
 		  AND NOT c.relispartition      -- exclude child partitions
+		  AND NOT EXISTS (
+			  SELECT 1 FROM pg_depend d
+			  WHERE d.objid = c.oid
+			    AND d.classid = 'pg_class'::regclass
+			    AND d.deptype = 'e'     -- installed by an extension
+		  )
 		ORDER BY c.relname
 	`, schema)
 	if err != nil {
@@ -161,7 +193,8 @@ func (d *Dumper) loadColumns(ctx context.Context, t *Table) error {
 			pg_catalog.format_type(a.atttypid, a.atttypmod),
 			NOT a.attnotnull,
 			pg_get_expr(ad.adbin, ad.adrelid),
-			a.attidentity::text
+			a.attidentity::text,
+			a.attgenerated::text
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -181,8 +214,16 @@ func (d *Dumper) loadColumns(ctx context.Context, t *Table) error {
 		var col Column
 		var defaultVal *string
 		var identity string
-		if err := rows.Scan(&col.Name, &col.DataType, &col.Nullable, &defaultVal, &identity); err != nil {
+		var generated string
+		if err := rows.Scan(&col.Name, &col.DataType, &col.Nullable, &defaultVal, &identity, &generated); err != nil {
 			return err
+		}
+		// A generated column's expression lives in pg_attrdef too. Route it to
+		// Generated so RenderDDL emits GENERATED ALWAYS AS (...) STORED rather
+		// than a DEFAULT that references sibling columns.
+		if generated == "s" {
+			col.Generated = defaultVal
+			defaultVal = nil
 		}
 		col.Default = defaultVal
 		switch identity {
@@ -383,13 +424,41 @@ func (d *Dumper) loadIndexes(ctx context.Context, t *Table) error {
 func RenderDDL(t *Table) string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "CREATE TABLE %s (\n", t.Name)
+	// Schema-qualify every object. The desired-state DDL is replayed into a
+	// throwaway database through a *connection pool*, so a leading
+	// "SET search_path" cannot be relied on to reach the statement that follows
+	// it. Unqualified DDL therefore lands in public no matter which
+	// schema/{pg_schema}/ folder it came from, and the diff — which reads the
+	// live side scoped to that schema — sees an empty desired state and proposes
+	// dropping every table in it.
+	fmt.Fprintf(&b, "CREATE TABLE %s (\n", t.QualifiedName())
 
 	// Columns
 	for i, col := range t.Columns {
-		fmt.Fprintf(&b, "    %s %s", col.Name, col.DataType)
+		fmt.Fprintf(&b, "    %s %s", pgident.Quote(col.Name), col.DataType)
 		if col.IsIdentity {
 			fmt.Fprintf(&b, " GENERATED %s AS IDENTITY", col.IdentityKind)
+		}
+		if col.Generated != nil {
+			// Rendered before NOT NULL, which is the order Postgres accepts,
+			// and byte-for-byte as pg_get_expr wrote it.
+			//
+			// The expression used to be folded onto one line with
+			// strings.Fields/Join. That collapses whitespace INSIDE string
+			// literals too, so
+			//
+			//	(a || '
+			//	  two spaces  here'::text)
+			//
+			// dumped as (a || ' two spaces here'::text) and the replayed column
+			// computed different values -- the baseline in git stopped
+			// describing the database. Re-indenting a pretty-printed expression
+			// has the same defect: a literal containing a newline gets indented
+			// along with the SQL. There is no cosmetic transformation of an
+			// arbitrary SQL expression that is safe without parsing it, and
+			// readability is not worth a wrong expression. The sibling DEFAULT
+			// path a few lines down has always emitted verbatim.
+			fmt.Fprintf(&b, " GENERATED ALWAYS AS (%s) STORED", *col.Generated)
 		}
 		if !col.Nullable {
 			b.WriteString(" NOT NULL")
@@ -409,7 +478,8 @@ func RenderDDL(t *Table) string {
 	// Primary key
 	if t.PK != nil {
 		remaining := len(t.Uniques) + len(t.Checks) + len(t.FKs)
-		fmt.Fprintf(&b, "    CONSTRAINT %s PRIMARY KEY (%s)", t.PK.Name, strings.Join(t.PK.Columns, ", "))
+		fmt.Fprintf(&b, "    CONSTRAINT %s PRIMARY KEY (%s)",
+			pgident.Quote(t.PK.Name), strings.Join(pgident.QuoteAll(t.PK.Columns), ", "))
 		if remaining > 0 {
 			b.WriteString(",")
 		}
@@ -419,7 +489,8 @@ func RenderDDL(t *Table) string {
 	// Unique constraints
 	for i, u := range t.Uniques {
 		remaining := len(t.Checks) + len(t.FKs)
-		fmt.Fprintf(&b, "    CONSTRAINT %s UNIQUE (%s)", u.Name, strings.Join(u.Columns, ", "))
+		fmt.Fprintf(&b, "    CONSTRAINT %s UNIQUE (%s)",
+			pgident.Quote(u.Name), strings.Join(pgident.QuoteAll(u.Columns), ", "))
 		if i < len(t.Uniques)-1 || remaining > 0 {
 			b.WriteString(",")
 		}
@@ -429,7 +500,9 @@ func RenderDDL(t *Table) string {
 	// Check constraints
 	for i, ck := range t.Checks {
 		remaining := len(t.FKs)
-		fmt.Fprintf(&b, "    CONSTRAINT %s %s", ck.Name, ck.Expression)
+		// The expression comes from pg_get_constraintdef, which already quotes
+		// what needs quoting; only the constraint name is ours to render.
+		fmt.Fprintf(&b, "    CONSTRAINT %s %s", pgident.Quote(ck.Name), ck.Expression)
 		if i < len(t.Checks)-1 || remaining > 0 {
 			b.WriteString(",")
 		}
@@ -438,15 +511,14 @@ func RenderDDL(t *Table) string {
 
 	// Foreign keys
 	for i, fk := range t.FKs {
-		refTable := fk.RefTable
-		if fk.RefSchema != t.Schema {
-			refTable = fk.RefSchema + "." + fk.RefTable
-		}
+		// The FK target is the sharpest case for quoting: an unquoted,
+		// wrongly-cased reference does not error, it resolves to a DIFFERENT
+		// table -- the constraint is created, against the wrong object.
 		fmt.Fprintf(&b, "    CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
-			fk.Name,
-			strings.Join(fk.Columns, ", "),
-			refTable,
-			strings.Join(fk.RefColumns, ", "))
+			pgident.Quote(fk.Name),
+			strings.Join(pgident.QuoteAll(fk.Columns), ", "),
+			pgident.Qualify(fk.RefSchema, fk.RefTable),
+			strings.Join(pgident.QuoteAll(fk.RefColumns), ", "))
 		if fk.OnDelete != "NO ACTION" {
 			fmt.Fprintf(&b, " ON DELETE %s", fk.OnDelete)
 		}
@@ -461,15 +533,11 @@ func RenderDDL(t *Table) string {
 
 	b.WriteString(");\n")
 
-	// Indexes (non-constraint)
-	// Strip schema qualification from pg_get_indexdef() output so the DDL
-	// is portable across schema contexts (e.g., "ON materialized.table" → "ON table")
+	// Indexes (non-constraint). pg_get_indexdef() already emits a
+	// schema-qualified target ("ON materialized.foo"); keep it, for the same
+	// reason the CREATE TABLE above is qualified.
 	for _, idx := range t.Indexes {
-		def := idx.Definition
-		if t.Schema != "public" {
-			def = strings.ReplaceAll(def, t.Schema+".", "")
-		}
-		fmt.Fprintf(&b, "\n%s;\n", def)
+		fmt.Fprintf(&b, "\n%s;\n", idx.Definition)
 	}
 
 	return b.String()

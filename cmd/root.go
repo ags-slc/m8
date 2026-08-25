@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,6 +34,13 @@ var (
 	flagShadowURL     string
 	flagStrict        bool
 	flagJSON          bool
+	// flagFailOnUnvalidated turns an unvalidated plan into a refusal rather
+	// than a warning, so a CI gate can be built on the exit code.
+	flagFailOnUnvalidated bool
+	// Overrides for the per-statement timeouts pg-schema-diff derives from each
+	// generated statement's hazards. Zero keeps the derived value.
+	flagLockTimeout      time.Duration
+	flagStatementTimeout time.Duration
 )
 
 var rootCmd = &cobra.Command{
@@ -59,6 +67,12 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&flagMigrationsDir, "migrations-dir", "migrations", "Path to migrations directory")
 	rootCmd.PersistentFlags().BoolVar(&flagStrict, "strict", false, "Include DROP statements for DB objects not declared in migration files")
 	rootCmd.PersistentFlags().BoolVar(&flagJSON, "json", false, "Output in JSON format")
+	rootCmd.PersistentFlags().BoolVar(&flagFailOnUnvalidated, "fail-on-unvalidated", false,
+		"Refuse to plan or apply a schema diff whose plan could not be validated (env: M8_FAIL_ON_UNVALIDATED; implied by require_shadow)")
+	rootCmd.PersistentFlags().DurationVar(&flagLockTimeout, "lock-timeout", 0,
+		"Override the lock_timeout applied to every generated schema statement (default: pg-schema-diff's hazard-derived value, 3s for ordinary DDL)")
+	rootCmd.PersistentFlags().DurationVar(&flagStatementTimeout, "statement-timeout", 0,
+		"Override the statement_timeout applied to every generated schema statement (default: pg-schema-diff's hazard-derived value, 3s for ordinary DDL / 20m for a concurrent index build)")
 }
 
 func loadEnv() {
@@ -89,21 +103,123 @@ func Execute() {
 	}
 }
 
-// loadConfig loads .m8.yaml from the current directory (if it exists).
-func loadConfig() *config.Config {
+// loadConfig reads .m8.yaml from the current directory.
+//
+// A parse failure is FATAL. It used to log slog.Warn and hand back an empty
+// config, so a YAML typo silently turned require_shadow -- the one setting whose
+// entire job is to refuse a degrade -- back off, and the run carried on against
+// the target as if the file had never existed. A missing file is still fine; a
+// file that exists and cannot be read or parsed is not.
+func loadConfig() (*config.Config, error) {
 	cfg, err := config.Load(".m8.yaml")
 	if err != nil {
-		slog.Warn("failed to load .m8.yaml", "error", err)
-		return &config.Config{}
+		return nil, fmt.Errorf("reading .m8.yaml: %w", err)
 	}
-	return cfg
+	return cfg, nil
+}
+
+// settings is the effective configuration for one command invocation: flags,
+// environment, and .m8.yaml collapsed in that priority order.
+//
+// It is resolved once per command. The previous shape re-read .m8.yaml from
+// four separate resolvers, which meant the same run could read the file four
+// times and, on a parse error, disagree with itself about what it said.
+type settings struct {
+	ConnStr           string
+	ShadowConnStr     string
+	MigrationsDir     string
+	Strict            bool
+	RequireShadow     bool
+	FailOnUnvalidated bool
+	LockTimeout       time.Duration
+	StatementTimeout  time.Duration
+}
+
+func resolveSettings() (*settings, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	// M8_REQUIRE_SHADOW lets CI enforce the refusal independently of the file,
+	// which matters precisely because the file is the thing an editing mistake
+	// can disarm.
+	requireShadow, err := envBool("M8_REQUIRE_SHADOW", cfg.RequireShadow)
+	if err != nil {
+		return nil, err
+	}
+	failOnUnvalidated, err := envBool("M8_FAIL_ON_UNVALIDATED", cfg.FailOnUnvalidated)
+	if err != nil {
+		return nil, err
+	}
+
+	lockTimeout, err := resolveDuration("lock_timeout", flagLockTimeout, cfg.LockTimeout)
+	if err != nil {
+		return nil, err
+	}
+	statementTimeout, err := resolveDuration("statement_timeout", flagStatementTimeout, cfg.StatementTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	return &settings{
+		ConnStr:       resolveConnStr(cfg),
+		ShadowConnStr: resolveShadowConnStr(cfg),
+		MigrationsDir: resolveMigrationsDir(cfg),
+		Strict:        flagStrict || cfg.Strict,
+		RequireShadow: requireShadow,
+		// An unvalidated plan is the same degrade require_shadow exists to
+		// forbid, one layer in: the statements were never proved to execute.
+		// A repository that refuses to plan without a shadow instance cannot
+		// coherently accept applying a plan the shadow never checked.
+		FailOnUnvalidated: flagFailOnUnvalidated || failOnUnvalidated || requireShadow,
+		LockTimeout:       lockTimeout,
+		StatementTimeout:  statementTimeout,
+	}, nil
+}
+
+// resolveDuration takes the flag when set, otherwise the config value. A config
+// value that does not parse is an error rather than a silent zero -- zero here
+// means "keep pg-schema-diff's derived timeout", which is not what someone who
+// wrote lock_timeout into the file was asking for.
+func resolveDuration(key string, flag time.Duration, configured string) (time.Duration, error) {
+	if flag < 0 {
+		return 0, fmt.Errorf("--%s must not be negative, got %s", strings.ReplaceAll(key, "_", "-"), flag)
+	}
+	if flag > 0 {
+		return flag, nil
+	}
+	if configured == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(configured)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not a duration", key, configured)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("%s: %q is negative", key, configured)
+	}
+	return d, nil
+}
+
+// envBool reads a boolean override from the environment. Unset or empty leaves
+// the file's value alone; anything else must parse, so "M8_REQUIRE_SHADOW=ture"
+// in a CI job is an error rather than a silent false.
+func envBool(name string, fallback bool) (bool, error) {
+	raw, ok := os.LookupEnv(name)
+	if !ok || raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s=%q is not a boolean", name, raw)
+	}
+	return v, nil
 }
 
 // resolveConnStr builds a PostgreSQL connection string.
 // Priority: flag > env > .m8.yaml > default
-func resolveConnStr() string {
-	cfg := loadConfig()
-
+func resolveConnStr(cfg *config.Config) string {
 	// --database-url or DATABASE_URL or config takes highest priority
 	if flagDatabaseURL != "" {
 		return flagDatabaseURL
@@ -160,22 +276,18 @@ const teardownTimeout = 30 * time.Second
 // hosts schema-diff temp databases. Priority: flag > SHADOW_DATABASE_URL env >
 // .m8.yaml shadow_url. Returns "" when none is configured (temp DBs then land
 // on the target instance).
-func resolveShadowConnStr() string {
+func resolveShadowConnStr(cfg *config.Config) string {
 	if flagShadowURL != "" {
 		return flagShadowURL
 	}
 	if url := os.Getenv("SHADOW_DATABASE_URL"); url != "" {
 		return url
 	}
-	if cfg := loadConfig(); cfg.ShadowURL != "" {
-		return cfg.ShadowURL
-	}
-	return ""
+	return cfg.ShadowURL
 }
 
 // resolveMigrationsDir returns the migrations directory from flag or config.
-func resolveMigrationsDir() string {
-	cfg := loadConfig()
+func resolveMigrationsDir(cfg *config.Config) string {
 	if flagMigrationsDir != "migrations" {
 		return flagMigrationsDir // explicit flag overrides
 	}
@@ -185,22 +297,30 @@ func resolveMigrationsDir() string {
 	return flagMigrationsDir
 }
 
-// resolveStrict returns the strict setting from flag or config.
-func resolveStrict() bool {
-	if flagStrict {
-		return true
-	}
-	cfg := loadConfig()
-	return cfg.Strict
-}
-
 // connectAndBuildEngine creates a pgx connection, sql.DB, and engine. When
 // needDiffer is true it also constructs the schema differ — which connects to
 // the shadow instance and sweeps orphaned temp databases. Commands that never
 // diff (status, baseline) pass false so they don't open a shadow connection or
 // perform DROP DATABASE side effects.
 func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *engine.Engine, func(), error) {
-	connStr := resolveConnStr()
+	st, err := resolveSettings()
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	connStr := st.ConnStr
+
+	// Checked before connecting: a missing shadow is a configuration error, and
+	// there is no reason to open a session on the target -- possibly a
+	// production primary -- only to refuse a moment later.
+	if needDiffer && st.ShadowConnStr == "" && st.RequireShadow {
+		// A warning is not enough when the target is a production primary:
+		// falling back means CREATE DATABASE / DROP DATABASE churn on it.
+		// Repositories that can never accept that set require_shadow in
+		// .m8.yaml, and this turns the degrade into a refusal.
+		return nil, nil, nil, fmt.Errorf(
+			"require_shadow is set in .m8.yaml but no shadow instance is configured: " +
+				"set --shadow-url or SHADOW_DATABASE_URL to an isolated non-production instance")
+	}
 
 	conn, err := pgx.Connect(ctx, connStr)
 	if err != nil {
@@ -216,7 +336,7 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 
 	var differ *schema.Differ
 	if needDiffer {
-		shadowConnStr := resolveShadowConnStr()
+		shadowConnStr := st.ShadowConnStr
 		if shadowConnStr == "" {
 			slog.Warn("no shadow instance configured: schema-diff temp databases will be created on the TARGET instance " +
 				"(set --shadow-url / SHADOW_DATABASE_URL to an isolated non-production instance to avoid CREATE/DROP DATABASE churn on the target)")
@@ -260,9 +380,12 @@ func connectAndBuildEngine(ctx context.Context, needDiffer bool) (*pgx.Conn, *en
 
 	logger := slog.Default()
 	eng := engine.New(conn, sqlDB, differ, &engine.Config{
-		MigrationsDir: resolveMigrationsDir(),
-		ConnStr:       connStr,
-		Strict:        resolveStrict(),
+		MigrationsDir:     st.MigrationsDir,
+		ConnStr:           connStr,
+		Strict:            st.Strict,
+		FailOnUnvalidated: st.FailOnUnvalidated,
+		LockTimeout:       st.LockTimeout,
+		StatementTimeout:  st.StatementTimeout,
 	}, logger)
 
 	cleanup := func() {
@@ -317,8 +440,27 @@ func openTargetPool(connStr string) (*sql.DB, error) {
 		cfg.RuntimeParams = map[string]string{}
 	}
 	cfg.RuntimeParams["statement_timeout"] = "0"
-	return stdlib.OpenDB(*cfg), nil
+	db := stdlib.OpenDB(*cfg)
+	// pg-schema-diff introspects the target through this pool and fans out one
+	// query per relation. database/sql defaults to an UNBOUNDED number of open
+	// connections, so on a database with thousands of relations that fan-out
+	// opens connections as fast as the introspection loop asks for them —
+	// enough, against a pooler behind a load balancer, to exhaust the resolver
+	// or the pooler's client slots and fail mid-diff. pg-schema-diff's own
+	// documentation asks for a bounded pool; give it one.
+	db.SetMaxOpenConns(targetPoolMaxConns)
+	db.SetMaxIdleConns(targetPoolMaxConns)
+	db.SetConnMaxLifetime(targetPoolConnMaxLifetime)
+	return db, nil
 }
+
+// Bounds for the introspection pool opened by openTargetPool. Small enough to
+// stay polite to a shared pooler, large enough that per-relation introspection
+// still overlaps.
+const (
+	targetPoolMaxConns        = 8
+	targetPoolConnMaxLifetime = 5 * time.Minute
+)
 
 func coalesce(values ...string) string {
 	for _, v := range values {

@@ -12,8 +12,9 @@ import (
 )
 
 var (
-	dumpSchemas []string
-	dumpStdout  bool
+	dumpSchemas          []string
+	dumpStdout           bool
+	dumpAllowUnsupported bool
 )
 
 var dumpCmd = &cobra.Command{
@@ -32,15 +33,19 @@ Examples:
   m8 dump --database mydb --user postgres --stdout`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
-		connStr := resolveConnStr()
+		st, err := resolveSettings()
+		if err != nil {
+			return err
+		}
 
-		conn, err := pgx.Connect(ctx, connStr)
+		conn, err := pgx.Connect(ctx, st.ConnStr)
 		if err != nil {
 			return fmt.Errorf("failed to connect: %w", err)
 		}
 		defer func() { _ = conn.Close(ctx) }()
 
 		d := dump.NewDumper(conn)
+		d.AllowUnsupported = dumpAllowUnsupported
 
 		schemas := dumpSchemas
 		if len(schemas) == 0 {
@@ -52,6 +57,15 @@ Examples:
 		}
 
 		var totalTables, totalLogic, totalPerms int
+
+		// Logic objects are collected across every schema and named in one
+		// pass at the end: overloaded functions share a name, so filenames can
+		// only be made collision-free once the whole set is known.
+		type logicEntry struct {
+			object   dump.LogicObject
+			rendered string
+		}
+		var logicEntries []logicEntry
 
 		for _, schema := range schemas {
 			// --- Tables → schema/{pg_schema}/*.sql ---
@@ -71,7 +85,7 @@ Examples:
 				if dumpStdout {
 					fmt.Printf("-- schema/%s/%s.sql\n%s\n", schema, tableName, ddl)
 				} else {
-					if err := writeFile(filepath.Join(flagMigrationsDir, "schema", schema), tableName+".sql", ddl); err != nil {
+					if err := writeFile(filepath.Join(st.MigrationsDir, "schema", schema), tableName+".sql", ddl); err != nil {
 						return err
 					}
 				}
@@ -85,21 +99,10 @@ Examples:
 			}
 
 			for _, f := range funcs {
-				rendered := dump.RenderFunction(&f)
-				filename := f.Name + ".sql"
-				// Prefix with schema if not public to avoid collisions
-				if schema != "public" {
-					filename = schema + "_" + f.Name + ".sql"
-				}
-
-				if dumpStdout {
-					fmt.Printf("-- logic/%s\n%s\n", filename, rendered)
-				} else {
-					if err := writeFile(filepath.Join(flagMigrationsDir, "logic"), filename, rendered); err != nil {
-						return err
-					}
-				}
-				totalLogic++
+				logicEntries = append(logicEntries, logicEntry{
+					object:   dump.LogicObject{Schema: schema, Name: f.Name, Identity: f.Identity},
+					rendered: dump.RenderFunction(&f),
+				})
 			}
 
 			// --- Views → logic/*.sql ---
@@ -109,46 +112,84 @@ Examples:
 			}
 
 			for _, v := range views {
-				rendered := dump.RenderView(&v)
-				filename := v.Name + ".sql"
-				if schema != "public" {
-					filename = schema + "_" + v.Name + ".sql"
-				}
-
-				if dumpStdout {
-					fmt.Printf("-- logic/%s\n%s\n", filename, rendered)
-				} else {
-					if err := writeFile(filepath.Join(flagMigrationsDir, "logic"), filename, rendered); err != nil {
-						return err
-					}
-				}
-				totalLogic++
+				logicEntries = append(logicEntries, logicEntry{
+					object:   dump.LogicObject{Schema: schema, Name: v.Name},
+					rendered: dump.RenderView(&v),
+				})
 			}
 
 			// --- Grants → permissions/grants_{schema}.sql ---
+			//
+			// Order matters: USAGE on the schema, then the revokes that undo
+			// PostgreSQL's PUBLIC defaults, then the grants. Without the schema
+			// grant every relation grant below it is inert on a rebuild.
+			schemaGrants, err := d.ListSchemaGrants(ctx, schema)
+			if err != nil {
+				return fmt.Errorf("failed to list schema grants for %s: %w", schema, err)
+			}
 			grants, err := d.ListGrants(ctx, schema)
 			if err != nil {
 				return fmt.Errorf("failed to list grants in %s: %w", schema, err)
 			}
-			publicGrants, err := d.ListPublicGrants(ctx, schema)
+			columnGrants, err := d.ListColumnGrants(ctx, schema)
 			if err != nil {
-				return fmt.Errorf("failed to list public grants in %s: %w", schema, err)
+				return fmt.Errorf("failed to list column grants in %s: %w", schema, err)
+			}
+			routineGrants, err := d.ListRoutineGrants(ctx, schema)
+			if err != nil {
+				return fmt.Errorf("failed to list routine grants in %s: %w", schema, err)
+			}
+			revokes, err := d.ListPublicRevokes(ctx, schema)
+			if err != nil {
+				return fmt.Errorf("failed to list public revokes in %s: %w", schema, err)
 			}
 
-			allGrants := append(grants, publicGrants...)
-			if len(allGrants) > 0 {
-				rendered := dump.RenderGrants(allGrants, schema)
+			allGrants := append(grants, columnGrants...)
+			if len(allGrants) > 0 || len(routineGrants) > 0 || len(schemaGrants) > 0 || len(revokes) > 0 {
+				var sections []string
+				if r := dump.RenderSchemaGrants(schemaGrants); r != "" {
+					sections = append(sections, r)
+				}
+				if r := dump.RenderPublicRevokes(revokes); r != "" {
+					sections = append(sections, r)
+				}
+				if len(allGrants) > 0 {
+					sections = append(sections, dump.RenderGrants(allGrants, schema))
+				} else {
+					sections = append(sections, fmt.Sprintf("-- Grants for schema %s\n", schema))
+				}
+				if r := dump.RenderRoutineGrants(routineGrants); r != "" {
+					sections = append(sections, r)
+				}
+				rendered := strings.Join(sections, "\n")
 				filename := "grants_" + schema + ".sql"
 
 				if dumpStdout {
 					fmt.Printf("-- permissions/%s\n%s\n", filename, rendered)
 				} else {
-					if err := writeFile(filepath.Join(flagMigrationsDir, "permissions"), filename, rendered); err != nil {
+					if err := writeFile(filepath.Join(st.MigrationsDir, "permissions"), filename, rendered); err != nil {
 						return err
 					}
 				}
 				totalPerms++
 			}
+		}
+
+		objects := make([]dump.LogicObject, 0, len(logicEntries))
+		for _, e := range logicEntries {
+			objects = append(objects, e.object)
+		}
+		logicNames := dump.ResolveLogicFileNames(objects)
+		for _, e := range logicEntries {
+			filename := logicNames[e.object]
+			if dumpStdout {
+				fmt.Printf("-- logic/%s\n%s\n", filename, e.rendered)
+			} else {
+				if err := writeFile(filepath.Join(st.MigrationsDir, "logic"), filename, e.rendered); err != nil {
+					return err
+				}
+			}
+			totalLogic++
 		}
 
 		if !dumpStdout {
@@ -184,5 +225,7 @@ func writeFile(dir, filename, content string) error {
 func init() {
 	dumpCmd.Flags().StringSliceVar(&dumpSchemas, "schema", nil, "Schemas to dump (default: all user schemas)")
 	dumpCmd.Flags().BoolVar(&dumpStdout, "stdout", false, "Print DDL to stdout instead of writing files")
+	dumpCmd.Flags().BoolVar(&dumpAllowUnsupported, "allow-unsupported", false,
+		"Leave objects m8 cannot represent (materialized views) out of the dump instead of refusing")
 	rootCmd.AddCommand(dumpCmd)
 }

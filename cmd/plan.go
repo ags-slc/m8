@@ -3,6 +3,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/ags-slc/m8/internal/engine"
 	"github.com/spf13/cobra"
@@ -29,6 +30,33 @@ var planCmd = &cobra.Command{
 		output := engine.FormatPlanOutput(result)
 		fmt.Print(output)
 
+		// PLAN_NOT_VALIDATED on stdout is not something a pipeline can gate on:
+		// it affects no exit code. --fail-on-unvalidated (implied by
+		// require_shadow) turns it into one, and it must be checked before the
+		// os.Exit(2) below -- exit 2 means "there are changes to apply", which
+		// CI gates read as success.
+		if eng.FailsOnUnvalidatedPlan() {
+			if names := engine.UnvalidatedSchemas(result); len(names) > 0 {
+				return fmt.Errorf(
+					"plan for %s proposes statements and was not validated; refusing to "+
+						"report it as a plan (--fail-on-unvalidated / require_shadow is set). "+
+						"Validation rebuilds the current schema in a throwaway database; it fails "+
+						"when an object in this schema is defined in terms of another schema. "+
+						"Dry-run the statements against the shadow by hand, or pass "+
+						"--fail-on-unvalidated=false once you have",
+					strings.Join(names, ", "))
+			}
+		}
+
+		// A schema whose diff could not be computed is NOT "pending". Exit 2
+		// means "there are changes to apply", and CI gates are built to treat
+		// it as success — so reporting an undiffable migration that way lets a
+		// broken change read as an ordinary pending one on a pull request and
+		// fail later, during apply, after merge. Fail hard instead.
+		if names := undiffable(result); len(names) > 0 {
+			return fmt.Errorf("could not compute a plan for: %s", strings.Join(names, ", "))
+		}
+
 		// Exit code 2 if there are pending migrations (useful for CI gates)
 		if hasPending(result) {
 			os.Exit(2)
@@ -37,7 +65,21 @@ var planCmd = &cobra.Command{
 	},
 }
 
+// undiffable returns the migrations whose schema diff failed to generate.
+func undiffable(r *engine.ApplyResult) []string {
+	var names []string
+	for _, s := range r.Schema {
+		if s.Error != nil {
+			names = append(names, s.Migration.Filename)
+		}
+	}
+	return names
+}
+
 func hasPending(r *engine.ApplyResult) bool {
+	if len(r.PendingPGSchemas) > 0 {
+		return true
+	}
 	for _, v := range r.Ops {
 		if !v.Skipped {
 			return true

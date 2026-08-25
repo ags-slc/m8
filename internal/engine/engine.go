@@ -11,6 +11,7 @@ import (
 
 	"github.com/ags-slc/m8/internal/migration"
 	"github.com/ags-slc/m8/internal/parser"
+	"github.com/ags-slc/m8/internal/pgident"
 	"github.com/ags-slc/m8/internal/schema"
 	"github.com/ags-slc/m8/internal/state"
 	"github.com/jackc/pgx/v5"
@@ -18,6 +19,12 @@ import (
 
 // Advisory lock ID: first 8 bytes of SHA-256("m8_migration_lock")
 const lockID int64 = 5739048866534836184
+
+// resetTimeout bounds the RESET that clears a schema statement's timeouts. It
+// runs in a defer on a context detached from the caller's, so without a deadline
+// of its own an unresponsive server would hang the command after the statement
+// has already finished.
+const resetTimeout = 10 * time.Second
 
 // errDifferUnavailable is returned when schema (S__) migrations exist but the
 // schema differ could not be constructed. We refuse to silently skip schema
@@ -43,6 +50,19 @@ type Config struct {
 	MigrationsDir string
 	ConnStr       string
 	Strict        bool // When true, schema diffs include DROPs for undeclared objects.
+	// FailOnUnvalidated refuses a schema diff whose plan could not be validated
+	// against a throwaway rebuild, instead of applying it with a warning. A CI
+	// gate can be built on the resulting exit code; a warning printed to stdout
+	// is not something a pipeline can fail on.
+	FailOnUnvalidated bool
+	// LockTimeout and StatementTimeout override the hazard-derived timeouts
+	// pg-schema-diff attaches to each generated statement. Zero keeps the
+	// plan's own value, which is what you want by default: 3s for ordinary DDL,
+	// 20 minutes for a concurrent index build. The override exists because a
+	// legitimate ALTER TABLE on a large table can exceed 3s -- and until these
+	// timeouts were actually applied, it silently did.
+	LockTimeout      time.Duration
+	StatementTimeout time.Duration
 }
 
 // ApplyResult holds the outcome of an apply or plan operation.
@@ -51,6 +71,10 @@ type ApplyResult struct {
 	Schema      []SchemaResult
 	Logic       []MigrationResult
 	Permissions []MigrationResult
+	// PendingPGSchemas lists PostgreSQL schemas implied by schema/ subfolders
+	// that do not exist yet on the target. Populated by Plan (which never
+	// creates them); Apply creates them instead of reporting them.
+	PendingPGSchemas []string
 }
 
 // MigrationResult holds the outcome of a single ops/logic/permissions migration.
@@ -158,7 +182,11 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 	}
 	defer e.releaseLock(ctx)
 
-	if err := e.store.EnsureSchema(ctx); err != nil {
+	// Deliberately NOT EnsureSchema: plan is read-only, so on a database m8 has
+	// never touched it reports everything as pending rather than bootstrapping
+	// its own state as a side effect of being asked what it would do.
+	stateReady, err := e.store.SchemaExists(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -170,9 +198,12 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 	result := &ApplyResult{}
 
 	// Phase A: Ops — find unapplied
-	applied, err := e.store.GetAppliedOps(ctx)
-	if err != nil {
-		return nil, err
+	var applied []state.HistoryRow
+	if stateReady {
+		applied, err = e.store.GetAppliedOps(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 	appliedSet := make(map[string]bool)
 	for _, h := range applied {
@@ -188,26 +219,40 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		}
 	}
 
-	// Phase B: Schema — ensure PG schemas exist, then diff combined DDL
+	// Phase B: Schema — report (never create) missing PG schemas, then diff.
+	// Plan is a read-only command: it must not mutate the target, so unlike
+	// Apply it only records which schemas Apply would create.
 	schemaMigrations := filterByType(all, migration.TypeSchema)
-	if err := e.ensurePGSchemas(ctx, schemaMigrations); err != nil {
+	pendingSchemas, err := e.missingPGSchemas(ctx, schemaMigrations)
+	if err != nil {
 		return nil, err
 	}
+	result.PendingPGSchemas = pendingSchemas
 	if e.differ != nil {
 		grouped := groupByPGSchema(schemaMigrations)
 		for pgSchema, migrations := range grouped {
 			var combinedDDL []string
 			// Ensure the PG schema exists in the temp DB for DDL parsing
 			if pgSchema != "public" {
-				combinedDDL = append(combinedDDL, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", pgSchema))
+				combinedDDL = append(combinedDDL, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", pgident.Quote(pgSchema)))
 			}
 			for _, m := range migrations {
 				combinedDDL = append(combinedDDL, string(m.Content))
 			}
 			diffResult, err := e.differ.Diff(ctx, e.sqlDB, pgSchema, combinedDDL, e.config.Strict)
 			if err != nil {
-				for _, m := range migrations {
-					result.Schema = append(result.Schema, SchemaResult{Migration: m, Error: err})
+				// One diff covers the whole schema folder, so a failure is a
+				// property of the folder, not of each file in it. Reporting it
+				// against every file names dozens of innocent ones and buries
+				// the real problem — attribute it once, like a successful diff.
+				for i, m := range migrations {
+					sr := SchemaResult{Migration: m}
+					if i == 0 {
+						sr.Error = err
+					} else {
+						sr.Skipped = true
+					}
+					result.Schema = append(result.Schema, sr)
 				}
 			} else {
 				diffResult.Name = pgSchema
@@ -229,13 +274,13 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 	}
 
 	// Phase C: Logic — find changed checksums
-	result.Logic, err = e.planIdempotent(ctx, filterByType(all, migration.TypeLogic), "logic")
+	result.Logic, err = e.planIdempotent(ctx, filterByType(all, migration.TypeLogic), "logic", stateReady)
 	if err != nil {
 		return result, err
 	}
 
 	// Phase D: Permissions — find changed checksums
-	result.Permissions, err = e.planIdempotent(ctx, filterByType(all, migration.TypePermissions), "permissions")
+	result.Permissions, err = e.planIdempotent(ctx, filterByType(all, migration.TypePermissions), "permissions", stateReady)
 	if err != nil {
 		return result, err
 	}
@@ -473,6 +518,13 @@ func (e *Engine) applyOps(ctx context.Context, migrations []*migration.Migration
 	return results, nil
 }
 
+// plannedSchema is one schema folder's diff, computed but not yet applied.
+type plannedSchema struct {
+	pgSchema   string
+	migrations []*migration.Migration
+	diff       *schema.DiffResult
+}
+
 func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migration) ([]SchemaResult, error) {
 	if e.differ == nil {
 		if len(migrations) > 0 {
@@ -481,14 +533,32 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 		return nil, nil
 	}
 
+	// Group by PG schema and diff combined DDL (FK references across files need
+	// this). Sorted, because Go map iteration is randomised and two runs of the
+	// same apply should not touch the schemas in different orders.
+	grouped := groupByPGSchema(migrations)
+	pgSchemas := make([]string, 0, len(grouped))
+	for pgSchema := range grouped {
+		pgSchemas = append(pgSchemas, pgSchema)
+	}
+	sort.Strings(pgSchemas)
+
 	var results []SchemaResult
 
-	// Group by PG schema and diff combined DDL (FK references across files need this)
-	grouped := groupByPGSchema(migrations)
-	for pgSchema, pgMigrations := range grouped {
+	// Pass 1: diff EVERY folder before applying any of them.
+	//
+	// A refusal has to be a refusal for the whole run. Deciding per folder,
+	// inside the apply loop, means folder B can be refused after folder A's
+	// statements have already landed -- which is not a refusal, it is a partial
+	// apply with an error on the end. The same goes for a folder whose diff
+	// cannot be computed at all.
+	var planned []plannedSchema
+	for _, pgSchema := range pgSchemas {
+		pgMigrations := grouped[pgSchema]
+
 		var combinedDDL []string
 		if pgSchema != "public" {
-			combinedDDL = append(combinedDDL, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", pgSchema))
+			combinedDDL = append(combinedDDL, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", pgident.Quote(pgSchema)))
 		}
 		for _, m := range pgMigrations {
 			combinedDDL = append(combinedDDL, string(m.Content))
@@ -496,55 +566,158 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 
 		diffResult, err := e.differ.Diff(ctx, e.sqlDB, pgSchema, combinedDDL, e.config.Strict)
 		if err != nil {
-			for _, m := range pgMigrations {
-				results = append(results, SchemaResult{Migration: m, Error: err})
-			}
+			// Attribute once, for the same reason as in Plan: the diff covers
+			// the whole schema folder, so repeating the error per file names
+			// dozens of innocent ones.
+			results = append(results, attributeSchemaError(pgMigrations, err, nil)...)
 			return results, fmt.Errorf("schema diff failed for %s: %w", pgSchema, err)
 		}
 		diffResult.Name = pgSchema
 
-		if !diffResult.HasChanges {
-			for _, m := range pgMigrations {
-				results = append(results, SchemaResult{Migration: m, Skipped: true})
+		// Only refuse an unvalidated diff that actually proposes DDL. An empty
+		// diff has nothing to validate, and refusing it would block every clean
+		// run on any database whose views cross schema boundaries.
+		if diffResult.ValidationSkipped && len(diffResult.Statements) > 0 && e.config.FailOnUnvalidated {
+			refusal := fmt.Errorf(
+				"plan for schema %s proposes %d statement(s) and was not validated (%s); "+
+					"refusing to apply it (--fail-on-unvalidated / require_shadow is set). "+
+					"Validation rebuilds the current schema in a throwaway database; it fails when "+
+					"an object in this schema is defined in terms of another schema. Dry-run the "+
+					"statements against the shadow by hand, or pass --fail-on-unvalidated=false "+
+					"once you have",
+				pgSchema, len(diffResult.Statements), firstLine(diffResult.ValidationSkippedReason))
+			results = append(results, attributeSchemaError(pgMigrations, refusal, diffResult)...)
+			return results, refusal
+		}
+
+		planned = append(planned, plannedSchema{pgSchema: pgSchema, migrations: pgMigrations, diff: diffResult})
+	}
+
+	// Pass 2: apply.
+	for _, p := range planned {
+		if !p.diff.HasChanges {
+			// Attach the diff even though there is nothing to do: "clean" and
+			// "clean, and we could not verify it" are different answers, and the
+			// second one has to survive as far as the output formatter.
+			for i, m := range p.migrations {
+				sr := SchemaResult{Migration: m, Skipped: true}
+				if i == 0 {
+					sr.Diff = p.diff
+				}
+				results = append(results, sr)
 			}
 			continue
 		}
 
 		// Apply the combined diff and record against each migration file
 		start := time.Now()
-		for i, stmt := range diffResult.Statements {
-			if stmt.LockTimeout > 0 {
-				_, _ = e.conn.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", stmt.LockTimeout.Milliseconds()))
-			}
-			if stmt.Timeout > 0 {
-				_, _ = e.conn.Exec(ctx, fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", stmt.Timeout.Milliseconds()))
-			}
-			if _, err := e.conn.Exec(ctx, stmt.DDL); err != nil {
+		for i, stmt := range p.diff.Statements {
+			if err := e.execSchemaStatement(ctx, stmt); err != nil {
 				execMs := time.Since(start).Milliseconds()
 				errMsg := fmt.Errorf("statement %d failed: %w\nDDL: %s", i+1, err, stmt.DDL)
-				for _, m := range pgMigrations {
-					ps := pgSchema
+				for _, m := range p.migrations {
+					ps := p.pgSchema
 					_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), &ps, m.Checksum, execMs, false)
 					results = append(results, SchemaResult{Migration: m, ExecMs: execMs, Error: errMsg})
 				}
-				return results, fmt.Errorf("schema migration for %s failed: %w", pgSchema, errMsg)
+				return results, fmt.Errorf("schema migration for %s failed: %w", p.pgSchema, errMsg)
 			}
 		}
 		execMs := time.Since(start).Milliseconds()
 
 		// Record success for all migrations in this PG schema group
-		for i, m := range pgMigrations {
-			ps := pgSchema
+		for i, m := range p.migrations {
+			ps := p.pgSchema
 			_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), &ps, m.Checksum, execMs, true)
 			sr := SchemaResult{Migration: m, ExecMs: execMs, Applied: true}
 			if i == 0 {
-				sr.Diff = diffResult
+				sr.Diff = p.diff
 			}
 			results = append(results, sr)
 		}
-		e.logger.Info("applied", "pg_schema", pgSchema, "type", "schema", "ms", execMs, "statements", len(diffResult.Statements))
+		e.logger.Info("applied", "pg_schema", p.pgSchema, "type", "schema", "ms", execMs, "statements", len(p.diff.Statements))
 	}
 	return results, nil
+}
+
+// attributeSchemaError records a whole-folder failure against the first file in
+// the folder and marks the rest skipped. One diff covers the whole folder, so
+// repeating the error per file names dozens of innocent ones and buries the real
+// problem.
+func attributeSchemaError(migrations []*migration.Migration, err error, diff *schema.DiffResult) []SchemaResult {
+	out := make([]SchemaResult, 0, len(migrations))
+	for i, m := range migrations {
+		sr := SchemaResult{Migration: m}
+		if i == 0 {
+			sr.Error = err
+			sr.Diff = diff
+		} else {
+			sr.Skipped = true
+		}
+		out = append(out, sr)
+	}
+	return out
+}
+
+// execSchemaStatement runs one generated DDL statement with pg-schema-diff's
+// hazard-derived timeouts actually in force.
+//
+// The timeouts are applied with a SESSION-level SET. They used to be issued as
+// SET LOCAL on e.conn, which is not inside a transaction -- and SET LOCAL
+// outside a transaction block does nothing at all: Postgres raises a WARNING
+// and moves on. The errors were discarded (`_, _ =`) so even the warning went
+// nowhere. Every lock timeout pg-schema-diff derived from a statement's hazards
+// was therefore silently dropped, and schema DDL waited for its ACCESS
+// EXCLUSIVE lock without bound against whatever it was pointed at.
+//
+// Wrapping the statement in an explicit transaction is not the fix: the plan
+// contains CREATE INDEX CONCURRENTLY, which Postgres refuses to run inside one.
+// pg-schema-diff says as much in Statement's own documentation ("be sure to set
+// the session-level ... timeout"), and its CLI emits SET SESSION.
+//
+// A plain SET is safe here because e.conn is one dedicated connection: the same
+// backend runs the SET and the statement. Both settings are reset afterwards,
+// on a context detached from the caller's, so a cancelled or failed statement
+// cannot leave its timeout on the connection the rest of the run keeps using.
+func (e *Engine) execSchemaStatement(ctx context.Context, stmt schema.DiffStatement) error {
+	lockTimeout := stmt.LockTimeout
+	if e.config.LockTimeout > 0 {
+		lockTimeout = e.config.LockTimeout
+	}
+	statementTimeout := stmt.Timeout
+	if e.config.StatementTimeout > 0 {
+		statementTimeout = e.config.StatementTimeout
+	}
+
+	reset := func(setting string) {
+		// Detached from the caller's context so a cancelled or failed statement
+		// still cleans up -- but with a deadline of its own, because
+		// context.WithoutCancel drops the caller's deadline along with its
+		// cancellation, and a RESET against an unresponsive server would then
+		// block forever in a defer.
+		resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resetTimeout)
+		defer cancel()
+		if _, err := e.conn.Exec(resetCtx, "RESET "+setting); err != nil {
+			e.logger.Warn("failed to reset session setting after a schema statement",
+				"setting", setting, "error", err)
+		}
+	}
+
+	if lockTimeout > 0 {
+		if _, err := e.conn.Exec(ctx, fmt.Sprintf("SET lock_timeout = '%dms'", lockTimeout.Milliseconds())); err != nil {
+			return fmt.Errorf("setting lock_timeout: %w", err)
+		}
+		defer reset("lock_timeout")
+	}
+	if statementTimeout > 0 {
+		if _, err := e.conn.Exec(ctx, fmt.Sprintf("SET statement_timeout = '%dms'", statementTimeout.Milliseconds())); err != nil {
+			return fmt.Errorf("setting statement_timeout: %w", err)
+		}
+		defer reset("statement_timeout")
+	}
+
+	_, err := e.conn.Exec(ctx, stmt.DDL)
+	return err
 }
 
 func (e *Engine) applyIdempotent(ctx context.Context, migrations []*migration.Migration, typ string) ([]MigrationResult, error) {
@@ -577,10 +750,18 @@ func (e *Engine) applyIdempotent(ctx context.Context, migrations []*migration.Mi
 	return results, nil
 }
 
-func (e *Engine) planIdempotent(ctx context.Context, migrations []*migration.Migration, typ string) ([]MigrationResult, error) {
-	latest, err := e.store.GetLatestByType(ctx, typ)
-	if err != nil {
-		return nil, err
+// planIdempotent classifies logic/permissions migrations as pending or already
+// applied. stateReady is false on a database m8 has never touched, where there
+// is no history to read and everything is therefore pending — plan must not
+// create the state schema just to discover that.
+func (e *Engine) planIdempotent(ctx context.Context, migrations []*migration.Migration, typ string, stateReady bool) ([]MigrationResult, error) {
+	latest := map[string]state.HistoryRow{}
+	if stateReady {
+		var err error
+		latest, err = e.store.GetLatestByType(ctx, typ)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var results []MigrationResult
 	for _, m := range migrations {
@@ -660,6 +841,32 @@ func (e *Engine) releaseLock(ctx context.Context) {
 // ensurePGSchemas creates any PostgreSQL schemas referenced by schema/ subfolders
 // that don't already exist. This means you don't need an ops/ migration just to
 // CREATE SCHEMA — the folder structure implies it.
+// missingPGSchemas returns the PostgreSQL schemas implied by schema/ subfolders
+// that do not exist on the target, in declaration order and without duplicates.
+// It only reads the catalog — Plan uses it so that planning a greenfield schema
+// does not create it as a side effect.
+func (e *Engine) missingPGSchemas(ctx context.Context, migrations []*migration.Migration) ([]string, error) {
+	var missing []string
+	seen := make(map[string]bool)
+	for _, m := range migrations {
+		if m.PGSchema == "" || m.PGSchema == "public" || seen[m.PGSchema] {
+			continue
+		}
+		seen[m.PGSchema] = true
+		var exists bool
+		err := e.conn.QueryRow(ctx,
+			"SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)", m.PGSchema,
+		).Scan(&exists)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check schema %s: %w", m.PGSchema, err)
+		}
+		if !exists {
+			missing = append(missing, m.PGSchema)
+		}
+	}
+	return missing, nil
+}
+
 func (e *Engine) ensurePGSchemas(ctx context.Context, migrations []*migration.Migration) error {
 	seen := make(map[string]bool)
 	for _, m := range migrations {
@@ -667,7 +874,9 @@ func (e *Engine) ensurePGSchemas(ctx context.Context, migrations []*migration.Mi
 			continue
 		}
 		seen[m.PGSchema] = true
-		_, err := e.conn.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", m.PGSchema))
+		// Quoted: an unquoted schema/MySchema/ folder creates "myschema" while
+		// the diff is scoped to "MySchema", which then reads as empty.
+		_, err := e.conn.Exec(ctx, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s", pgident.Quote(m.PGSchema)))
 		if err != nil {
 			return fmt.Errorf("failed to create schema %s: %w", m.PGSchema, err)
 		}
@@ -711,6 +920,11 @@ func FormatPlanOutput(result *ApplyResult) string {
 	var b strings.Builder
 	var pending int
 
+	for _, sch := range result.PendingPGSchemas {
+		fmt.Fprintf(&b, "  + CREATE SCHEMA %s (schema)\n", sch)
+		pending++
+	}
+
 	for _, v := range result.Ops {
 		if !v.Skipped {
 			fmt.Fprintf(&b, "  + %s (ops)\n", v.Migration.Filename)
@@ -724,6 +938,10 @@ func FormatPlanOutput(result *ApplyResult) string {
 			pending++
 		} else if !s.Skipped && s.Diff != nil {
 			fmt.Fprintf(&b, "  ~ %s (schema)\n", s.Migration.Filename)
+			if s.Diff.ValidationSkipped {
+				fmt.Fprintf(&b, "    ⚠ PLAN_NOT_VALIDATED — the current schema could not be rebuilt in isolation\n")
+				fmt.Fprintf(&b, "      (%s)\n", firstLine(s.Diff.ValidationSkippedReason))
+			}
 			for _, stmt := range s.Diff.Statements {
 				fmt.Fprintf(&b, "    %s\n", strings.TrimSpace(stmt.DDL))
 				for _, h := range stmt.Hazards {
@@ -748,18 +966,52 @@ func FormatPlanOutput(result *ApplyResult) string {
 		}
 	}
 
+	// A diff that produced no statements is marked Skipped, so the loop above
+	// never reaches it -- but "clean" and "clean, and we could not verify it"
+	// are different answers. Surface the warning either way, without counting
+	// it as pending: an unvalidated empty diff is still an empty diff.
+	var w strings.Builder
+	for _, s := range result.Schema {
+		if s.Skipped && s.Diff != nil && s.Diff.ValidationSkipped {
+			fmt.Fprintf(&w, "  ⚠ PLAN_NOT_VALIDATED %s (schema) — the current schema could not be rebuilt in isolation\n",
+				s.Diff.Name)
+			fmt.Fprintf(&w, "      (%s)\n", firstLine(s.Diff.ValidationSkippedReason))
+		}
+	}
+
 	if pending == 0 {
-		return "No pending migrations. Database is up to date.\n"
+		return w.String() + "No pending migrations. Database is up to date.\n"
 	}
 
 	header := fmt.Sprintf("Plan: %d migration(s) to apply.\n\n", pending)
-	return header + b.String()
+	return header + w.String() + b.String()
 }
 
 // FormatApplyOutput returns a human-readable summary of an apply result.
+//
+// An unvalidated plan is reported here, not only in `plan`. apply runs the same
+// Differ, so it can and does execute a degraded plan against the target; saying
+// so only in the read-only command means the one operator who most needs to know
+// -- the one holding the write connection -- is the one not told.
 func FormatApplyOutput(result *ApplyResult) string {
 	var b strings.Builder
 	var applied, skipped, failed int
+
+	// Warnings for results that get no line of their own, hoisted above the
+	// per-file lines so they are not lost at the end of a long apply.
+	var w strings.Builder
+	warnUnvalidated := func(s SchemaResult, applied bool) {
+		if s.Diff == nil || !s.Diff.ValidationSkipped {
+			return
+		}
+		verb := "were applied"
+		if !applied {
+			verb = "would have been applied"
+		}
+		fmt.Fprintf(&w, "  ⚠ PLAN_NOT_VALIDATED %s (schema) — the statements %s without the check that they execute\n",
+			s.Diff.Name, verb)
+		fmt.Fprintf(&w, "      (%s)\n", firstLine(s.Diff.ValidationSkippedReason))
+	}
 
 	writeResults := func(results []MigrationResult) {
 		for _, v := range results {
@@ -786,8 +1038,10 @@ func FormatApplyOutput(result *ApplyResult) string {
 				stmtCount = len(s.Diff.Statements)
 			}
 			fmt.Fprintf(&b, "  ✓ %s (%dms, %d statements)\n", s.Migration.Filename, s.ExecMs, stmtCount)
+			warnUnvalidated(s, true)
 			applied++
 		} else if s.Skipped {
+			warnUnvalidated(s, false)
 			skipped++
 		}
 	}
@@ -795,7 +1049,7 @@ func FormatApplyOutput(result *ApplyResult) string {
 	writeResults(result.Permissions)
 
 	summary := fmt.Sprintf("\nApplied: %d, Skipped: %d, Failed: %d\n", applied, skipped, failed)
-	return b.String() + summary
+	return w.String() + b.String() + summary
 }
 
 // FormatStatusOutput returns a human-readable summary of status.
@@ -847,4 +1101,51 @@ func FormatStatusOutput(result *StatusResult) string {
 	}
 
 	return b.String()
+}
+
+// FailsOnUnvalidatedPlan reports whether this engine refuses a schema diff whose
+// plan could not be validated. `plan` gates its exit code on the same setting
+// `apply` gates its refusal on, read from the engine rather than resolved a
+// second time, so the two commands cannot disagree within one run.
+func (e *Engine) FailsOnUnvalidatedPlan() bool {
+	return e.config.FailOnUnvalidated
+}
+
+// UnvalidatedSchemas returns the PostgreSQL schemas whose diff was produced
+// without the plan-validation step AND proposes at least one statement. `plan`
+// turns this into a non-zero exit when --fail-on-unvalidated is set:
+// PLAN_NOT_VALIDATED printed to stdout is not something a CI pipeline can gate
+// on.
+//
+// The statement count is part of the condition, not a detail. Validation
+// rebuilds the current schema in a throwaway database and replays the generated
+// statements against it, so an empty diff has nothing to validate and refusing
+// it protects nothing. Scoping the diff to one schema — which is what makes it
+// correct and affordable — means that rebuild fails on any object whose
+// definition reaches outside the schema, so a database with a single
+// cross-schema view would otherwise refuse every clean plan forever. A gate
+// that is always red is a gate somebody turns off.
+func UnvalidatedSchemas(r *ApplyResult) []string {
+	var names []string
+	seen := make(map[string]bool)
+	for _, s := range r.Schema {
+		if s.Diff == nil || !s.Diff.ValidationSkipped || seen[s.Diff.Name] {
+			continue
+		}
+		if len(s.Diff.Statements) == 0 {
+			continue
+		}
+		seen[s.Diff.Name] = true
+		names = append(names, s.Diff.Name)
+	}
+	return names
+}
+
+// firstLine trims a multi-line error to its first line, so a plan stays
+// readable when the underlying message embeds a whole view definition.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i]) + " ..."
+	}
+	return strings.TrimSpace(s)
 }

@@ -45,6 +45,20 @@ func (s *Store) EnsureSchema(ctx context.Context) error {
 	return nil
 }
 
+// SchemaExists reports whether m8's own state schema has been bootstrapped.
+// Read-only commands use this to decide whether there is any history to read,
+// rather than creating the schema as a side effect of looking.
+func (s *Store) SchemaExists(ctx context.Context) (bool, error) {
+	var exists bool
+	err := s.conn.QueryRow(ctx,
+		"SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = '_m8')",
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("failed to check for _m8 schema: %w", err)
+	}
+	return exists, nil
+}
+
 // GetAppliedOps returns all successfully applied ops migrations, sorted by version.
 func (s *Store) GetAppliedOps(ctx context.Context) ([]HistoryRow, error) {
 	rows, err := s.conn.Query(ctx, `
