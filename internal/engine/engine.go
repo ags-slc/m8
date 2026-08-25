@@ -619,7 +619,8 @@ func (e *Engine) executeMigration(ctx context.Context, m *migration.Migration) e
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	// Rollback is a no-op once the transaction has been committed.
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if parsed.Directives.LockTimeout > 0 {
 		if _, err = tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", parsed.Directives.LockTimeout.Milliseconds())); err != nil {
