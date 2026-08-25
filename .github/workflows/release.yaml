@@ -24,8 +24,11 @@ jobs:
           # directive fails every command that loads the module graph.
           go-version-file: go.mod
 
+      # Pinned to an exact version: cosign-installer publishes no floating v4
+      # tag, so @v4 would fail to resolve on the tag push. v4 is required for
+      # cosign v3, which the signs block in .goreleaser.yaml now targets.
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@v4.1.2
 
       # -p 1: package-parallel execution of the testcontainers suites is flaky
       # under contention, and a flake here aborts a release whose tag already
