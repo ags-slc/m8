@@ -1,9 +1,10 @@
 package dump
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 )
 
@@ -29,12 +30,22 @@ func (o LogicObject) BaseFileName() string {
 
 var nonFilenameChars = regexp.MustCompile(`[^a-z0-9]+`)
 
+// maxSlugLen caps the readable part of a disambiguated filename. A signature
+// with a dozen named arguments would otherwise push the path past what some
+// filesystems accept. Truncating is safe because a slug that is no longer unique
+// after truncation collides, and a collision is what pulls in the hash.
+const maxSlugLen = 64
+
 // argSlug renders an argument list into a short, filename-safe, deterministic
 // suffix: "IN p_start_date date" -> "in_p_start_date_date", "" -> "noargs".
 //
 // Identity may be either a bare argument list or a full "name(args)"
 // signature; only the arguments distinguish overloads, so a wrapping name is
 // stripped to keep the suffix from repeating the name already in the prefix.
+//
+// It is deliberately LOSSY -- "text" and "text[]" both slug to "text" -- because
+// it is a readability aid, not an identity. Uniqueness comes from objectHash,
+// which ResolveLogicFileNames appends whenever two objects land on one slug.
 func argSlug(identity string) string {
 	if open := strings.Index(identity, "("); open >= 0 && strings.HasSuffix(identity, ")") {
 		identity = identity[open+1 : len(identity)-1]
@@ -44,7 +55,23 @@ func argSlug(identity string) string {
 	if s == "" {
 		return "noargs"
 	}
+	if len(s) > maxSlugLen {
+		s = strings.Trim(s[:maxSlugLen], "_")
+	}
 	return s
+}
+
+// objectHash is a short discriminator derived from everything that
+// distinguishes one logic object from another. Length-prefixed so ("ab", "c")
+// and ("a", "bc") cannot hash alike, and truncated to 48 bits -- ample for the
+// handful of objects that ever share one slug, and short enough to keep the
+// filename readable.
+func objectHash(o LogicObject) string {
+	h := sha256.New()
+	for _, part := range []string{o.Schema, o.Name, o.Identity} {
+		_, _ = fmt.Fprintf(h, "%d:%s", len(part), part)
+	}
+	return hex.EncodeToString(h.Sum(nil)[:6])
 }
 
 // ResolveLogicFileNames maps every logic object to a distinct filename.
@@ -53,6 +80,24 @@ func argSlug(identity string) string {
 // them all to one path and every overload but the last is silently lost from
 // the baseline. Colliding objects are disambiguated by their argument list;
 // objects with no collision keep the short, stable name.
+//
+// A name is a pure function of the object and of which slugs collide with it.
+// Nothing depends on position:
+//
+//   - The disambiguator used to be an ordinal (__2, __3), which made the
+//     filename depend on where an object fell in a sorted group. Removing one
+//     overload then handed its path to a DIFFERENT overload -- the file stayed,
+//     its contents silently became another function. A hash of the object
+//     cannot do that: a removal can shorten a surviving name, never re-point an
+//     existing one.
+//   - The ordinal was also wrong. `used` was incremented against the *rewritten*
+//     candidate, so a slug shared by three objects produced __2 twice and one of
+//     them was overwritten -- the exact silent loss this function exists to
+//     prevent.
+//   - The sort that made the ordinal reproducible keyed on Identity alone and
+//     was not stable, so objects with equal Identity (two views, both "")
+//     swapped filenames from run to run. There is no ordinal now, so there is
+//     nothing to sort.
 //
 // The returned map is keyed by schema, name, and identity so callers can look
 // up the filename for the exact object they hold.
@@ -68,17 +113,22 @@ func ResolveLogicFileNames(objects []LogicObject) map[LogicObject]string {
 			names[group[0]] = base + ".sql"
 			continue
 		}
-		// Deterministic order so the same database always dumps the same
-		// filenames, even if the caller's iteration order changes.
-		sort.Slice(group, func(i, j int) bool { return group[i].Identity < group[j].Identity })
-		used := make(map[string]int, len(group))
+		// Which slugs collide is a property of the set, not of any object's
+		// position in it. argSlug is lossy -- f(text) and f(text[]) both slug to
+		// "text" -- so this is what decides who needs a hash.
+		slugCount := make(map[string]int, len(group))
 		for _, o := range group {
-			candidate := fmt.Sprintf("%s__%s", base, argSlug(o.Identity))
-			if n := used[candidate]; n > 0 {
-				candidate = fmt.Sprintf("%s_%d", candidate, n+1)
+			slugCount[argSlug(o.Identity)]++
+		}
+		for _, o := range group {
+			slug := argSlug(o.Identity)
+			if slugCount[slug] > 1 {
+				// argSlug collapses every run of non-[a-z0-9] to a single "_",
+				// so a slug can never contain "__" and base__slug can never be
+				// mistaken for base__slug__hash.
+				slug += "__" + objectHash(o)
 			}
-			used[candidate]++
-			names[o] = candidate + ".sql"
+			names[o] = base + "__" + slug + ".sql"
 		}
 	}
 	return names

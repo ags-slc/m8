@@ -1,6 +1,9 @@
 package dump
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // Two overloads of one procedure must not share a filename. The naive
 // schema+name scheme wrote both to logic/materialized_proc_lcb_backfill.sql,
@@ -73,5 +76,99 @@ func TestResolveLogicFileNamesIsDeterministic(t *testing.T) {
 
 	if first[a] != second[a] || first[b] != second[b] {
 		t.Errorf("filenames are order-dependent: %v vs %v", first, second)
+	}
+}
+
+// argSlug is lossy: f(text) and f(text[]) both slug to "text", because
+// nonFilenameChars collapses "[]" to "_" and the trailing "_" is trimmed. Three
+// such overloads used to produce only two filenames -- the ordinal was
+// incremented against the rewritten candidate, so __2 was handed out twice and
+// one function was overwritten by another.
+func TestResolveLogicFileNamesSeparatesSlugCollidingOverloads(t *testing.T) {
+	objects := []LogicObject{
+		{Schema: "public", Name: "f", Identity: "f(text)"},
+		{Schema: "public", Name: "f", Identity: "f(text[])"},
+		{Schema: "public", Name: "f", Identity: "f(text[][])"},
+	}
+
+	names := ResolveLogicFileNames(objects)
+
+	seen := make(map[string]LogicObject, len(objects))
+	for _, o := range objects {
+		n := names[o]
+		if n == "" {
+			t.Fatalf("no filename for %+v", o)
+		}
+		if prev, dup := seen[n]; dup {
+			t.Errorf("%+v and %+v both write to %q -- one is silently lost", prev, o, n)
+		}
+		seen[n] = o
+	}
+	if len(seen) != len(objects) {
+		t.Errorf("got %d filenames for %d objects", len(seen), len(objects))
+	}
+}
+
+// Removing one overload must never hand its path to a different overload. With
+// an ordinal disambiguator, deleting f(text) renamed f(text[]) from f__text_2
+// to f__text: the file f__text.sql stayed in the tree and silently changed
+// which function it contained.
+func TestResolveLogicFileNamesDoNotInheritARemovedSiblingsPath(t *testing.T) {
+	integer := LogicObject{Schema: "public", Name: "f", Identity: "f(integer)"}
+	text := LogicObject{Schema: "public", Name: "f", Identity: "f(text)"}
+	textArray := LogicObject{Schema: "public", Name: "f", Identity: "f(text[])"}
+
+	before := ResolveLogicFileNames([]LogicObject{integer, text, textArray})
+	after := ResolveLogicFileNames([]LogicObject{integer, textArray})
+
+	owner := make(map[string]LogicObject, len(before))
+	for o, n := range before {
+		owner[n] = o
+	}
+	for o, n := range after {
+		if prev, ok := owner[n]; ok && prev != o {
+			t.Errorf("%q used to hold %+v and now holds %+v -- same path, different object",
+				n, prev, o)
+		}
+	}
+}
+
+// Two objects can collide on base filename while sharing an Identity: a view in
+// schema "a" named "b_c" and a view in schema "a_b" named "c" both base to
+// "a_b_c", and both have the empty Identity of a view. The old sort keyed on
+// Identity alone and was not stable, so which one got the plain name and which
+// got the ordinal depended on the order the caller happened to pass them in.
+func TestResolveLogicFileNamesHandlesEqualIdentities(t *testing.T) {
+	first := LogicObject{Schema: "a", Name: "b_c"}
+	second := LogicObject{Schema: "a_b", Name: "c"}
+
+	forward := ResolveLogicFileNames([]LogicObject{first, second})
+	reverse := ResolveLogicFileNames([]LogicObject{second, first})
+
+	if forward[first] == forward[second] {
+		t.Fatalf("objects with equal Identity collided on %q", forward[first])
+	}
+	if forward[first] != reverse[first] || forward[second] != reverse[second] {
+		t.Errorf("filenames flipped with input order:\n  forward: %v\n  reverse: %v", forward, reverse)
+	}
+}
+
+// A pathological signature must not produce a path longer than a filesystem
+// will take. Truncation is safe because a truncated slug that is no longer
+// unique collides, and a collision pulls in the hash.
+func TestResolveLogicFileNamesBoundsFilenameLength(t *testing.T) {
+	long := strings.Repeat("p_very_long_argument_name text, ", 40)
+	a := LogicObject{Schema: "public", Name: "f", Identity: "f(" + long + "a integer)"}
+	b := LogicObject{Schema: "public", Name: "f", Identity: "f(" + long + "b integer)"}
+
+	names := ResolveLogicFileNames([]LogicObject{a, b})
+
+	if names[a] == names[b] {
+		t.Fatalf("truncation collapsed two overloads onto %q", names[a])
+	}
+	for _, n := range []string{names[a], names[b]} {
+		if len(n) > 255 {
+			t.Errorf("filename is %d bytes, longer than a filesystem will take: %q", len(n), n)
+		}
 	}
 }
