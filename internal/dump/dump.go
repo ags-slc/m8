@@ -33,6 +33,12 @@ type Column struct {
 	Default      *string
 	IsIdentity   bool
 	IdentityKind string // "ALWAYS" or "BY DEFAULT"
+	// Generated holds the expression of a GENERATED ALWAYS AS (...) STORED
+	// column. Postgres stores that expression in pg_attrdef alongside ordinary
+	// defaults, but it is not a default: it references sibling columns, which a
+	// DEFAULT may not do. Emitting one as a DEFAULT produces DDL Postgres
+	// rejects with 0A000.
+	Generated *string
 }
 
 // PrimaryKey represents a primary key constraint.
@@ -166,7 +172,8 @@ func (d *Dumper) loadColumns(ctx context.Context, t *Table) error {
 			pg_catalog.format_type(a.atttypid, a.atttypmod),
 			NOT a.attnotnull,
 			pg_get_expr(ad.adbin, ad.adrelid),
-			a.attidentity::text
+			a.attidentity::text,
+			a.attgenerated::text
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -186,8 +193,16 @@ func (d *Dumper) loadColumns(ctx context.Context, t *Table) error {
 		var col Column
 		var defaultVal *string
 		var identity string
-		if err := rows.Scan(&col.Name, &col.DataType, &col.Nullable, &defaultVal, &identity); err != nil {
+		var generated string
+		if err := rows.Scan(&col.Name, &col.DataType, &col.Nullable, &defaultVal, &identity, &generated); err != nil {
 			return err
+		}
+		// A generated column's expression lives in pg_attrdef too. Route it to
+		// Generated so RenderDDL emits GENERATED ALWAYS AS (...) STORED rather
+		// than a DEFAULT that references sibling columns.
+		if generated == "s" {
+			col.Generated = defaultVal
+			defaultVal = nil
 		}
 		col.Default = defaultVal
 		switch identity {
@@ -403,6 +418,10 @@ func RenderDDL(t *Table) string {
 		if col.IsIdentity {
 			fmt.Fprintf(&b, " GENERATED %s AS IDENTITY", col.IdentityKind)
 		}
+		if col.Generated != nil {
+			// Rendered before NOT NULL, which is the order Postgres accepts.
+			fmt.Fprintf(&b, " GENERATED ALWAYS AS (%s) STORED", collapseWhitespace(*col.Generated))
+		}
 		if !col.Nullable {
 			b.WriteString(" NOT NULL")
 		}
@@ -478,4 +497,11 @@ func RenderDDL(t *Table) string {
 	}
 
 	return b.String()
+}
+
+// collapseWhitespace folds a multi-line catalog expression onto one line.
+// pg_get_expr pretty-prints CASE expressions across several lines, which is
+// valid SQL but renders a column definition unreadable inside a CREATE TABLE.
+func collapseWhitespace(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }

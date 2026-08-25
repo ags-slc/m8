@@ -221,8 +221,18 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 			}
 			diffResult, err := e.differ.Diff(ctx, e.sqlDB, pgSchema, combinedDDL, e.config.Strict)
 			if err != nil {
-				for _, m := range migrations {
-					result.Schema = append(result.Schema, SchemaResult{Migration: m, Error: err})
+				// One diff covers the whole schema folder, so a failure is a
+				// property of the folder, not of each file in it. Reporting it
+				// against every file names dozens of innocent ones and buries
+				// the real problem — attribute it once, like a successful diff.
+				for i, m := range migrations {
+					sr := SchemaResult{Migration: m}
+					if i == 0 {
+						sr.Error = err
+					} else {
+						sr.Skipped = true
+					}
+					result.Schema = append(result.Schema, sr)
 				}
 			} else {
 				diffResult.Name = pgSchema
@@ -511,8 +521,17 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 
 		diffResult, err := e.differ.Diff(ctx, e.sqlDB, pgSchema, combinedDDL, e.config.Strict)
 		if err != nil {
-			for _, m := range pgMigrations {
-				results = append(results, SchemaResult{Migration: m, Error: err})
+			// Attribute once, for the same reason as in Plan: the diff covers
+			// the whole schema folder, so repeating the error per file names
+			// dozens of innocent ones.
+			for i, m := range pgMigrations {
+				sr := SchemaResult{Migration: m}
+				if i == 0 {
+					sr.Error = err
+				} else {
+					sr.Skipped = true
+				}
+				results = append(results, sr)
 			}
 			return results, fmt.Errorf("schema diff failed for %s: %w", pgSchema, err)
 		}
