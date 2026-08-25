@@ -1251,10 +1251,14 @@ func TestDumpCapturesColumnGrants(t *testing.T) {
 	conn, cleanup := testDB(t)
 	defer cleanup()
 
+	// Two privileges on ONE column is the shape that matters. PostgreSQL binds a
+	// column list to the privilege it follows, not to the statement, so
+	// rendering "GRANT SELECT, UPDATE (name) ON ..." makes SELECT table-wide.
 	if _, err := conn.Exec(ctx, `
 		CREATE ROLE analyst;
 		CREATE TABLE public.people (id BIGINT PRIMARY KEY, name TEXT, ssn TEXT);
-		GRANT SELECT (id, name) ON public.people TO analyst;
+		GRANT SELECT (id) ON public.people TO analyst;
+		GRANT SELECT (name), UPDATE (name) ON public.people TO analyst;
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -1268,19 +1272,94 @@ func TestDumpCapturesColumnGrants(t *testing.T) {
 		t.Fatalf("rendered permissions failed to replay: %v\n%s", err, rendered)
 	}
 
-	var id, name, ssn bool
+	var id, name, nameUpdate, ssn, wholeTable bool
 	if err := conn.QueryRow(ctx, `
 		SELECT has_column_privilege('analyst', 'public.people', 'id',   'SELECT'),
 		       has_column_privilege('analyst', 'public.people', 'name', 'SELECT'),
-		       has_column_privilege('analyst', 'public.people', 'ssn',  'SELECT')
-	`).Scan(&id, &name, &ssn); err != nil {
+		       has_column_privilege('analyst', 'public.people', 'name', 'UPDATE'),
+		       has_column_privilege('analyst', 'public.people', 'ssn',  'SELECT'),
+		       has_table_privilege ('analyst', 'public.people',         'SELECT')
+	`).Scan(&id, &name, &nameUpdate, &ssn, &wholeTable); err != nil {
 		t.Fatal(err)
 	}
-	if !id || !name {
-		t.Errorf("column grants were lost (id=%v name=%v):\n%s", id, name, rendered)
+	if !id || !name || !nameUpdate {
+		t.Errorf("column grants were lost (id=%v name=%v name/UPDATE=%v):\n%s", id, name, nameUpdate, rendered)
 	}
 	if ssn {
-		t.Errorf("the replay widened the grant to a column that never had it:\n%s", rendered)
+		t.Errorf("the replay widened SELECT to a column that never had it:\n%s", rendered)
+	}
+	if wholeTable {
+		t.Errorf("the replay widened a column grant to the whole table:\n%s", rendered)
+	}
+}
+
+// The _m8 exclusion is a LIKE pattern, where a bare underscore is a
+// single-character wildcard. Unescaped, '_m8%' also matches any relation with
+// "m8" in positions two and three, and that table's grants disappear from the
+// dump.
+func TestDumpCapturesGrantsOnTablesThatLookLikeM8Internals(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE ROLE reader;
+		CREATE TABLE public.tm8data (id BIGINT PRIMARY KEY);
+		GRANT SELECT ON public.tm8data TO reader;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	grants, err := NewDumper(conn).ListGrants(ctx, "public")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, g := range grants {
+		if g.Table == "tm8data" && g.Grantee == "reader" && g.Privilege == "SELECT" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a table named tm8data was excluded as an m8 internal: %+v", grants)
+	}
+}
+
+// TestPublicRevokesAreOnlyRealRevokes pins that the PUBLIC-revoke arm reports a
+// revoke only when there was one.
+//
+// What initdb grants PUBLIC on the public schema is version-dependent, and it is
+// not what acldefault() returns. PostgreSQL 15 stopped granting CREATE, so a
+// hardcoded ARRAY['USAGE','CREATE'] reports CREATE as revoked on every stock 15+
+// database -- a REVOKE nobody asked for, recorded as if it were intent.
+func TestPublicRevokesAreOnlyRealRevokes(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	d := NewDumper(conn)
+
+	revokes, err := d.ListPublicRevokes(ctx, "public")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(revokes) != 0 {
+		t.Errorf("a stock database reported %d revoke(s) nobody made: %+v", len(revokes), revokes)
+	}
+
+	// A real revoke must still be found.
+	if _, err := conn.Exec(ctx, `REVOKE USAGE ON SCHEMA public FROM PUBLIC`); err != nil {
+		t.Fatal(err)
+	}
+	revokes, err = d.ListPublicRevokes(ctx, "public")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(revokes) != 1 || revokes[0].Privilege != "USAGE" || revokes[0].Name != "" {
+		t.Errorf("expected exactly the USAGE revoke, got %+v", revokes)
+	}
+	if out := RenderPublicRevokes(revokes); !strings.Contains(out, `REVOKE USAGE ON SCHEMA "public" FROM PUBLIC;`) {
+		t.Errorf("revoke not rendered:\n%s", out)
 	}
 }
 

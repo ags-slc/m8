@@ -77,7 +77,7 @@ func (d *Dumper) ListGrants(ctx context.Context, schema string) ([]Grant, error)
 		  AND c.relacl IS NOT NULL
 		  AND a.grantee <> c.relowner              -- the owner's implicit grants
 		  AND NOT (a.grantee <> 0 AND pg_catalog.pg_get_userbyid(a.grantee) LIKE 'pg\_%')
-		  AND c.relname NOT LIKE '_m8%'
+		  AND c.relname NOT LIKE '\_m8%'   -- escaped: bare _ is a single-character wildcard
 		ORDER BY 2, 4, 5
 	`, schema)
 	if err != nil {
@@ -121,7 +121,7 @@ func (d *Dumper) ListColumnGrants(ctx context.Context, schema string) ([]Grant, 
 		  AND NOT att.attisdropped
 		  AND a.grantee <> c.relowner
 		  AND NOT (a.grantee <> 0 AND pg_catalog.pg_get_userbyid(a.grantee) LIKE 'pg\_%')
-		  AND c.relname NOT LIKE '_m8%'
+		  AND c.relname NOT LIKE '\_m8%'   -- escaped: bare _ is a single-character wildcard
 		ORDER BY 2, 3, 5, 6
 	`, schema)
 	if err != nil {
@@ -322,14 +322,25 @@ func (d *Dumper) ListPublicRevokes(ctx context.Context, schema string) ([]Revoke
 		return nil, err
 	}
 
-	// The public schema is the one schema initdb grants to PUBLIC (USAGE, and
-	// CREATE before PostgreSQL 15), so it is the one schema where a revoke can
-	// be undone by a rebuild. Any other schema starts with no PUBLIC access at
-	// all, and emitting a revoke for it would be noise.
+	// The public schema is the one schema initdb grants to PUBLIC, so it is the
+	// one schema where a revoke can be undone by a rebuild. Any other schema
+	// starts with no PUBLIC access at all, and emitting a revoke for it would be
+	// noise.
+	//
+	// What initdb grants is version-dependent and is NOT what acldefault('n',
+	// owner) returns -- that function knows only the owner's own privileges. So
+	// the set is spelled out, and gated on the server version: PostgreSQL 15
+	// stopped granting CREATE on public to PUBLIC, and treating CREATE as
+	// revoked on every stock 15+ database emits a REVOKE nobody asked for.
 	if schema == "public" {
 		prows, err := d.conn.Query(ctx, `
 			SELECT priv
-			FROM unnest(ARRAY['USAGE', 'CREATE']) AS priv
+			FROM unnest(
+				CASE WHEN current_setting('server_version_num')::int < 150000
+					THEN ARRAY['USAGE', 'CREATE']
+					ELSE ARRAY['USAGE']
+				END
+			) AS priv
 			JOIN pg_namespace n ON n.nspname = 'public'
 			WHERE n.nspacl IS NOT NULL
 			  AND NOT EXISTS (
@@ -400,6 +411,7 @@ func RenderSchemaGrants(grants []SchemaGrant) string {
 	}
 
 	var b strings.Builder
+	b.WriteString("-- Access to the schema itself. Every grant below is inert without it.\n")
 	for _, k := range order {
 		fmt.Fprintf(&b, "GRANT %s ON SCHEMA %s TO %s%s;\n",
 			strings.Join(grouped[k], ", "),
@@ -471,13 +483,25 @@ func RenderGrants(grants []Grant, schema string) string {
 			// is rejected outright.
 			objectType = "SEQUENCE"
 		}
-		columns := ""
+		// PostgreSQL binds a column list to the privilege it FOLLOWS, not to the
+		// statement. Appending it once after the joined list --
+		//
+		//	GRANT SELECT, UPDATE ("name") ON TABLE …
+		//
+		// makes every privilege but the last table-wide, so a column-scoped
+		// SELECT on one column comes back as SELECT on every column in the
+		// table. Each privilege carries its own list.
+		privileges := grouped[k]
 		if k.column != "" {
-			columns = " (" + pgident.Quote(k.column) + ")"
+			columns := " (" + pgident.Quote(k.column) + ")"
+			withColumns := make([]string, len(privileges))
+			for i, priv := range privileges {
+				withColumns[i] = priv + columns
+			}
+			privileges = withColumns
 		}
-		fmt.Fprintf(&b, "GRANT %s%s ON %s %s TO %s%s;\n",
-			strings.Join(grouped[k], ", "),
-			columns,
+		fmt.Fprintf(&b, "GRANT %s ON %s %s TO %s%s;\n",
+			strings.Join(privileges, ", "),
 			objectType,
 			pgident.Qualify(k.schema, k.table),
 			quoteGrantee(k.grantee),
