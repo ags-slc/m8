@@ -1056,6 +1056,14 @@ func FormatStatusOutput(result *StatusResult) string {
 	return b.String()
 }
 
+// FailsOnUnvalidatedPlan reports whether this engine refuses a schema diff whose
+// plan could not be validated. `plan` gates its exit code on the same setting
+// `apply` gates its refusal on, read from the engine rather than resolved a
+// second time, so the two commands cannot disagree within one run.
+func (e *Engine) FailsOnUnvalidatedPlan() bool {
+	return e.config.FailOnUnvalidated
+}
+
 // UnvalidatedSchemas returns the PostgreSQL schemas whose diff was produced
 // without the plan-validation step. `plan` turns this into a non-zero exit when
 // --fail-on-unvalidated is set: PLAN_NOT_VALIDATED printed to stdout is not

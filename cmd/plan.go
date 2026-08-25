@@ -22,11 +22,6 @@ var planCmd = &cobra.Command{
 		}
 		defer cleanup()
 
-		st, err := resolveSettings()
-		if err != nil {
-			return err
-		}
-
 		result, err := eng.Plan(ctx)
 		if err != nil {
 			return err
@@ -40,7 +35,7 @@ var planCmd = &cobra.Command{
 		// require_shadow) turns it into one, and it must be checked before the
 		// os.Exit(2) below -- exit 2 means "there are changes to apply", which
 		// CI gates read as success.
-		if st.FailOnUnvalidated {
+		if eng.FailsOnUnvalidatedPlan() {
 			if names := engine.UnvalidatedSchemas(result); len(names) > 0 {
 				return fmt.Errorf(
 					"plan for %s could not be validated; refusing to report it as a plan "+
