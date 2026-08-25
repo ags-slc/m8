@@ -117,29 +117,49 @@ Examples:
 			}
 
 			// --- Grants → permissions/grants_{schema}.sql ---
+			//
+			// Order matters: USAGE on the schema, then the revokes that undo
+			// PostgreSQL's PUBLIC defaults, then the grants. Without the schema
+			// grant every relation grant below it is inert on a rebuild.
+			schemaGrants, err := d.ListSchemaGrants(ctx, schema)
+			if err != nil {
+				return fmt.Errorf("failed to list schema grants for %s: %w", schema, err)
+			}
 			grants, err := d.ListGrants(ctx, schema)
 			if err != nil {
 				return fmt.Errorf("failed to list grants in %s: %w", schema, err)
 			}
-			publicGrants, err := d.ListPublicGrants(ctx, schema)
+			columnGrants, err := d.ListColumnGrants(ctx, schema)
 			if err != nil {
-				return fmt.Errorf("failed to list public grants in %s: %w", schema, err)
+				return fmt.Errorf("failed to list column grants in %s: %w", schema, err)
 			}
-
 			routineGrants, err := d.ListRoutineGrants(ctx, schema)
 			if err != nil {
 				return fmt.Errorf("failed to list routine grants in %s: %w", schema, err)
 			}
+			revokes, err := d.ListPublicRevokes(ctx, schema)
+			if err != nil {
+				return fmt.Errorf("failed to list public revokes in %s: %w", schema, err)
+			}
 
-			allGrants := append(grants, publicGrants...)
-			if len(allGrants) > 0 || len(routineGrants) > 0 {
-				rendered := dump.RenderGrants(allGrants, schema)
-				if len(allGrants) == 0 {
-					rendered = fmt.Sprintf("-- Grants for schema %s\n\n", schema)
+			allGrants := append(grants, columnGrants...)
+			if len(allGrants) > 0 || len(routineGrants) > 0 || len(schemaGrants) > 0 || len(revokes) > 0 {
+				var sections []string
+				if r := dump.RenderSchemaGrants(schemaGrants); r != "" {
+					sections = append(sections, r)
+				}
+				if r := dump.RenderPublicRevokes(revokes); r != "" {
+					sections = append(sections, r)
+				}
+				if len(allGrants) > 0 {
+					sections = append(sections, dump.RenderGrants(allGrants, schema))
+				} else {
+					sections = append(sections, fmt.Sprintf("-- Grants for schema %s\n", schema))
 				}
 				if r := dump.RenderRoutineGrants(routineGrants); r != "" {
-					rendered += "\n" + r
+					sections = append(sections, r)
 				}
+				rendered := strings.Join(sections, "\n")
 				filename := "grants_" + schema + ".sql"
 
 				if dumpStdout {

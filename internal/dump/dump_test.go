@@ -414,28 +414,20 @@ func TestDumpGrants(t *testing.T) {
 
 	d := NewDumper(conn)
 
+	// One query now covers both: PUBLIC is grantee OID 0 in the same relacl.
 	grants, err := d.ListGrants(ctx, "public")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(grants) != 1 {
-		t.Errorf("expected 1 role grant, got %d", len(grants))
+	if len(grants) != 2 {
+		t.Errorf("expected the role grant and the PUBLIC grant, got %d: %+v", len(grants), grants)
 	}
 
-	publicGrants, err := d.ListPublicGrants(ctx, "public")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(publicGrants) != 1 {
-		t.Errorf("expected 1 public grant, got %d", len(publicGrants))
-	}
-
-	allGrants := append(grants, publicGrants...)
-	rendered := RenderGrants(allGrants, "public")
-	if !strings.Contains(rendered, `GRANT SELECT ON "public"."docs" TO "reader"`) {
+	rendered := RenderGrants(grants, "public")
+	if !strings.Contains(rendered, `GRANT SELECT ON TABLE "public"."docs" TO "reader"`) {
 		t.Errorf("expected grant to reader in:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, `GRANT SELECT ON "public"."docs" TO PUBLIC`) {
+	if !strings.Contains(rendered, `GRANT SELECT ON TABLE "public"."docs" TO PUBLIC`) {
 		t.Errorf("expected grant to PUBLIC in:\n%s", rendered)
 	}
 }
@@ -579,7 +571,7 @@ func TestDumpGrantsAreSchemaQualified(t *testing.T) {
 	}
 
 	rendered := RenderGrants(grants, "radar")
-	if !strings.Contains(rendered, `ON "radar"."audit_log" TO "viewport_readonly"`) {
+	if !strings.Contains(rendered, `ON TABLE "radar"."audit_log" TO "viewport_readonly"`) {
 		t.Errorf("grant target is not schema-qualified:\n%s", rendered)
 	}
 
@@ -1104,4 +1096,340 @@ func TestDumpQuotesViewAndGrantIdentifiers(t *testing.T) {
 	if !canSelect {
 		t.Errorf("the replayed grant did not restore SELECT for \"Read Only\":\n%s", renderedGrants)
 	}
+}
+
+// renderAllPermissions is what `m8 dump` writes to permissions/grants_{schema}.sql:
+// schema grants, then the PUBLIC revokes, then relation, column, and routine
+// grants.
+func renderAllPermissions(t *testing.T, ctx context.Context, d *Dumper, schema string) string {
+	t.Helper()
+	schemaGrants, err := d.ListSchemaGrants(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grants, err := d.ListGrants(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columnGrants, err := d.ListColumnGrants(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	routineGrants, err := d.ListRoutineGrants(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokes, err := d.ListPublicRevokes(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return RenderSchemaGrants(schemaGrants) + "\n" +
+		RenderPublicRevokes(revokes) + "\n" +
+		RenderGrants(append(grants, columnGrants...), schema) + "\n" +
+		RenderRoutineGrants(routineGrants)
+}
+
+// TestDumpCapturesSchemaUsageGrants pins the grant without which every other
+// grant is inert.
+//
+// pg_namespace.nspacl was never read. CREATE SCHEMA grants USAGE to nobody, so a
+// permissions file full of correct GRANT SELECT statements produces a rebuilt
+// database where the application still cannot see a single table -- which is the
+// exact failure the relacl work was written to prevent, one level up.
+func TestDumpCapturesSchemaUsageGrants(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE ROLE reporting_reader LOGIN;
+		CREATE SCHEMA reporting;
+		CREATE TABLE reporting.metrics (id BIGINT PRIMARY KEY);
+		GRANT USAGE ON SCHEMA reporting TO reporting_reader;
+		GRANT SELECT ON reporting.metrics TO reporting_reader;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	rendered := renderAllPermissions(t, ctx, NewDumper(conn), "reporting")
+
+	// Rebuild: the schema exists with no privileges on it, as CREATE SCHEMA
+	// leaves it.
+	if _, err := conn.Exec(ctx, `
+		REVOKE ALL ON SCHEMA reporting FROM reporting_reader;
+		REVOKE ALL ON reporting.metrics FROM reporting_reader;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, rendered); err != nil {
+		t.Fatalf("rendered permissions failed to replay: %v\n%s", err, rendered)
+	}
+
+	// The end-to-end property: the role can actually read the table. Without
+	// USAGE on the schema this fails with 42501 even though the table grant is
+	// in place.
+	if _, err := conn.Exec(ctx, `SET ROLE reporting_reader`); err != nil {
+		t.Fatal(err)
+	}
+	_, selErr := conn.Exec(ctx, `SELECT 1 FROM reporting.metrics`)
+	if _, err := conn.Exec(ctx, `RESET ROLE`); err != nil {
+		t.Fatal(err)
+	}
+	if selErr != nil {
+		t.Errorf("the role cannot read the table it was granted SELECT on: %v\n%s", selErr, rendered)
+	}
+}
+
+// TestDumpCapturesPublicRevokeOnRoutine pins that the dump records what was
+// taken away, not only what was added.
+//
+// Every function is created with EXECUTE granted to PUBLIC. A GRANT-only dump
+// therefore loses every hardening REVOKE, and the direction of that loss is
+// ESCALATION: a SECURITY DEFINER function that returns secrets becomes callable
+// by every role again on a rebuilt database.
+func TestDumpCapturesPublicRevokeOnRoutine(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE ROLE auth_service;
+		CREATE SCHEMA auth;
+		CREATE FUNCTION auth.user_secret(p_user text) RETURNS text
+			LANGUAGE sql SECURITY DEFINER AS $$ SELECT 'hunter2'::text $$;
+		REVOKE EXECUTE ON FUNCTION auth.user_secret(text) FROM PUBLIC;
+		GRANT EXECUTE ON FUNCTION auth.user_secret(text) TO auth_service;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	rendered := renderAllPermissions(t, ctx, NewDumper(conn), "auth")
+
+	// Rebuild the function from its logic/ file: the fresh object carries
+	// PostgreSQL's default ACL, which grants EXECUTE to PUBLIC.
+	if _, err := conn.Exec(ctx, `
+		DROP FUNCTION auth.user_secret(text);
+		CREATE FUNCTION auth.user_secret(p_user text) RETURNS text
+			LANGUAGE sql SECURITY DEFINER AS $$ SELECT 'hunter2'::text $$;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	var publicBefore bool
+	if err := conn.QueryRow(ctx,
+		`SELECT has_function_privilege('public', 'auth.user_secret(text)', 'EXECUTE')`,
+	).Scan(&publicBefore); err != nil {
+		t.Fatal(err)
+	}
+	if !publicBefore {
+		t.Fatal("premise broken: a freshly created function should be EXECUTE-able by PUBLIC")
+	}
+
+	if _, err := conn.Exec(ctx, rendered); err != nil {
+		t.Fatalf("rendered permissions failed to replay: %v\n%s", err, rendered)
+	}
+
+	var publicAfter, serviceAfter bool
+	if err := conn.QueryRow(ctx, `
+		SELECT has_function_privilege('public', 'auth.user_secret(text)', 'EXECUTE'),
+		       has_function_privilege('auth_service', 'auth.user_secret(text)', 'EXECUTE')
+	`).Scan(&publicAfter, &serviceAfter); err != nil {
+		t.Fatal(err)
+	}
+	if publicAfter {
+		t.Errorf("PUBLIC can execute a SECURITY DEFINER function the live database revoked it from:\n%s", rendered)
+	}
+	if !serviceAfter {
+		t.Errorf("the explicit grant to auth_service was lost:\n%s", rendered)
+	}
+}
+
+// Column-level privileges live in pg_attribute.attacl and leave no trace in
+// pg_class.relacl, so a role granted SELECT on three columns had no
+// relation-level entry at all and vanished from the dump entirely.
+func TestDumpCapturesColumnGrants(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE ROLE analyst;
+		CREATE TABLE public.people (id BIGINT PRIMARY KEY, name TEXT, ssn TEXT);
+		GRANT SELECT (id, name) ON public.people TO analyst;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	rendered := renderAllPermissions(t, ctx, NewDumper(conn), "public")
+
+	if _, err := conn.Exec(ctx, `REVOKE ALL (id, name, ssn) ON public.people FROM analyst`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, rendered); err != nil {
+		t.Fatalf("rendered permissions failed to replay: %v\n%s", err, rendered)
+	}
+
+	var id, name, ssn bool
+	if err := conn.QueryRow(ctx, `
+		SELECT has_column_privilege('analyst', 'public.people', 'id',   'SELECT'),
+		       has_column_privilege('analyst', 'public.people', 'name', 'SELECT'),
+		       has_column_privilege('analyst', 'public.people', 'ssn',  'SELECT')
+	`).Scan(&id, &name, &ssn); err != nil {
+		t.Fatal(err)
+	}
+	if !id || !name {
+		t.Errorf("column grants were lost (id=%v name=%v):\n%s", id, name, rendered)
+	}
+	if ssn {
+		t.Errorf("the replay widened the grant to a column that never had it:\n%s", rendered)
+	}
+}
+
+// A sequence carries its own privileges, and relkind 'S' was excluded. Without
+// USAGE on the sequence behind a SERIAL column, every INSERT by the application
+// role fails on a rebuilt database even though the table grant is intact.
+func TestDumpCapturesSequenceGrants(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE ROLE writer;
+		CREATE TABLE public.events (id BIGSERIAL PRIMARY KEY, note TEXT);
+		GRANT INSERT ON public.events TO writer;
+		GRANT USAGE ON SEQUENCE public.events_id_seq TO writer;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	rendered := renderAllPermissions(t, ctx, NewDumper(conn), "public")
+
+	if _, err := conn.Exec(ctx, `
+		REVOKE ALL ON public.events FROM writer;
+		REVOKE ALL ON SEQUENCE public.events_id_seq FROM writer;
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, rendered); err != nil {
+		t.Fatalf("rendered permissions failed to replay: %v\n%s", err, rendered)
+	}
+
+	var usage bool
+	if err := conn.QueryRow(ctx,
+		`SELECT has_sequence_privilege('writer', 'public.events_id_seq', 'USAGE')`,
+	).Scan(&usage); err != nil {
+		t.Fatal(err)
+	}
+	if !usage {
+		t.Errorf("the sequence grant was lost, so the role cannot INSERT:\n%s", rendered)
+	}
+}
+
+// WITH GRANT OPTION is a separate bit in the ACL. Dropping it turns a role that
+// could delegate access into one that cannot, and every downstream grant that
+// depended on the delegation fails the next time it is needed.
+func TestDumpCapturesGrantOption(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE ROLE broker;
+		CREATE TABLE public.ledger (id BIGINT PRIMARY KEY);
+		GRANT SELECT ON public.ledger TO broker WITH GRANT OPTION;
+		GRANT INSERT ON public.ledger TO broker;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	rendered := renderAllPermissions(t, ctx, NewDumper(conn), "public")
+
+	if _, err := conn.Exec(ctx, `REVOKE ALL ON public.ledger FROM broker`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, rendered); err != nil {
+		t.Fatalf("rendered permissions failed to replay: %v\n%s", err, rendered)
+	}
+
+	var selectGrantable, insertGrantable bool
+	if err := conn.QueryRow(ctx, `
+		SELECT
+			EXISTS (SELECT 1 FROM aclexplode((SELECT relacl FROM pg_class WHERE oid = 'public.ledger'::regclass)) a
+			        WHERE pg_get_userbyid(a.grantee) = 'broker' AND a.privilege_type = 'SELECT' AND a.is_grantable),
+			EXISTS (SELECT 1 FROM aclexplode((SELECT relacl FROM pg_class WHERE oid = 'public.ledger'::regclass)) a
+			        WHERE pg_get_userbyid(a.grantee) = 'broker' AND a.privilege_type = 'INSERT' AND a.is_grantable)
+	`).Scan(&selectGrantable, &insertGrantable); err != nil {
+		t.Fatal(err)
+	}
+	if !selectGrantable {
+		t.Errorf("WITH GRANT OPTION was lost on SELECT:\n%s", rendered)
+	}
+	if insertGrantable {
+		t.Errorf("WITH GRANT OPTION was widened to INSERT, which never had it:\n%s", rendered)
+	}
+}
+
+// aclexplode yields one row per (grantor, grantee, privilege). The same
+// privilege granted by two grantors is one privilege; without DISTINCT it
+// produced the same GRANT line twice.
+func TestDumpDoesNotDuplicateGrantsFromMultipleGrantors(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE ROLE owner_role;
+		CREATE ROLE middle_role;
+		CREATE ROLE consumer_role;
+		CREATE TABLE public.shared (id BIGINT PRIMARY KEY);
+		ALTER TABLE public.shared OWNER TO owner_role;
+		GRANT owner_role TO CURRENT_USER;
+		SET ROLE owner_role;
+		GRANT SELECT ON public.shared TO middle_role WITH GRANT OPTION;
+		GRANT SELECT ON public.shared TO consumer_role;
+		RESET ROLE;
+		GRANT middle_role TO CURRENT_USER;
+		SET ROLE middle_role;
+		GRANT SELECT ON public.shared TO consumer_role;
+		RESET ROLE;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Premise: two grantors really do produce two ACL entries --
+	// consumer_role=r/owner_role and consumer_role=r/middle_role.
+	var aclRows int
+	if err := conn.QueryRow(ctx, `
+		SELECT count(*) FROM aclexplode((SELECT relacl FROM pg_class WHERE oid = 'public.shared'::regclass)) a
+		WHERE pg_get_userbyid(a.grantee) = 'consumer_role' AND a.privilege_type = 'SELECT'
+	`).Scan(&aclRows); err != nil {
+		t.Fatal(err)
+	}
+	if aclRows < 2 {
+		t.Skipf("this server collapsed the two grantors into %d ACL entries", aclRows)
+	}
+
+	grants := mustListGrants(t, ctx, NewDumper(conn), "public")
+	rendered := RenderGrants(grants, "public")
+
+	// The duplicate lands inside one statement -- "GRANT SELECT, SELECT ON ..." --
+	// because the render groups by grantee and target.
+	if strings.Contains(rendered, "SELECT, SELECT") {
+		t.Errorf("the same privilege from two grantors was emitted twice:\n%s", rendered)
+	}
+	if want := "GRANT SELECT ON TABLE \"public\".\"shared\" TO \"consumer_role\";"; !strings.Contains(rendered, want) {
+		t.Errorf("expected exactly %q in:\n%s", want, rendered)
+	}
+	// While we are here: middle_role's SELECT is grantable and must say so.
+	if want := "TO \"middle_role\" WITH GRANT OPTION;"; !strings.Contains(rendered, want) {
+		t.Errorf("expected %q in:\n%s", want, rendered)
+	}
+}
+
+func mustListGrants(t *testing.T, ctx context.Context, d *Dumper, schema string) []Grant {
+	t.Helper()
+	g, err := d.ListGrants(ctx, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g
 }
