@@ -20,6 +20,12 @@ import (
 // Advisory lock ID: first 8 bytes of SHA-256("m8_migration_lock")
 const lockID int64 = 5739048866534836184
 
+// resetTimeout bounds the RESET that clears a schema statement's timeouts. It
+// runs in a defer on a context detached from the caller's, so without a deadline
+// of its own an unresponsive server would hang the command after the statement
+// has already finished.
+const resetTimeout = 10 * time.Second
+
 // errDifferUnavailable is returned when schema (S__) migrations exist but the
 // schema differ could not be constructed. We refuse to silently skip schema
 // changes — a no-op that exits 0 is far more dangerous than a hard failure.
@@ -512,6 +518,13 @@ func (e *Engine) applyOps(ctx context.Context, migrations []*migration.Migration
 	return results, nil
 }
 
+// plannedSchema is one schema folder's diff, computed but not yet applied.
+type plannedSchema struct {
+	pgSchema   string
+	migrations []*migration.Migration
+	diff       *schema.DiffResult
+}
+
 func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migration) ([]SchemaResult, error) {
 	if e.differ == nil {
 		if len(migrations) > 0 {
@@ -520,11 +533,29 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 		return nil, nil
 	}
 
+	// Group by PG schema and diff combined DDL (FK references across files need
+	// this). Sorted, because Go map iteration is randomised and two runs of the
+	// same apply should not touch the schemas in different orders.
+	grouped := groupByPGSchema(migrations)
+	pgSchemas := make([]string, 0, len(grouped))
+	for pgSchema := range grouped {
+		pgSchemas = append(pgSchemas, pgSchema)
+	}
+	sort.Strings(pgSchemas)
+
 	var results []SchemaResult
 
-	// Group by PG schema and diff combined DDL (FK references across files need this)
-	grouped := groupByPGSchema(migrations)
-	for pgSchema, pgMigrations := range grouped {
+	// Pass 1: diff EVERY folder before applying any of them.
+	//
+	// A refusal has to be a refusal for the whole run. Deciding per folder,
+	// inside the apply loop, means folder B can be refused after folder A's
+	// statements have already landed -- which is not a refusal, it is a partial
+	// apply with an error on the end. The same goes for a folder whose diff
+	// cannot be computed at all.
+	var planned []plannedSchema
+	for _, pgSchema := range pgSchemas {
+		pgMigrations := grouped[pgSchema]
+
 		var combinedDDL []string
 		if pgSchema != "public" {
 			combinedDDL = append(combinedDDL, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s;", pgident.Quote(pgSchema)))
@@ -538,50 +569,34 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 			// Attribute once, for the same reason as in Plan: the diff covers
 			// the whole schema folder, so repeating the error per file names
 			// dozens of innocent ones.
-			for i, m := range pgMigrations {
-				sr := SchemaResult{Migration: m}
-				if i == 0 {
-					sr.Error = err
-				} else {
-					sr.Skipped = true
-				}
-				results = append(results, sr)
-			}
+			results = append(results, attributeSchemaError(pgMigrations, err, nil)...)
 			return results, fmt.Errorf("schema diff failed for %s: %w", pgSchema, err)
 		}
 		diffResult.Name = pgSchema
 
-		// Refuse BEFORE the first statement runs. The diff itself is fine; what
-		// is missing is the check that its statements execute and converge, and
-		// finding that out halfway through a production primary is the outcome
-		// this exists to prevent.
 		if diffResult.ValidationSkipped && e.config.FailOnUnvalidated {
 			refusal := fmt.Errorf(
 				"plan for schema %s was not validated (%s); refusing to apply it "+
 					"(--fail-on-unvalidated / require_shadow is set -- configure a shadow instance "+
 					"with --shadow-url / SHADOW_DATABASE_URL so the plan can be checked)",
 				pgSchema, firstLine(diffResult.ValidationSkippedReason))
-			for i, m := range pgMigrations {
-				sr := SchemaResult{Migration: m}
-				if i == 0 {
-					sr.Error = refusal
-					sr.Diff = diffResult
-				} else {
-					sr.Skipped = true
-				}
-				results = append(results, sr)
-			}
+			results = append(results, attributeSchemaError(pgMigrations, refusal, diffResult)...)
 			return results, refusal
 		}
 
-		if !diffResult.HasChanges {
+		planned = append(planned, plannedSchema{pgSchema: pgSchema, migrations: pgMigrations, diff: diffResult})
+	}
+
+	// Pass 2: apply.
+	for _, p := range planned {
+		if !p.diff.HasChanges {
 			// Attach the diff even though there is nothing to do: "clean" and
 			// "clean, and we could not verify it" are different answers, and the
 			// second one has to survive as far as the output formatter.
-			for i, m := range pgMigrations {
+			for i, m := range p.migrations {
 				sr := SchemaResult{Migration: m, Skipped: true}
 				if i == 0 {
-					sr.Diff = diffResult
+					sr.Diff = p.diff
 				}
 				results = append(results, sr)
 			}
@@ -590,33 +605,52 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 
 		// Apply the combined diff and record against each migration file
 		start := time.Now()
-		for i, stmt := range diffResult.Statements {
+		for i, stmt := range p.diff.Statements {
 			if err := e.execSchemaStatement(ctx, stmt); err != nil {
 				execMs := time.Since(start).Milliseconds()
 				errMsg := fmt.Errorf("statement %d failed: %w\nDDL: %s", i+1, err, stmt.DDL)
-				for _, m := range pgMigrations {
-					ps := pgSchema
+				for _, m := range p.migrations {
+					ps := p.pgSchema
 					_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), &ps, m.Checksum, execMs, false)
 					results = append(results, SchemaResult{Migration: m, ExecMs: execMs, Error: errMsg})
 				}
-				return results, fmt.Errorf("schema migration for %s failed: %w", pgSchema, errMsg)
+				return results, fmt.Errorf("schema migration for %s failed: %w", p.pgSchema, errMsg)
 			}
 		}
 		execMs := time.Since(start).Milliseconds()
 
 		// Record success for all migrations in this PG schema group
-		for i, m := range pgMigrations {
-			ps := pgSchema
+		for i, m := range p.migrations {
+			ps := p.pgSchema
 			_ = e.store.RecordApplied(ctx, nil, m.Name, m.Type.String(), &ps, m.Checksum, execMs, true)
 			sr := SchemaResult{Migration: m, ExecMs: execMs, Applied: true}
 			if i == 0 {
-				sr.Diff = diffResult
+				sr.Diff = p.diff
 			}
 			results = append(results, sr)
 		}
-		e.logger.Info("applied", "pg_schema", pgSchema, "type", "schema", "ms", execMs, "statements", len(diffResult.Statements))
+		e.logger.Info("applied", "pg_schema", p.pgSchema, "type", "schema", "ms", execMs, "statements", len(p.diff.Statements))
 	}
 	return results, nil
+}
+
+// attributeSchemaError records a whole-folder failure against the first file in
+// the folder and marks the rest skipped. One diff covers the whole folder, so
+// repeating the error per file names dozens of innocent ones and buries the real
+// problem.
+func attributeSchemaError(migrations []*migration.Migration, err error, diff *schema.DiffResult) []SchemaResult {
+	out := make([]SchemaResult, 0, len(migrations))
+	for i, m := range migrations {
+		sr := SchemaResult{Migration: m}
+		if i == 0 {
+			sr.Error = err
+			sr.Diff = diff
+		} else {
+			sr.Skipped = true
+		}
+		out = append(out, sr)
+	}
+	return out
 }
 
 // execSchemaStatement runs one generated DDL statement with pg-schema-diff's
@@ -650,7 +684,14 @@ func (e *Engine) execSchemaStatement(ctx context.Context, stmt schema.DiffStatem
 	}
 
 	reset := func(setting string) {
-		if _, err := e.conn.Exec(context.WithoutCancel(ctx), "RESET "+setting); err != nil {
+		// Detached from the caller's context so a cancelled or failed statement
+		// still cleans up -- but with a deadline of its own, because
+		// context.WithoutCancel drops the caller's deadline along with its
+		// cancellation, and a RESET against an unresponsive server would then
+		// block forever in a defer.
+		resetCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), resetTimeout)
+		defer cancel()
+		if _, err := e.conn.Exec(resetCtx, "RESET "+setting); err != nil {
 			e.logger.Warn("failed to reset session setting after a schema statement",
 				"setting", setting, "error", err)
 		}

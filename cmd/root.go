@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -182,6 +183,9 @@ func resolveSettings() (*settings, error) {
 // means "keep pg-schema-diff's derived timeout", which is not what someone who
 // wrote lock_timeout into the file was asking for.
 func resolveDuration(key string, flag time.Duration, configured string) (time.Duration, error) {
+	if flag < 0 {
+		return 0, fmt.Errorf("--%s must not be negative, got %s", strings.ReplaceAll(key, "_", "-"), flag)
+	}
 	if flag > 0 {
 		return flag, nil
 	}

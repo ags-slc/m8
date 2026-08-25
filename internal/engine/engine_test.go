@@ -2132,3 +2132,69 @@ CREATE TRIGGER t_new_trg BEFORE UPDATE ON public.t FOR EACH ROW EXECUTE FUNCTION
 		t.Error("a folder that declares triggers must still reconcile the ones it omits")
 	}
 }
+
+// TestApplyRefusesBeforeAnyFolderIsApplied pins that a refusal is a refusal for
+// the whole run.
+//
+// The check used to sit inside the loop that applies each schema/ folder, so a
+// folder refused late was refused AFTER an earlier folder's statements had
+// already landed -- a partial apply with an error on the end, which is the
+// outcome --fail-on-unvalidated exists to prevent. Here "alpha" is clean and
+// sorts first; "omega" cannot be validated.
+func TestApplyRefusesBeforeAnyFolderIsApplied(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE SCHEMA elsewhere;
+		CREATE TABLE elsewhere.source_rows (id BIGINT PRIMARY KEY, label TEXT);
+		CREATE SCHEMA alpha;
+		CREATE TABLE alpha.thing (id BIGINT PRIMARY KEY);
+		CREATE SCHEMA omega;
+		CREATE TABLE omega.thing (id BIGINT PRIMARY KEY);
+		-- Reaches outside its own schema, so the plan for omega cannot be
+		-- validated against a single-schema rebuild.
+		CREATE VIEW omega.reaching_out AS SELECT id, label FROM elsewhere.source_rows;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := setupMigrationsDir(t)
+	for _, pgSchema := range []string{"alpha", "omega"} {
+		mustMkdirAll(t, filepath.Join(dir, "schema", pgSchema), 0755)
+		mustWriteFile(t, filepath.Join(dir, "schema", pgSchema, "thing.sql"),
+			[]byte("CREATE TABLE "+pgSchema+".thing (id BIGINT PRIMARY KEY, note TEXT);"), 0644)
+	}
+
+	differ, err := schema.NewDiffer(ctx, connStr, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = differ.Close() }()
+
+	eng := New(conn, sqlDB, differ, &Config{
+		MigrationsDir:     dir,
+		ConnStr:           connStr,
+		FailOnUnvalidated: true,
+	}, slog.Default())
+
+	if _, err := eng.Apply(ctx); err == nil {
+		t.Fatal("apply ran an unvalidated plan even though it was configured to refuse")
+	}
+
+	for _, pgSchema := range []string{"alpha", "omega"} {
+		var hasNote bool
+		if err := conn.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = $1 AND table_name = 'thing' AND column_name = 'note'
+			)`, pgSchema).Scan(&hasNote); err != nil {
+			t.Fatal(err)
+		}
+		if hasNote {
+			t.Errorf("schema %q was applied before the run was refused", pgSchema)
+		}
+	}
+}

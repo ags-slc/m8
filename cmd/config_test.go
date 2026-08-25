@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // inRepoDir writes a .m8.yaml (when body is non-empty) into a temp directory and
@@ -152,5 +153,51 @@ func TestFailOnUnvalidatedIsIndependentlySettable(t *testing.T) {
 	}
 	if st.RequireShadow {
 		t.Error("fail_on_unvalidated must not imply require_shadow")
+	}
+}
+
+// A negative --lock-timeout used to be silently ignored (the flag was only
+// consulted when > 0), so a typo produced pg-schema-diff's derived value with no
+// hint that the override had not taken. The config-file path already rejected
+// negatives.
+func TestNegativeTimeoutFlagIsRejected(t *testing.T) {
+	inRepoDir(t, "")
+
+	flagLockTimeout = -5 * time.Second
+	t.Cleanup(func() { flagLockTimeout = 0 })
+
+	if _, err := resolveSettings(); err == nil {
+		t.Fatal("expected a negative --lock-timeout to be rejected")
+	} else if !strings.Contains(err.Error(), "lock-timeout") {
+		t.Errorf("error does not name the flag: %v", err)
+	}
+}
+
+// A duration in .m8.yaml that does not parse is an error too: zero means "keep
+// pg-schema-diff's derived timeout", which is not what someone who wrote
+// statement_timeout into the file was asking for.
+func TestUnparseableTimeoutInConfigIsRejected(t *testing.T) {
+	inRepoDir(t, "statement_timeout: 10min\n")
+
+	if _, err := resolveSettings(); err == nil {
+		t.Fatal("expected an unparseable statement_timeout to be rejected")
+	} else if !strings.Contains(err.Error(), "statement_timeout") {
+		t.Errorf("error does not name the setting: %v", err)
+	}
+}
+
+// And a valid one reaches the engine.
+func TestTimeoutOverridesResolve(t *testing.T) {
+	inRepoDir(t, "lock_timeout: 10s\nstatement_timeout: 5m\n")
+
+	st, err := resolveSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.LockTimeout != 10*time.Second {
+		t.Errorf("lock_timeout = %s, want 10s", st.LockTimeout)
+	}
+	if st.StatementTimeout != 5*time.Minute {
+		t.Errorf("statement_timeout = %s, want 5m", st.StatementTimeout)
 	}
 }
