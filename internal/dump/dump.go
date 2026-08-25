@@ -22,11 +22,11 @@ type Table struct {
 
 // Column represents a table column.
 type Column struct {
-	Name       string
-	DataType   string
-	Nullable   bool
-	Default    *string
-	IsIdentity bool
+	Name         string
+	DataType     string
+	Nullable     bool
+	Default      *string
+	IsIdentity   bool
 	IdentityKind string // "ALWAYS" or "BY DEFAULT"
 }
 
@@ -185,10 +185,11 @@ func (d *Dumper) loadColumns(ctx context.Context, t *Table) error {
 			return err
 		}
 		col.Default = defaultVal
-		if identity == "a" {
+		switch identity {
+		case "a":
 			col.IsIdentity = true
 			col.IdentityKind = "ALWAYS"
-		} else if identity == "d" {
+		case "d":
 			col.IsIdentity = true
 			col.IdentityKind = "BY DEFAULT"
 		}
@@ -197,9 +198,10 @@ func (d *Dumper) loadColumns(ctx context.Context, t *Table) error {
 			// Check if the type is integer/bigint — if so, this is a SERIAL
 			if col.DataType == "integer" || col.DataType == "bigint" || col.DataType == "smallint" {
 				serialType := "SERIAL"
-				if col.DataType == "bigint" {
+				switch col.DataType {
+				case "bigint":
 					serialType = "BIGSERIAL"
-				} else if col.DataType == "smallint" {
+				case "smallint":
 					serialType = "SMALLSERIAL"
 				}
 				col.DataType = serialType

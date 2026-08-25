@@ -11,10 +11,10 @@ import (
 func TestFolderOps(t *testing.T) {
 	dir := t.TempDir()
 	opsDir := filepath.Join(dir, "ops")
-	os.Mkdir(opsDir, 0755)
-	os.WriteFile(filepath.Join(opsDir, "20260411_001__create_ext.sql"), []byte("CREATE EXTENSION pg_trgm;"), 0644)
-	os.WriteFile(filepath.Join(opsDir, "20260411_002__create_hypertable.sql"), []byte("SELECT create_hypertable('t','ts');"), 0644)
-	os.WriteFile(filepath.Join(opsDir, "bad_name.sql"), []byte("skip me"), 0644) // no timestamp
+	mustMkdir(t, opsDir, 0755)
+	mustWriteFile(t, filepath.Join(opsDir, "20260411_001__create_ext.sql"), []byte("CREATE EXTENSION pg_trgm;"), 0644)
+	mustWriteFile(t, filepath.Join(opsDir, "20260411_002__create_hypertable.sql"), []byte("SELECT create_hypertable('t','ts');"), 0644)
+	mustWriteFile(t, filepath.Join(opsDir, "bad_name.sql"), []byte("skip me"), 0644) // no timestamp
 
 	migrations, err := Discover(dir)
 	if err != nil {
@@ -36,12 +36,12 @@ func TestFolderOps(t *testing.T) {
 
 func TestFolderSchemaWithPGSchemas(t *testing.T) {
 	dir := t.TempDir()
-	os.MkdirAll(filepath.Join(dir, "schema", "public"), 0755)
-	os.MkdirAll(filepath.Join(dir, "schema", "materialized"), 0755)
+	mustMkdirAll(t, filepath.Join(dir, "schema", "public"), 0755)
+	mustMkdirAll(t, filepath.Join(dir, "schema", "materialized"), 0755)
 
-	os.WriteFile(filepath.Join(dir, "schema", "public", "users.sql"), []byte("CREATE TABLE users (id INT);"), 0644)
-	os.WriteFile(filepath.Join(dir, "schema", "public", "orders.sql"), []byte("CREATE TABLE orders (id INT);"), 0644)
-	os.WriteFile(filepath.Join(dir, "schema", "materialized", "rpt_invoice.sql"), []byte("CREATE TABLE rpt_invoice (id INT);"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "users.sql"), []byte("CREATE TABLE users (id INT);"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "orders.sql"), []byte("CREATE TABLE orders (id INT);"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "schema", "materialized", "rpt_invoice.sql"), []byte("CREATE TABLE rpt_invoice (id INT);"), 0644)
 
 	migrations, err := Discover(dir)
 	if err != nil {
@@ -74,9 +74,9 @@ func TestFolderSchemaWithPGSchemas(t *testing.T) {
 func TestFolderLogic(t *testing.T) {
 	dir := t.TempDir()
 	logicDir := filepath.Join(dir, "logic")
-	os.Mkdir(logicDir, 0755)
-	os.WriteFile(filepath.Join(logicDir, "proc_refresh.sql"), []byte("CREATE OR REPLACE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END; $$;"), 0644)
-	os.WriteFile(filepath.Join(logicDir, "view_summary.sql"), []byte("CREATE OR REPLACE VIEW v AS SELECT 1;"), 0644)
+	mustMkdir(t, logicDir, 0755)
+	mustWriteFile(t, filepath.Join(logicDir, "proc_refresh.sql"), []byte("CREATE OR REPLACE PROCEDURE p() LANGUAGE plpgsql AS $$ BEGIN END; $$;"), 0644)
+	mustWriteFile(t, filepath.Join(logicDir, "view_summary.sql"), []byte("CREATE OR REPLACE VIEW v AS SELECT 1;"), 0644)
 
 	migrations, err := Discover(dir)
 	if err != nil {
@@ -96,9 +96,9 @@ func TestFolderLogic(t *testing.T) {
 func TestFolderPermissions(t *testing.T) {
 	dir := t.TempDir()
 	permDir := filepath.Join(dir, "permissions")
-	os.Mkdir(permDir, 0755)
-	os.WriteFile(filepath.Join(permDir, "grants_public.sql"), []byte("GRANT SELECT ON t TO PUBLIC;"), 0644)
-	os.WriteFile(filepath.Join(permDir, "roles.sql"), []byte("-- role definitions"), 0644)
+	mustMkdir(t, permDir, 0755)
+	mustWriteFile(t, filepath.Join(permDir, "grants_public.sql"), []byte("GRANT SELECT ON t TO PUBLIC;"), 0644)
+	mustWriteFile(t, filepath.Join(permDir, "roles.sql"), []byte("-- role definitions"), 0644)
 
 	migrations, err := Discover(dir)
 	if err != nil {
@@ -114,15 +114,15 @@ func TestFolderPermissions(t *testing.T) {
 
 func TestFolderMixedAllTypes(t *testing.T) {
 	dir := t.TempDir()
-	os.Mkdir(filepath.Join(dir, "ops"), 0755)
-	os.MkdirAll(filepath.Join(dir, "schema", "public"), 0755)
-	os.Mkdir(filepath.Join(dir, "logic"), 0755)
-	os.Mkdir(filepath.Join(dir, "permissions"), 0755)
+	mustMkdir(t, filepath.Join(dir, "ops"), 0755)
+	mustMkdirAll(t, filepath.Join(dir, "schema", "public"), 0755)
+	mustMkdir(t, filepath.Join(dir, "logic"), 0755)
+	mustMkdir(t, filepath.Join(dir, "permissions"), 0755)
 
-	os.WriteFile(filepath.Join(dir, "ops", "20260411_001__ext.sql"), []byte("SELECT 1;"), 0644)
-	os.WriteFile(filepath.Join(dir, "schema", "public", "users.sql"), []byte("CREATE TABLE users (id INT);"), 0644)
-	os.WriteFile(filepath.Join(dir, "logic", "proc.sql"), []byte("SELECT 1;"), 0644)
-	os.WriteFile(filepath.Join(dir, "permissions", "grants.sql"), []byte("GRANT SELECT ON t TO r;"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260411_001__ext.sql"), []byte("SELECT 1;"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "users.sql"), []byte("CREATE TABLE users (id INT);"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "logic", "proc.sql"), []byte("SELECT 1;"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "permissions", "grants.sql"), []byte("GRANT SELECT ON t TO r;"), 0644)
 
 	migrations, err := Discover(dir)
 	if err != nil {
@@ -144,8 +144,8 @@ func TestFolderMixedAllTypes(t *testing.T) {
 func TestFolderMissingSubdirs(t *testing.T) {
 	dir := t.TempDir()
 	// Only create schema/ — others don't exist
-	os.MkdirAll(filepath.Join(dir, "schema", "public"), 0755)
-	os.WriteFile(filepath.Join(dir, "schema", "public", "users.sql"), []byte("CREATE TABLE users (id INT);"), 0644)
+	mustMkdirAll(t, filepath.Join(dir, "schema", "public"), 0755)
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "users.sql"), []byte("CREATE TABLE users (id INT);"), 0644)
 
 	migrations, err := Discover(dir)
 	if err != nil {
@@ -158,10 +158,10 @@ func TestFolderMissingSubdirs(t *testing.T) {
 
 func TestFolderSchemaSkipsFilesAtRoot(t *testing.T) {
 	dir := t.TempDir()
-	os.MkdirAll(filepath.Join(dir, "schema", "public"), 0755)
+	mustMkdirAll(t, filepath.Join(dir, "schema", "public"), 0755)
 	// File at schema/ root (no PG schema subfolder) should be skipped
-	os.WriteFile(filepath.Join(dir, "schema", "stray.sql"), []byte("SELECT 1;"), 0644)
-	os.WriteFile(filepath.Join(dir, "schema", "public", "users.sql"), []byte("CREATE TABLE users (id INT);"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "schema", "stray.sql"), []byte("SELECT 1;"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "users.sql"), []byte("CREATE TABLE users (id INT);"), 0644)
 
 	migrations, err := Discover(dir)
 	if err != nil {
@@ -186,7 +186,7 @@ func TestLegacyFlatLayout(t *testing.T) {
 		"not_a_migration.txt":       "ignore me",
 	}
 	for name, content := range files {
-		os.WriteFile(filepath.Join(dir, name), []byte(content), 0644)
+		mustWriteFile(t, filepath.Join(dir, name), []byte(content), 0644)
 	}
 
 	migrations, err := Discover(dir)
@@ -278,5 +278,29 @@ func TestTypeString(t *testing.T) {
 		if got := tt.typ.String(); got != tt.want {
 			t.Errorf("Type(%d).String() = %q, want %q", tt.typ, got, tt.want)
 		}
+	}
+}
+
+// mustWriteFile writes a test fixture, failing the test if it cannot.
+func mustWriteFile(t *testing.T, path string, data []byte, perm os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, data, perm); err != nil {
+		t.Fatalf("writing %s: %v", path, err)
+	}
+}
+
+// mustMkdir creates a directory, failing the test if it cannot.
+func mustMkdir(t *testing.T, path string, perm os.FileMode) {
+	t.Helper()
+	if err := os.Mkdir(path, perm); err != nil {
+		t.Fatalf("creating %s: %v", path, err)
+	}
+}
+
+// mustMkdirAll creates a directory tree, failing the test if it cannot.
+func mustMkdirAll(t *testing.T, path string, perm os.FileMode) {
+	t.Helper()
+	if err := os.MkdirAll(path, perm); err != nil {
+		t.Fatalf("creating %s: %v", path, err)
 	}
 }

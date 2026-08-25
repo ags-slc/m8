@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -118,7 +119,12 @@ func resolveConnStr() string {
 	port := flagPort
 	if port == 0 {
 		if p := os.Getenv("PGPORT"); p != "" {
-			fmt.Sscanf(p, "%d", &port)
+			parsed, err := strconv.Atoi(p)
+			if err != nil || parsed <= 0 {
+				slog.Warn("ignoring unparseable PGPORT", "value", p)
+			} else {
+				port = parsed
+			}
 		}
 		if port == 0 && cfg.Port > 0 {
 			port = cfg.Port
