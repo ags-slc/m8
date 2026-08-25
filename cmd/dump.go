@@ -53,6 +53,15 @@ Examples:
 
 		var totalTables, totalLogic, totalPerms int
 
+		// Logic objects are collected across every schema and named in one
+		// pass at the end: overloaded functions share a name, so filenames can
+		// only be made collision-free once the whole set is known.
+		type logicEntry struct {
+			object   dump.LogicObject
+			rendered string
+		}
+		var logicEntries []logicEntry
+
 		for _, schema := range schemas {
 			// --- Tables → schema/{pg_schema}/*.sql ---
 			tables, err := d.ListTables(ctx, schema)
@@ -85,21 +94,10 @@ Examples:
 			}
 
 			for _, f := range funcs {
-				rendered := dump.RenderFunction(&f)
-				filename := f.Name + ".sql"
-				// Prefix with schema if not public to avoid collisions
-				if schema != "public" {
-					filename = schema + "_" + f.Name + ".sql"
-				}
-
-				if dumpStdout {
-					fmt.Printf("-- logic/%s\n%s\n", filename, rendered)
-				} else {
-					if err := writeFile(filepath.Join(flagMigrationsDir, "logic"), filename, rendered); err != nil {
-						return err
-					}
-				}
-				totalLogic++
+				logicEntries = append(logicEntries, logicEntry{
+					object:   dump.LogicObject{Schema: schema, Name: f.Name, Identity: f.Identity},
+					rendered: dump.RenderFunction(&f),
+				})
 			}
 
 			// --- Views → logic/*.sql ---
@@ -109,20 +107,10 @@ Examples:
 			}
 
 			for _, v := range views {
-				rendered := dump.RenderView(&v)
-				filename := v.Name + ".sql"
-				if schema != "public" {
-					filename = schema + "_" + v.Name + ".sql"
-				}
-
-				if dumpStdout {
-					fmt.Printf("-- logic/%s\n%s\n", filename, rendered)
-				} else {
-					if err := writeFile(filepath.Join(flagMigrationsDir, "logic"), filename, rendered); err != nil {
-						return err
-					}
-				}
-				totalLogic++
+				logicEntries = append(logicEntries, logicEntry{
+					object:   dump.LogicObject{Schema: schema, Name: v.Name},
+					rendered: dump.RenderView(&v),
+				})
 			}
 
 			// --- Grants → permissions/grants_{schema}.sql ---
@@ -149,6 +137,23 @@ Examples:
 				}
 				totalPerms++
 			}
+		}
+
+		objects := make([]dump.LogicObject, 0, len(logicEntries))
+		for _, e := range logicEntries {
+			objects = append(objects, e.object)
+		}
+		logicNames := dump.ResolveLogicFileNames(objects)
+		for _, e := range logicEntries {
+			filename := logicNames[e.object]
+			if dumpStdout {
+				fmt.Printf("-- logic/%s\n%s\n", filename, e.rendered)
+			} else {
+				if err := writeFile(filepath.Join(flagMigrationsDir, "logic"), filename, e.rendered); err != nil {
+					return err
+				}
+			}
+			totalLogic++
 		}
 
 		if !dumpStdout {
