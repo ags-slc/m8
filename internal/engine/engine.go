@@ -797,6 +797,10 @@ func FormatPlanOutput(result *ApplyResult) string {
 			pending++
 		} else if !s.Skipped && s.Diff != nil {
 			fmt.Fprintf(&b, "  ~ %s (schema)\n", s.Migration.Filename)
+			if s.Diff.ValidationSkipped {
+				fmt.Fprintf(&b, "    ⚠ PLAN_NOT_VALIDATED — the current schema could not be rebuilt in isolation\n")
+				fmt.Fprintf(&b, "      (%s)\n", firstLine(s.Diff.ValidationSkippedReason))
+			}
 			for _, stmt := range s.Diff.Statements {
 				fmt.Fprintf(&b, "    %s\n", strings.TrimSpace(stmt.DDL))
 				for _, h := range stmt.Hazards {
@@ -920,4 +924,13 @@ func FormatStatusOutput(result *StatusResult) string {
 	}
 
 	return b.String()
+}
+
+// firstLine trims a multi-line error to its first line, so a plan stays
+// readable when the underlying message embeds a whole view definition.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return strings.TrimSpace(s[:i]) + " ..."
+	}
+	return strings.TrimSpace(s)
 }

@@ -1303,3 +1303,82 @@ func TestPlanOnVirginDatabaseIsReadOnly(t *testing.T) {
 		t.Error("plan created the helper function")
 	}
 }
+
+// TestSchemaDiffDegradesWhenPlanCannotBeValidated pins the fallback for a
+// cross-schema dependency. pg-schema-diff validates a plan by rebuilding the
+// *current* schema in a throwaway database and replaying the generated
+// statements against it. Because the diff is scoped to one schema — which is
+// what makes it correct and affordable — that rebuild cannot resolve an object
+// that reaches outside the schema, e.g. a view over another schema's table.
+// m8 must still produce the diff, flagged as unvalidated, rather than refuse.
+func TestSchemaDiffDegradesWhenPlanCannotBeValidated(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	_, err := conn.Exec(ctx, `
+		CREATE SCHEMA elsewhere;
+		CREATE TABLE elsewhere.source_rows (id BIGINT PRIMARY KEY, label TEXT);
+		CREATE SCHEMA managed;
+		CREATE TABLE managed.thing (id BIGINT PRIMARY KEY);
+		-- A view in the managed schema whose definition reaches outside it.
+		CREATE VIEW managed.reaching_out AS SELECT id, label FROM elsewhere.source_rows;
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir := setupMigrationsDir(t)
+	mustMkdirAll(t, filepath.Join(dir, "schema", "managed"), 0755)
+	mustWriteFile(t, filepath.Join(dir, "schema", "managed", "thing.sql"),
+		[]byte("CREATE TABLE managed.thing (id BIGINT PRIMARY KEY, note TEXT);"), 0644)
+
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+
+	result, err := eng.Plan(ctx)
+	if err != nil {
+		t.Fatalf("plan should degrade, not fail: %v", err)
+	}
+
+	var diff *schema.DiffResult
+	for _, s := range result.Schema {
+		if s.Error != nil {
+			t.Fatalf("plan reported an error instead of degrading: %v", s.Error)
+		}
+		if s.Diff != nil {
+			diff = s.Diff
+		}
+	}
+	if diff == nil {
+		t.Fatal("no diff produced")
+	}
+	if !diff.ValidationSkipped {
+		t.Error("expected the plan to be flagged as unvalidated")
+	}
+	if diff.ValidationSkippedReason == "" {
+		t.Error("expected a reason for skipping validation")
+	}
+
+	// The diff itself must still be correct.
+	sawExpected := false
+	for _, stmt := range diff.Statements {
+		if strings.Contains(strings.ToLower(stmt.DDL), "note") {
+			sawExpected = true
+		}
+		if strings.Contains(strings.ToLower(stmt.DDL), "elsewhere") {
+			t.Errorf("diff reached into the other schema: %s", stmt.DDL)
+		}
+	}
+	if !sawExpected {
+		t.Error("expected the diff to add the declared \"note\" column")
+	}
+
+	// And the warning must reach the operator, not just the struct.
+	if out := FormatPlanOutput(result); !strings.Contains(out, "PLAN_NOT_VALIDATED") {
+		t.Errorf("plan output does not warn that validation was skipped:\n%s", out)
+	}
+}
