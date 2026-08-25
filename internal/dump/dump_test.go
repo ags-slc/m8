@@ -324,8 +324,76 @@ func TestDumpView(t *testing.T) {
 	}
 
 	rendered := RenderView(&views[0])
-	if !strings.Contains(rendered, "CREATE OR REPLACE VIEW active_users") {
-		t.Error("expected CREATE OR REPLACE VIEW in rendered output")
+	if !strings.Contains(rendered, "CREATE OR REPLACE VIEW public.active_users") {
+		t.Errorf("expected schema-qualified CREATE OR REPLACE VIEW, got:\n%s", rendered)
+	}
+}
+
+// A dumped view must be schema-qualified, must not be double-terminated, and
+// must carry its reloptions. Desired state is replayed through a connection
+// pool, so an unqualified name silently lands in public; pg_get_viewdef()
+// already ends in ";" so a second one emits an empty trailing statement; and a
+// dropped security_barrier/security_invoker changes the view's access
+// semantics.
+func TestDumpViewIsQualifiedAndKeepsOptions(t *testing.T) {
+	conn, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+	_, err := conn.Exec(ctx, `
+		CREATE SCHEMA reporting;
+		CREATE TABLE reporting.accounts (id INT, secret TEXT);
+		CREATE VIEW reporting.safe_accounts
+			WITH (security_barrier = true)
+			AS SELECT id FROM reporting.accounts;
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDumper(conn)
+	views, err := d.ListViews(ctx, "reporting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("expected 1 view, got %d", len(views))
+	}
+
+	rendered := RenderView(&views[0])
+
+	if !strings.HasPrefix(rendered, "CREATE OR REPLACE VIEW reporting.safe_accounts") {
+		t.Errorf("view name is not schema-qualified:\n%s", rendered)
+	}
+	if strings.Contains(rendered, ";;") {
+		t.Errorf("view DDL is double-terminated:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "security_barrier=true") &&
+		!strings.Contains(rendered, "security_barrier = true") {
+		t.Errorf("view DDL dropped its reloptions:\n%s", rendered)
+	}
+
+	// The rendered DDL must round-trip into a database that has no reporting
+	// schema on its search_path.
+	if _, err := conn.Exec(ctx, "DROP VIEW reporting.safe_accounts"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "SET search_path TO public"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, rendered); err != nil {
+		t.Fatalf("rendered view DDL failed to replay: %v\n%s", err, rendered)
+	}
+	var nsp string
+	if err := conn.QueryRow(ctx, `
+		SELECT n.nspname FROM pg_class c
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE c.relname = 'safe_accounts' AND c.relkind = 'v'
+	`).Scan(&nsp); err != nil {
+		t.Fatal(err)
+	}
+	if nsp != "reporting" {
+		t.Errorf("replayed view landed in schema %q, want reporting", nsp)
 	}
 }
 

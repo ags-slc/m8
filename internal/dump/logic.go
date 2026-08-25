@@ -19,7 +19,13 @@ type Function struct {
 type View struct {
 	Schema     string
 	Name       string
-	Definition string // the SELECT query
+	Definition string   // the SELECT query
+	Options    []string // reloptions (security_barrier, security_invoker, check_option)
+}
+
+// QualifiedName returns schema.name, matching Table.QualifiedName.
+func (v *View) QualifiedName() string {
+	return v.Schema + "." + v.Name
 }
 
 // ListFunctions returns all user-defined functions and procedures in a schema.
@@ -63,7 +69,7 @@ func (d *Dumper) ListFunctions(ctx context.Context, schema string) ([]Function, 
 // ListViews returns all user-defined views in a schema.
 func (d *Dumper) ListViews(ctx context.Context, schema string) ([]View, error) {
 	rows, err := d.conn.Query(ctx, `
-		SELECT c.relname, pg_get_viewdef(c.oid, true)
+		SELECT c.relname, pg_get_viewdef(c.oid, true), coalesce(c.reloptions, '{}')
 		FROM pg_class c
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1
@@ -83,7 +89,7 @@ func (d *Dumper) ListViews(ctx context.Context, schema string) ([]View, error) {
 	for rows.Next() {
 		var v View
 		v.Schema = schema
-		if err := rows.Scan(&v.Name, &v.Definition); err != nil {
+		if err := rows.Scan(&v.Name, &v.Definition, &v.Options); err != nil {
 			return nil, err
 		}
 		views = append(views, v)
@@ -105,7 +111,23 @@ func RenderFunction(f *Function) string {
 	return def + "\n"
 }
 
-// RenderView generates a CREATE OR REPLACE VIEW statement.
+// RenderView generates a schema-qualified CREATE OR REPLACE VIEW statement.
+//
+// The name MUST be qualified: desired state is replayed over a connection pool,
+// so a session-level SET search_path cannot be relied on and an unqualified view
+// would be created in whatever schema happens to be first on the path (usually
+// public) instead of its own.
+//
+// pg_get_viewdef() already terminates its output with a semicolon, so appending
+// another one produces an empty trailing statement (";;").
 func RenderView(v *View) string {
-	return fmt.Sprintf("CREATE OR REPLACE VIEW %s AS\n%s;\n", v.Name, strings.TrimSpace(v.Definition))
+	def := strings.TrimSpace(v.Definition)
+	def = strings.TrimRight(def, ";")
+
+	var opts string
+	if len(v.Options) > 0 {
+		opts = fmt.Sprintf(" WITH (%s)", strings.Join(v.Options, ", "))
+	}
+
+	return fmt.Sprintf("CREATE OR REPLACE VIEW %s%s AS\n%s;\n", v.QualifiedName(), opts, def)
 }
