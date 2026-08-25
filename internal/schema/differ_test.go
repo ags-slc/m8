@@ -2,6 +2,53 @@ package schema
 
 import "testing"
 
+func TestQuoteIdent(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"pgschemadiff_tmp_abc", `"pgschemadiff_tmp_abc"`},
+		{`weird"name`, `"weird""name"`},
+	}
+	for _, tt := range tests {
+		if got := quoteIdent(tt.in); got != tt.want {
+			t.Errorf("quoteIdent(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestTempConnComposition mirrors how the temp-DB factory builds a connection
+// string: replace the db name first, then append statement_timeout. Appending
+// options before replaceDBName would corrupt a key=value DSN (replaceDBName
+// tokenizes on whitespace and splits the quoted options value).
+func TestTempConnComposition(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		db   string
+		want string
+	}{
+		{
+			"url",
+			"postgres://u:p@h:5432/mydb",
+			"pgschemadiff_tmp_x",
+			"postgres://u:p@h:5432/pgschemadiff_tmp_x?options=-c+statement_timeout%3D0",
+		},
+		{
+			"keyvalue",
+			"host=h port=5432 dbname=mydb user=u",
+			"pgschemadiff_tmp_x",
+			"host=h port=5432 dbname=pgschemadiff_tmp_x user=u options='-c statement_timeout=0'",
+		},
+	}
+	for _, tt := range tests {
+		got := appendConnOption(replaceDBName(tt.in, tt.db), "statement_timeout", "0")
+		if got != tt.want {
+			t.Errorf("%s: got %q, want %q", tt.name, got, tt.want)
+		}
+	}
+}
+
 func TestReplaceDBNameURL(t *testing.T) {
 	tests := []struct {
 		input string

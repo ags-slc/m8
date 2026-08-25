@@ -15,7 +15,7 @@ var planCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx := cmd.Context()
 
-		_, eng, cleanup, err := connectAndBuildEngine(ctx)
+		_, eng, cleanup, err := connectAndBuildEngine(ctx, true)
 		if err != nil {
 			return err
 		}

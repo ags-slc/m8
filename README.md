@@ -259,6 +259,66 @@ m8 supports standard PostgreSQL environment variables and `.env` files:
 | `PGPASSWORD` | `--password` | `password` | -- |
 | `PGSSLMODE` | `--sslmode` | `sslmode` | prefer |
 | `DATABASE_URL` | `--database-url` | `database_url` | -- |
+| `SHADOW_DATABASE_URL` | `--shadow-url` | `shadow_url` | -- |
+
+### Shadow Instance for Schema Diffing
+
+To compute schema diffs, pg-schema-diff creates and drops temporary databases
+(named `pgschemadiff_tmp_*`) to parse your desired DDL and validate the generated
+plan. By default these are created **on the target instance** — including for
+`m8 plan`, which is therefore *not* side-effect-free.
+
+Against a production primary this churns `CREATE`/`DROP DATABASE` on the live
+cluster, which can be disruptive (and on some PostgreSQL versions can leave
+invalid databases behind if a drop is interrupted). Point m8 at a separate,
+non-production instance to host these temp databases:
+
+```yaml
+database_url: postgres://user:pass@prod-host:5432/mydb
+shadow_url:   postgres://user:pass@shadow-host:5432/postgres   # isolated instance
+```
+
+**The shadow must be able to faithfully build your schema.** Temp databases are
+created from `template0`, so the shadow instance needs:
+
+- `CREATE DATABASE` privilege for the connecting role.
+- The **same major PostgreSQL version** as the target (plan validation runs your
+  DDL there; version-specific syntax/behavior must match).
+- **The same extensions available** and the same `shared_preload_libraries` as
+  the target, if your schema references extension-provided types/functions
+  (TimescaleDB, PostGIS, `pg_cron`, etc.). The cleanest way to guarantee this is
+  to point the shadow at a restore/clone of the target rather than an empty
+  instance.
+- **PostgreSQL 13 or later**, since cleanup issues `DROP DATABASE ... WITH
+  (FORCE)`. On older versions the sweeps log a warning and do nothing; diffing
+  itself still works.
+
+Both the temp databases pg-schema-diff creates and m8's own cleanup statements
+are anchored to the database named in `shadow_url`, so the shadow host does not
+need a separate `postgres` database — some managed providers don't offer one, or
+don't let your role connect to it. (pg-schema-diff defaults that anchor to
+`postgres`; m8 overrides it.)
+
+If the shadow is **explicitly configured** but the differ can't initialize
+(unreachable, bad credentials, missing privilege), m8 fails loudly rather than
+silently skipping schema migrations. With no shadow configured it warns and
+falls back to the target; either way the engine refuses to apply when schema
+migrations exist but cannot be diffed.
+
+**Cleanup.** At startup (for `plan`/`apply`/`sync` only) m8 drops any *invalid*
+orphaned `pgschemadiff_tmp_*` databases (the residue of an interrupted drop) on
+whichever instance hosts temp databases. When a dedicated shadow is configured,
+it additionally reclaims *valid* temp databases older than one hour that have no
+active connections — abandoned leftovers from a killed process.
+
+As a command exits — including after a Ctrl-C — m8 reclaims the temp databases
+*it* created, by name, on a context detached from the cancelled one. That covers
+both kinds of residue an interrupted run leaves: a drop interrupted mid-flight,
+which leaves the database invalid, and one that was never sent at all, which
+leaves it valid and which no age-based sweep would touch for an hour. Going by
+name means this can never reach a database another m8 process owns, so it is
+safe when several runs share one shadow. Read-only commands (`status`,
+`baseline`) never touch temp databases.
 
 ## License
 

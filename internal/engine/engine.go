@@ -19,6 +19,15 @@ import (
 // Advisory lock ID: first 8 bytes of SHA-256("m8_migration_lock")
 const lockID int64 = 5739048866534836184
 
+// errDifferUnavailable is returned when schema (S__) migrations exist but the
+// schema differ could not be constructed. We refuse to silently skip schema
+// changes — a no-op that exits 0 is far more dangerous than a hard failure.
+func errDifferUnavailable(n int) error {
+	return fmt.Errorf("%d schema (S__) migration(s) present but the schema differ is unavailable; "+
+		"refusing to silently skip them — verify CREATE DATABASE privilege and the shadow connection "+
+		"(--shadow-url / SHADOW_DATABASE_URL)", n)
+}
+
 // Engine orchestrates migration discovery, planning, and execution.
 type Engine struct {
 	conn   *pgx.Conn
@@ -215,10 +224,8 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 				}
 			}
 		}
-	} else {
-		for _, m := range schemaMigrations {
-			result.Schema = append(result.Schema, SchemaResult{Migration: m, Skipped: true})
-		}
+	} else if len(schemaMigrations) > 0 {
+		return nil, errDifferUnavailable(len(schemaMigrations))
 	}
 
 	// Phase C: Logic — find changed checksums
@@ -468,6 +475,9 @@ func (e *Engine) applyOps(ctx context.Context, migrations []*migration.Migration
 
 func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migration) ([]SchemaResult, error) {
 	if e.differ == nil {
+		if len(migrations) > 0 {
+			return nil, errDifferUnavailable(len(migrations))
+		}
 		return nil, nil
 	}
 
