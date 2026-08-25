@@ -1175,3 +1175,73 @@ func TestSchemaDiffIsScopedToItsSchema(t *testing.T) {
 		t.Error("untouched.bystander disappeared")
 	}
 }
+
+// TestSchemaApplyCreatesSerialTable pins that a table declared with a SERIAL
+// column can actually be created. pg-schema-diff does not manage sequences: the
+// CREATE TABLE it generates carries a nextval() default with nothing behind it,
+// which fails on apply with 42P01. m8 brackets such a statement with the
+// sequence it needs.
+func TestSchemaApplyCreatesSerialTable(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	dir := setupMigrationsDir(t)
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "probe.sql"),
+		[]byte("CREATE TABLE public.probe (\n    id BIGSERIAL,\n    note TEXT,\n    CONSTRAINT probe_pkey PRIMARY KEY (id)\n);"), 0644)
+
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+
+	if _, err := eng.Apply(ctx); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	// The table exists and the sequence actually drives it.
+	var id1, id2 int64
+	if err := conn.QueryRow(ctx, `INSERT INTO public.probe (note) VALUES ('a') RETURNING id`).Scan(&id1); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := conn.QueryRow(ctx, `INSERT INTO public.probe (note) VALUES ('b') RETURNING id`).Scan(&id2); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if id2 <= id1 {
+		t.Errorf("sequence did not advance: %d then %d", id1, id2)
+	}
+
+	// The sequence is owned by the column, so it is dropped with the table —
+	// the ownership SERIAL would have established.
+	var owned bool
+	if err := conn.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_depend d
+			JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+			JOIN pg_class t ON t.oid = d.refobjid
+			WHERE t.relname = 'probe' AND d.deptype = 'a'
+		)
+	`).Scan(&owned); err != nil {
+		t.Fatal(err)
+	}
+	if !owned {
+		t.Error("sequence is not OWNED BY the probe.id column")
+	}
+
+	// And the baseline is stable: a second plan has nothing to do.
+	result, err := eng.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, s := range result.Schema {
+		if s.Error != nil {
+			t.Fatalf("second plan errored: %v", s.Error)
+		}
+		if !s.Skipped {
+			for _, stmt := range s.Diff.Statements {
+				t.Errorf("second plan is not clean: %s", stmt.DDL)
+			}
+		}
+	}
+}

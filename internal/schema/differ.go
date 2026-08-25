@@ -441,7 +441,14 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 		for _, h := range stmt.Hazards {
 			ds.Hazards = append(ds.Hazards, string(h.Type))
 		}
+
+		// pg-schema-diff doesn't manage sequences, so a generated CREATE TABLE
+		// for a SERIAL column arrives with a nextval() default and nothing
+		// behind it. Bracket it with the sequence it needs. See sequences.go.
+		before, after := sequenceStatements(findSequenceFixups(stmt.DDL))
+		result.Statements = append(result.Statements, before...)
 		result.Statements = append(result.Statements, ds)
+		result.Statements = append(result.Statements, after...)
 	}
 
 	result.HasChanges = len(result.Statements) > 0
