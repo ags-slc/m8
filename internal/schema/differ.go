@@ -5,9 +5,12 @@ import (
 	"database/sql"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stripe/pg-schema-diff/pkg/diff"
 	"github.com/stripe/pg-schema-diff/pkg/tempdb"
 )
@@ -42,12 +45,41 @@ const tempDropTimeout = 5 * time.Minute
 // instance shared by several targets.
 const StaleTempDBTTL = time.Hour
 
+// tempDBPrefix is the prefix pg-schema-diff gives every temp database it
+// creates. The LIKE patterns in the sweeps below must match it.
+const tempDBPrefix = tempdb.DefaultOnInstanceDbPrefix
+
+// tempDBTracker records the temp databases the factory was asked to create on
+// behalf of this process, so teardown can reclaim any whose drop never ran.
+type tempDBTracker struct {
+	mu    sync.Mutex
+	names map[string]struct{}
+}
+
+func (t *tempDBTracker) add(name string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.names[name] = struct{}{}
+}
+
+func (t *tempDBTracker) list() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	out := make([]string, 0, len(t.names))
+	for n := range t.names {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Differ computes the difference between a desired-state DDL definition
 // and the live database schema, producing ALTER statements to converge.
 type Differ struct {
 	connStr       string         // connection string for the live target database
 	shadowConnStr string         // connection string for the instance hosting temp DBs
 	tempFactory   tempdb.Factory // creates temp DBs for DDL parsing/plan validation
+	created       *tempDBTracker // temp DBs this process asked the factory to create
 }
 
 // NewDiffer creates a Differ. The live target database (introspected for the
@@ -65,7 +97,26 @@ func NewDiffer(ctx context.Context, targetConnStr, shadowConnStr string) (*Diffe
 		shadowConnStr = targetConnStr
 	}
 
+	// pg-schema-diff's factory defaults its root connection to a database named
+	// "postgres" and asserts at construction that it landed there, which would make
+	// a reachable "postgres" database a hidden requirement of every shadow instance
+	// — one some managed providers don't satisfy. Pin the root database to the one
+	// the shadow connection string already names, so the factory and our own
+	// cleanup connection (see rootConn) agree, and the only database an operator
+	// must provide is the one they configured.
+	rootDB, err := databaseName(shadowConnStr)
+	if err != nil {
+		return nil, fmt.Errorf("resolving shadow database name: %w", err)
+	}
+
+	created := &tempDBTracker{names: make(map[string]struct{})}
+
 	factory, err := tempdb.NewOnInstanceFactory(ctx, func(ctx context.Context, dbName string) (*sql.DB, error) {
+		// The factory calls this for its root connection too; only temp databases
+		// are ours to reclaim.
+		if strings.HasPrefix(dbName, tempDBPrefix) {
+			created.add(dbName)
+		}
 		// Replace the database name first, THEN append statement_timeout=0.
 		// replaceDBName tokenizes key=value DSNs on whitespace and would corrupt
 		// a quoted options='...' value, so options must be appended last.
@@ -73,7 +124,7 @@ func NewDiffer(ctx context.Context, targetConnStr, shadowConnStr string) (*Diffe
 		// sql.Open is lazy and a SET may not reach the factory's connections.
 		tempConnStr := appendConnOption(replaceDBName(shadowConnStr, dbName), "statement_timeout", "0")
 		return sql.Open("pgx", tempConnStr)
-	}, tempdb.WithDropTimeout(tempDropTimeout))
+	}, tempdb.WithDropTimeout(tempDropTimeout), tempdb.WithRootDatabase(rootDB))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp database factory: %w", err)
 	}
@@ -82,7 +133,70 @@ func NewDiffer(ctx context.Context, targetConnStr, shadowConnStr string) (*Diffe
 		connStr:       targetConnStr,
 		shadowConnStr: shadowConnStr,
 		tempFactory:   factory,
+		created:       created,
 	}, nil
+}
+
+// CreatedTempDBs returns the names of the temp databases this Differ asked the
+// factory to create, in sorted order, whether or not they still exist.
+func (d *Differ) CreatedTempDBs() []string {
+	return d.created.list()
+}
+
+// DropCreatedTempDBs drops any temp database this Differ created that still
+// exists, and returns how many it dropped.
+//
+// pg-schema-diff issues its drops on the caller's context. When that context is
+// cancelled, database/sql refuses to hand out a connection at all, so the drop is
+// never even sent and the temp database survives as a perfectly *valid* orphan —
+// invisible to SweepInvalidTempDBs, and untouched by the TTL sweep for an hour.
+// Dropping strictly by the names this process created is safe alongside other m8
+// runs sharing one shadow instance: it can never reach a database another process
+// owns, which is what makes it safe to run without any age or liveness heuristic.
+func (d *Differ) DropCreatedTempDBs(ctx context.Context) (int, error) {
+	names := d.created.list()
+	if len(names) == 0 {
+		return 0, nil
+	}
+
+	db, conn, err := d.rootConn(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = db.Close() }()
+	defer func() { _ = conn.Close() }()
+
+	existing := make(map[string]bool, len(names))
+	rows, err := conn.QueryContext(ctx,
+		`SELECT datname FROM pg_database WHERE datname LIKE 'pgschemadiff\_tmp\_%'`)
+	if err != nil {
+		return 0, fmt.Errorf("listing temp databases: %w", err)
+	}
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("scanning temp database name: %w", err)
+		}
+		existing[n] = true
+	}
+	_ = rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterating temp databases: %w", err)
+	}
+
+	dropped := 0
+	for _, n := range names {
+		if !existing[n] {
+			continue
+		}
+		stmt := fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", quoteIdent(n))
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return dropped, fmt.Errorf("dropping temp database %s left by this run: %w", n, err)
+		}
+		dropped++
+	}
+	return dropped, nil
 }
 
 // SweepInvalidTempDBs drops any orphaned pgschemadiff_tmp_* databases on the
@@ -95,8 +209,8 @@ func (d *Differ) SweepInvalidTempDBs(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer db.Close()
-	defer conn.Close()
+	defer func() { _ = db.Close() }()
+	defer func() { _ = conn.Close() }()
 
 	rows, err := conn.QueryContext(ctx,
 		`SELECT datname FROM pg_database WHERE datname LIKE 'pgschemadiff\_tmp\_%' AND datconnlimit = -2`)
@@ -107,12 +221,12 @@ func (d *Differ) SweepInvalidTempDBs(ctx context.Context) (int, error) {
 	for rows.Next() {
 		var n string
 		if err := rows.Scan(&n); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return 0, fmt.Errorf("scanning temp database name: %w", err)
 		}
 		names = append(names, n)
 	}
-	rows.Close()
+	_ = rows.Close()
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("iterating temp databases: %w", err)
 	}
@@ -144,8 +258,8 @@ func (d *Differ) SweepStaleTempDBs(ctx context.Context, maxAge time.Duration) (i
 	if err != nil {
 		return 0, err
 	}
-	defer db.Close()
-	defer conn.Close()
+	defer func() { _ = db.Close() }()
+	defer func() { _ = conn.Close() }()
 
 	// Candidates: valid temp databases with no active backends.
 	rows, err := conn.QueryContext(ctx, `
@@ -154,6 +268,7 @@ func (d *Differ) SweepStaleTempDBs(ctx context.Context, maxAge time.Duration) (i
 		LEFT JOIN pg_stat_database s ON s.datname = d.datname
 		WHERE d.datname LIKE 'pgschemadiff\_tmp\_%'
 		  AND d.datconnlimit <> -2
+		  AND d.datname <> current_database()
 		  AND COALESCE(s.numbackends, 0) = 0`)
 	if err != nil {
 		return 0, fmt.Errorf("listing stale temp databases: %w", err)
@@ -162,12 +277,12 @@ func (d *Differ) SweepStaleTempDBs(ctx context.Context, maxAge time.Duration) (i
 	for rows.Next() {
 		var n string
 		if err := rows.Scan(&n); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return 0, fmt.Errorf("scanning temp database name: %w", err)
 		}
 		names = append(names, n)
 	}
-	rows.Close()
+	_ = rows.Close()
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("iterating temp databases: %w", err)
 	}
@@ -197,7 +312,7 @@ func (d *Differ) tempDBOlderThan(ctx context.Context, dbName string, maxAge time
 	if err != nil {
 		return false, err
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	var old bool
 	err = db.QueryRowContext(ctx,
@@ -209,29 +324,51 @@ func (d *Differ) tempDBOlderThan(ctx context.Context, dbName string, maxAge time
 	return old, nil
 }
 
-// rootConn opens a single pinned connection to the shadow instance's root
-// ("postgres") database with statement_timeout disabled. Pinning one connection
-// (rather than using the *sql.DB pool directly) guarantees the statement_timeout
-// reset and the subsequent statements all run on the same backend. The caller
-// must close both the returned conn and pool (conn first).
+// rootConn opens a single pinned connection to the shadow instance with
+// statement_timeout disabled, used for the catalog queries and DROP DATABASE
+// statements the sweeps issue.
+//
+// It connects to the database named in the shadow connection string, which is
+// also what NewDiffer pins pg-schema-diff's own root connection to — so cleanup
+// and temp database creation always operate from the same place, and neither
+// requires a "postgres" database to exist. DROP DATABASE works from any database
+// in the cluster except the one being dropped, which the stale sweep excludes
+// explicitly.
+//
+// Pinning one connection (rather than using the *sql.DB pool directly)
+// guarantees the statement_timeout reset and the subsequent statements all run
+// on the same backend. The caller must close both the returned conn and pool
+// (conn first).
 func (d *Differ) rootConn(ctx context.Context) (*sql.DB, *sql.Conn, error) {
-	rootStr := replaceDBName(d.shadowConnStr, "postgres")
-	db, err := sql.Open("pgx", rootStr)
+	db, err := sql.Open("pgx", d.shadowConnStr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open shadow root connection: %w", err)
 	}
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, nil, fmt.Errorf("acquire shadow root connection: %w", err)
 	}
 	// Don't let our own cleanup get killed by a role-level statement_timeout.
 	if _, err := conn.ExecContext(ctx, "SET statement_timeout = 0"); err != nil {
-		conn.Close()
-		db.Close()
+		_ = conn.Close()
+		_ = db.Close()
 		return nil, nil, fmt.Errorf("disabling statement_timeout: %w", err)
 	}
 	return db, conn, nil
+}
+
+// databaseName reports which database a connection string resolves to, using the
+// parser pgx itself uses so libpq environment fallbacks resolve identically.
+func databaseName(connStr string) (string, error) {
+	cfg, err := pgconn.ParseConfig(connStr)
+	if err != nil {
+		return "", err
+	}
+	if cfg.Database == "" {
+		return "", fmt.Errorf("connection string names no database")
+	}
+	return cfg.Database, nil
 }
 
 // quoteIdent double-quotes a PostgreSQL identifier, escaping embedded quotes.
