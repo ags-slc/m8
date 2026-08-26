@@ -3,7 +3,7 @@
 Notable changes to m8. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] — not yet tagged
+## [0.2.0] - 2026-08-25
 
 First release with production experience behind it. `v0.1.0` was adopted against a
 live PostgreSQL cluster (~160 objects across four migration folders, two target
@@ -107,7 +107,27 @@ review.
   pull requests into any branch, and no longer truncates lint findings.
 - Every action moved off the deprecated Node 20 runtime.
 - Release signing migrated to cosign v3's bundle format; GoReleaser pinned,
-  container tests serialized, cross-compilation moved into CI.
+  container tests serialized, cross-compilation moved into CI. Signatures are
+  now a single `checksums.txt.sigstore.json` bundle rather than a `.pem`/`.sig`
+  pair, so **verification requires cosign >= v2.4.2**:
+
+  ```
+  cosign verify-blob \
+    --bundle checksums.txt.sigstore.json \
+    --certificate-identity-regexp 'https://github.com/ags-slc/m8/.*' \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    checksums.txt
+  ```
+
+  (`v0.1.0` was unsigned — it shipped no `signs` block and no signature
+  assets, so there is nothing to migrate from.)
 - staticcheck and errcheck findings addressed in non-test code.
 
+## [0.1.0] - 2026-04-12
+
+Initial release. The m8 CLI scaffold: `plan`, `apply`, `dump`, `baseline`,
+`sync`, `status`, `new`, and `version`. Superseded by `0.2.0` — see the upgrade
+note above before running it against anything you care about.
+
 [0.2.0]: https://github.com/ags-slc/m8/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/ags-slc/m8/releases/tag/v0.1.0
