@@ -42,7 +42,7 @@ func (d *Dumper) ListFunctions(ctx context.Context, schema string) ([]Function, 
 		JOIN pg_namespace n ON n.oid = p.pronamespace
 		WHERE n.nspname = $1
 		  AND p.prokind IN ('f', 'p')  -- functions and procedures
-		  AND p.proname NOT LIKE 'pg_%'
+		  AND p.proname NOT LIKE 'pg\_%'   -- escaped: bare _ is a single-character wildcard
 		  AND NOT EXISTS (
 			  SELECT 1 FROM pg_depend d
 			  WHERE d.objid = p.oid AND d.deptype = 'e'  -- exclude extension-owned

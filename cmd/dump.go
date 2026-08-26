@@ -68,6 +68,13 @@ Examples:
 		var logicEntries []logicEntry
 
 		for _, schema := range schemas {
+			// A schema name becomes a directory component below. Rejecting it
+			// here rather than in writeFile is the point: "../ops" cleans away
+			// to "ops", which writeFile would accept as perfectly local.
+			if !dumpStdout && !safeComponent(schema) {
+				return fmt.Errorf("refusing to dump schema %q: name is not usable as a path component; rename it or use --stdout", schema)
+			}
+
 			// --- Tables → schema/{pg_schema}/*.sql ---
 			tables, err := d.ListTables(ctx, schema)
 			if err != nil {
@@ -85,7 +92,13 @@ Examples:
 				if dumpStdout {
 					fmt.Printf("-- schema/%s/%s.sql\n%s\n", schema, tableName, ddl)
 				} else {
-					if err := writeFile(filepath.Join(st.MigrationsDir, "schema", schema), tableName+".sql", ddl); err != nil {
+					// No dedup machinery here as there is for logic names, so
+					// sanitizing would silently merge "a/b" into "a_b" and lose one
+					// of them. dump is interactive; fail closed instead.
+					if !safeComponent(tableName) {
+						return fmt.Errorf("refusing to dump %s.%s: table name is not usable as a filename; rename it or use --stdout", schema, tableName)
+					}
+					if err := writeFile(st.MigrationsDir, filepath.Join("schema", schema), tableName+".sql", ddl); err != nil {
 						return err
 					}
 				}
@@ -167,7 +180,7 @@ Examples:
 				if dumpStdout {
 					fmt.Printf("-- permissions/%s\n%s\n", filename, rendered)
 				} else {
-					if err := writeFile(filepath.Join(st.MigrationsDir, "permissions"), filename, rendered); err != nil {
+					if err := writeFile(st.MigrationsDir, "permissions", filename, rendered); err != nil {
 						return err
 					}
 				}
@@ -185,7 +198,7 @@ Examples:
 			if dumpStdout {
 				fmt.Printf("-- logic/%s\n%s\n", filename, e.rendered)
 			} else {
-				if err := writeFile(filepath.Join(st.MigrationsDir, "logic"), filename, e.rendered); err != nil {
+				if err := writeFile(st.MigrationsDir, "logic", filename, e.rendered); err != nil {
 					return err
 				}
 			}
@@ -210,15 +223,63 @@ Examples:
 	},
 }
 
-func writeFile(dir, filename, content string) error {
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory %s: %w", dir, err)
+// safeComponent reports whether s is usable as exactly one path element.
+//
+// Catalog names reach the filesystem as path components, and PostgreSQL lets a
+// quoted identifier hold "/" and ".." -- so this is what stops a hostile object
+// name from steering a write. filepath.IsLocal additionally rejects Windows
+// drive-relative paths and reserved device names.
+func safeComponent(s string) bool {
+	return s != "" && s != "." && s != ".." &&
+		!strings.ContainsAny(s, `/\`) &&
+		!strings.ContainsRune(s, 0) &&
+		filepath.IsLocal(s)
+}
+
+// openRoot creates root if it is missing and opens it for confined access.
+func openRoot(root string) (*os.Root, error) {
+	if err := os.MkdirAll(root, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create directory %s: %w", root, err)
 	}
-	filePath := filepath.Join(dir, filename)
-	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
-		return fmt.Errorf("failed to write %s: %w", filePath, err)
+	r, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open %s: %w", root, err)
 	}
-	fmt.Printf("  %s\n", filePath)
+	return r, nil
+}
+
+// writeFile writes content to <root>/<relDir>/<filename>.
+//
+// relDir and filename are built from catalog names -- schema, table, function
+// and view names -- which anyone holding CREATE on a schema controls and which
+// may legally contain "/" and "..". os.Root confines every mkdir and open
+// beneath root, so a hostile identifier can neither climb out of the migrations
+// tree nor follow a symlink out of it.
+//
+// The caller still has to reject an unsafe name BEFORE joining it into relDir:
+// filepath.Join("schema", "../ops") cleans to "ops", which is local, exists, and
+// whose contents apply runs verbatim.
+func writeFile(root, relDir, filename, content string) error {
+	if !filepath.IsLocal(relDir) {
+		return fmt.Errorf("refusing to write: directory %q escapes the migrations directory", relDir)
+	}
+	if !safeComponent(filename) {
+		return fmt.Errorf("refusing to write: %q is not a plain filename", filename)
+	}
+	r, err := openRoot(root)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = r.Close() }()
+
+	if err := r.MkdirAll(relDir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory %s: %w", filepath.Join(root, relDir), err)
+	}
+	rel := filepath.Join(relDir, filename)
+	if err := r.WriteFile(rel, []byte(content), 0644); err != nil {
+		return fmt.Errorf("failed to write %s: %w", filepath.Join(root, rel), err)
+	}
+	fmt.Printf("  %s\n", filepath.Join(root, rel))
 	return nil
 }
 

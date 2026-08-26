@@ -19,13 +19,38 @@ type LogicObject struct {
 	Identity string
 }
 
+// unsafeFilenameChars matches anything that must not survive into a filename.
+// Wider than nonFilenameChars below, which slugs an argument list: a base name
+// is the readable identity of the object, so case, "." and "-" are kept.
+var unsafeFilenameChars = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
+
+// SanitizeComponent reduces a catalog name to exactly one path element.
+//
+// A schema, function, or view name is written to disk as part of a path, and a
+// quoted PostgreSQL identifier may contain "/" and "..", so a name is otherwise
+// free to steer the write out of logic/ -- into a sibling folder apply executes,
+// or out of the migrations tree entirely.
+//
+// Deliberately lossy, and safe to be lossy here: ResolveLogicFileNames finishes
+// with deduplicate, which hashes apart anything that collides, so "a/b" and
+// "a_b" collapsing to one base cannot silently drop an object.
+func SanitizeComponent(s string) string {
+	s = unsafeFilenameChars.ReplaceAllString(s, "_")
+	if s == "" || s == "." || s == ".." {
+		return "_"
+	}
+	return s
+}
+
 // BaseFileName is the filename a logic object gets when nothing collides with
 // it: public objects keep their bare name, everything else is schema-prefixed.
+//
+// Both halves are sanitized -- they are catalog names, not trusted input.
 func (o LogicObject) BaseFileName() string {
 	if o.Schema == "public" {
-		return o.Name
+		return SanitizeComponent(o.Name)
 	}
-	return o.Schema + "_" + o.Name
+	return SanitizeComponent(o.Schema) + "_" + SanitizeComponent(o.Name)
 }
 
 var nonFilenameChars = regexp.MustCompile(`[^a-z0-9]+`)

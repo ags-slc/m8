@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -34,7 +33,10 @@ Types and naming:
 		}
 		migrationsDir := st.MigrationsDir
 
-		var filePath string
+		// relDir and filename are kept as separate, validated components: the
+		// name comes from argv, so "m8 new logic ../../../x" would otherwise
+		// scaffold a file outside the migrations tree.
+		var relDir, filename string
 
 		switch migType {
 		case "schema":
@@ -44,47 +46,50 @@ Types and naming:
 				return fmt.Errorf("schema name must include PG schema: m8 new schema public/users")
 			}
 			pgSchema, objName := parts[0], parts[1]
-			dir := filepath.Join(migrationsDir, "schema", pgSchema)
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return fmt.Errorf("failed to create directory %s: %w", dir, err)
+			if !safeComponent(pgSchema) || !safeComponent(objName) {
+				return fmt.Errorf("invalid name %q: each part must be a plain path component", name)
 			}
-			filePath = filepath.Join(dir, objName+".sql")
+			relDir, filename = filepath.Join("schema", pgSchema), objName+".sql"
 
-		case "logic":
-			dir := filepath.Join(migrationsDir, "logic")
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return fmt.Errorf("failed to create directory %s: %w", dir, err)
+		case "logic", "permissions":
+			if !safeComponent(name) {
+				return fmt.Errorf("invalid name %q: must be a plain filename", name)
 			}
-			filePath = filepath.Join(dir, name+".sql")
-
-		case "permissions":
-			dir := filepath.Join(migrationsDir, "permissions")
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return fmt.Errorf("failed to create directory %s: %w", dir, err)
-			}
-			filePath = filepath.Join(dir, name+".sql")
+			relDir, filename = migType, name+".sql"
 
 		case "ops":
-			dir := filepath.Join(migrationsDir, "ops")
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				return fmt.Errorf("failed to create directory %s: %w", dir, err)
-			}
 			ts := time.Now().UTC().Format("20060102_150405")
 			safeName := strings.ReplaceAll(strings.ToLower(name), " ", "_")
-			filePath = filepath.Join(dir, ts+"__"+safeName+".sql")
+			relDir, filename = "ops", ts+"__"+safeName+".sql"
+			if !safeComponent(filename) {
+				return fmt.Errorf("invalid name %q: must be a plain filename", name)
+			}
 
 		default:
 			return fmt.Errorf("unknown type %q (expected: schema, logic, permissions, ops)", migType)
 		}
 
+		r, err := openRoot(migrationsDir)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = r.Close() }()
+
+		if err := r.MkdirAll(relDir, 0755); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", filepath.Join(migrationsDir, relDir), err)
+		}
+
+		rel := filepath.Join(relDir, filename)
+		filePath := filepath.Join(migrationsDir, rel)
+
 		// Check if file already exists
-		if _, err := os.Stat(filePath); err == nil {
+		if _, err := r.Stat(rel); err == nil {
 			return fmt.Errorf("file already exists: %s", filePath)
 		}
 
 		// Write template content
 		content := templateFor(migType, name)
-		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		if err := r.WriteFile(rel, []byte(content), 0644); err != nil {
 			return fmt.Errorf("failed to write %s: %w", filePath, err)
 		}
 
