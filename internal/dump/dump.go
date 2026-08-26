@@ -100,7 +100,7 @@ func NewDumper(conn *pgx.Conn) *Dumper {
 func (d *Dumper) ListSchemas(ctx context.Context) ([]string, error) {
 	rows, err := d.conn.Query(ctx, `
 		SELECT nspname FROM pg_namespace
-		WHERE nspname NOT LIKE 'pg_%'
+		WHERE nspname NOT LIKE 'pg\_%'   -- escaped: bare _ is a single-character wildcard
 		  AND nspname NOT IN ('information_schema', '_m8', '_peerdb_internal')
 		ORDER BY nspname
 	`)
