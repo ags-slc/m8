@@ -272,6 +272,7 @@ func TestTypeString(t *testing.T) {
 		{TypeSchema, "schema"},
 		{TypeLogic, "logic"},
 		{TypePermissions, "permissions"},
+		{TypeData, "data"},
 		{Type(99), "unknown"},
 	}
 	for _, tt := range tests {
@@ -302,5 +303,66 @@ func mustMkdirAll(t *testing.T, path string, perm os.FileMode) {
 	t.Helper()
 	if err := os.MkdirAll(path, perm); err != nil {
 		t.Fatalf("creating %s: %v", path, err)
+	}
+}
+
+// data/ is discovered with a parsed version, ordered LAST, and -- like ops/ --
+// only picks up files that carry a timestamp prefix.
+func TestDiscoverDataFolder(t *testing.T) {
+	dir := t.TempDir()
+	for _, sub := range []string{"ops", "schema/public", "logic", "permissions", "data"} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260101_001__ext.sql"), []byte("SELECT 1;"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "t.sql"), []byte("CREATE TABLE t (id INT);"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "logic", "f.sql"), []byte("SELECT 1;"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "permissions", "g.sql"), []byte("SELECT 1;"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "data", "20260202_002__second.sql"), []byte("SELECT 1;"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "data", "20260202_001__first.sql"), []byte("SELECT 1;"), 0644)
+	// No timestamp prefix: skipped, exactly as in ops/.
+	mustWriteFile(t, filepath.Join(dir, "data", "notes.sql"), []byte("SELECT 1;"), 0644)
+
+	migrations, err := Discover(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []Type{TypeOps, TypeSchema, TypeLogic, TypePermissions, TypeData, TypeData}
+	if len(migrations) != len(want) {
+		var got []string
+		for _, m := range migrations {
+			got = append(got, m.Filename)
+		}
+		t.Fatalf("expected %d migrations, got %d: %v", len(want), len(migrations), got)
+	}
+	for i, exp := range want {
+		if migrations[i].Type != exp {
+			t.Errorf("[%d] %s: expected %v, got %v", i, migrations[i].Filename, exp, migrations[i].Type)
+		}
+	}
+
+	// Versioned, and ordered by version within the phase.
+	if migrations[4].Version != "20260202_001" || migrations[5].Version != "20260202_002" {
+		t.Errorf("data/ versions out of order: %q then %q",
+			migrations[4].Version, migrations[5].Version)
+	}
+}
+
+func TestIsVersioned(t *testing.T) {
+	for _, tt := range []struct {
+		typ  Type
+		want bool
+	}{
+		{TypeOps, true},
+		{TypeData, true},
+		{TypeSchema, false},
+		{TypeLogic, false},
+		{TypePermissions, false},
+	} {
+		if got := IsVersioned(tt.typ); got != tt.want {
+			t.Errorf("IsVersioned(%v) = %v, want %v", tt.typ, got, tt.want)
+		}
 	}
 }

@@ -22,6 +22,18 @@ const (
 	TypeLogic
 	// TypePermissions migrations re-run when their content changes (grants, revokes, roles).
 	TypePermissions
+	// TypeData migrations run once in timestamp order, LAST -- after schema/,
+	// logic/ and permissions/ have converged.
+	//
+	// ops/ cannot do this. It runs first, so a one-time migration that depends
+	// on the very objects this release introduces -- backfilling a column
+	// schema/ adds, CALLing a procedure logic/ creates -- finds nothing, guards
+	// itself, no-ops, and is recorded applied forever. The only remedies were
+	// splitting the change across two releases or having an operator re-run the
+	// file by hand against production. data/ removes both: same one-time,
+	// timestamp-ordered, checksummed semantics as ops/, at the other end of the
+	// apply.
+	TypeData
 )
 
 // String returns the type name for display and database storage.
@@ -35,6 +47,8 @@ func (t Type) String() string {
 		return "logic"
 	case TypePermissions:
 		return "permissions"
+	case TypeData:
+		return "data"
 	default:
 		return "unknown"
 	}
@@ -46,7 +60,15 @@ const (
 	FolderSchema      = "schema"
 	FolderLogic       = "logic"
 	FolderPermissions = "permissions"
+	FolderData        = "data"
 )
+
+// IsVersioned reports whether a type is one-time and ordered by its filename
+// timestamp, rather than re-applied on checksum change. ops/ and data/ are the
+// two; they differ only in when they run.
+func IsVersioned(t Type) bool {
+	return t == TypeOps || t == TypeData
+}
 
 // Migration represents a single migration file.
 type Migration struct {
@@ -60,7 +82,8 @@ type Migration struct {
 	Content  []byte // Raw file content.
 }
 
-// Regex for ops/ files: {timestamp}__{name}.sql or {timestamp}_{seq}__{name}.sql
+// Regex for versioned (ops/, data/) files: {timestamp}__{name}.sql or
+// {timestamp}_{seq}__{name}.sql
 var opsPattern = regexp.MustCompile(`^(\d+(?:_\d+)*)__(.+)\.sql$`)
 
 // Regex for simple .sql files in logic/, permissions/, schema/ subfolders.
@@ -83,7 +106,7 @@ func Discover(dir string) ([]*Migration, error) {
 	var migrations []*Migration
 
 	folderBased := false
-	for _, sub := range []string{FolderOps, FolderSchema, FolderLogic, FolderPermissions} {
+	for _, sub := range []string{FolderOps, FolderSchema, FolderLogic, FolderPermissions, FolderData} {
 		subDir := filepath.Join(dir, sub)
 		if info, err := os.Stat(subDir); err == nil && info.IsDir() {
 			folderBased = true
@@ -109,7 +132,7 @@ func Discover(dir string) ([]*Migration, error) {
 		if migrations[i].Type != migrations[j].Type {
 			return migrations[i].Type < migrations[j].Type
 		}
-		if migrations[i].Type == TypeOps {
+		if IsVersioned(migrations[i].Type) {
 			return migrations[i].Version < migrations[j].Version
 		}
 		// For schema, sort by PGSchema then Name
@@ -156,6 +179,15 @@ func discoverFolderLayout(dir string) ([]*Migration, error) {
 
 	// permissions/
 	if m, err := scanSimpleFolder(filepath.Join(dir, FolderPermissions), FolderPermissions, TypePermissions); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	} else {
+		migrations = append(migrations, m...)
+	}
+
+	// data/ -- one-time like ops/, but applied last.
+	if m, err := scanSimpleFolder(filepath.Join(dir, FolderData), FolderData, TypeData); err != nil {
 		if !os.IsNotExist(err) {
 			return nil, err
 		}
@@ -240,13 +272,13 @@ func scanSimpleFolder(dir, folderName string, typ Type) ([]*Migration, error) {
 		relFilename := filepath.Join(folderName, entry.Name())
 
 		switch typ {
-		case TypeOps:
+		case TypeOps, TypeData:
 			matches := opsPattern.FindStringSubmatch(entry.Name())
 			if matches == nil {
 				continue // skip files without timestamp prefix
 			}
 			migrations = append(migrations, &Migration{
-				Type:     TypeOps,
+				Type:     typ,
 				Version:  matches[1],
 				Name:     strings.ReplaceAll(matches[2], "_", " "),
 				Filename: relFilename,

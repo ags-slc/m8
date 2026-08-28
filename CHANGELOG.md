@@ -3,6 +3,38 @@
 Notable changes to m8. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **A fifth migration phase, `data/`, applied last.** One-time and checksummed
+  like `ops/`, but it runs *after* `schema/`, `logic/` and `permissions/` have
+  converged, so a migration in it can read and write the objects the same apply
+  introduced. Apply order is now **ops → schema → logic → permissions → data**.
+
+  `ops/` runs first, which made a whole class of migration impossible to ship in
+  one release: backfilling a column `schema/` adds, `CALL`ing a procedure
+  `logic/` creates, seeding or commenting a new object. In `ops/` such a file
+  runs before its target exists, finds nothing, and no-ops -- and m8 records it
+  applied, permanently, because `ops/` is one-time. What it carried is lost. The
+  only ways out were to split the change across two releases or to have an
+  operator run the file by hand against production afterwards, which is the
+  thing a migration pipeline exists to remove.
+
+  `data/` also has its own version namespace, so a release may add an `ops/` and
+  a `data/` file bearing the same timestamp.
+
+  `m8 new data "<name>"` scaffolds one.
+
+### Changed
+
+- `_m8.history`'s `type` CHECK now admits `'data'`, and carries the explicit
+  name `m8_history_type_check`. **Existing installs are upgraded in place** by
+  `EnsureSchema` on the next command: they carry PostgreSQL's auto-generated
+  `history_type_check`, which would have let a `data/` migration run and then
+  rejected its history row -- applied but unrecorded, the worst possible order.
+  The upgrade is keyed on the constraint name, so it happens once.
+
 ## [0.2.0] - 2026-08-25
 
 First release with production experience behind it. `v0.1.0` was adopted against a

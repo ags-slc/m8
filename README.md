@@ -2,7 +2,7 @@
 
 PostgreSQL migration tool. Mate for your database.
 
-m8 is a PostgreSQL-specific migration tool built as a single static Go binary. It organizes migrations into four directories -- **schema**, **logic**, **permissions**, and **ops** -- each with behavior matched to the type of database object it manages.
+m8 is a PostgreSQL-specific migration tool built as a single static Go binary. It organizes migrations into five directories -- **schema**, **logic**, **permissions**, **ops**, and **data** -- each with behavior matched to the type of database object it manages.
 
 ## Why m8?
 
@@ -87,6 +87,7 @@ m8 new schema public/users
 m8 new logic proc_refresh_invoices
 m8 new permissions grants_readonly
 m8 new ops "create extensions"
+m8 new data "backfill destination country"
 ```
 
 ## Migration Layout
@@ -109,9 +110,11 @@ migrations/
 ├── permissions/                               # Re-applied on change
 │   ├── grants_materialized.sql
 │   └── default_privileges.sql
-└── ops/                                       # One-time, sequential
-    ├── 20260411_001__create_extensions.sql
-    └── 20260411_002__create_hypertables.sql
+├── ops/                                       # One-time, sequential -- runs FIRST
+│   ├── 20260411_001__create_extensions.sql
+│   └── 20260411_002__create_hypertables.sql
+└── data/                                      # One-time, sequential -- runs LAST
+    └── 20260412_001__backfill_country.sql
 ```
 
 ### Migration Types
@@ -121,9 +124,35 @@ migrations/
 | **Schema** | `schema/{pg_schema}/` | Desired state diffed against live DB per PG schema | Tables, indexes, constraints |
 | **Logic** | `logic/` | Re-run whenever file content changes | Procedures, functions, views, triggers, pg_cron |
 | **Permissions** | `permissions/` | Re-run whenever file content changes | Grants, revokes, roles, default privileges |
-| **Ops** | `ops/` | Run once in timestamp order | Extensions, hypertables, data migrations |
+| **Ops** | `ops/` | Run once in timestamp order, **before** schema/ | Extensions, hypertables, session/database settings |
+| **Data** | `data/` | Run once in timestamp order, **after** everything | Backfills, seeds, one-time DML, comments on new objects |
 
-**Apply order:** Ops → Schema → Logic → Permissions
+**Apply order:** Ops → Schema → Logic → Permissions → Data
+
+### ops/ or data/?
+
+Both run once, in timestamp order, and are checksummed; they differ only in
+*when*. The question to ask is what the file needs to already exist.
+
+`ops/` runs before the schema diff, so it is for the things a schema needs in
+order to be created at all -- extensions, database settings, a hypertable
+conversion, anything that must precede a table.
+
+`data/` runs after `schema/`, `logic/` and `permissions/` have converged, so it
+is for the things that need the release to have happened -- backfilling a column
+`schema/` just added, `CALL`ing a procedure `logic/` just created, seeding a
+table, commenting a view.
+
+Putting the second kind in `ops/` does not fail loudly. The file runs before its
+target exists, finds nothing, and -- because these files are usually written to
+guard themselves -- no-ops. m8 then records it applied, permanently, since `ops/`
+is one-time and checksummed. What the file carried is simply lost, and the only
+remedies are splitting the change across two releases or having someone run the
+file by hand afterwards. That is the case `data/` exists to remove.
+
+A `data/` migration whose procedure `COMMIT`s per batch needs
+`-- m8:no-transaction`, like any other migration that manages its own
+transactions.
 
 ### Schema Migrations
 
@@ -237,7 +266,7 @@ and replica identity**, plus roles themselves, event triggers, and
 
 | Command | Description |
 |---------|-------------|
-| `m8 apply` | Apply pending migrations (ops → schema → logic → permissions) |
+| `m8 apply` | Apply pending migrations (ops → schema → logic → permissions → data) |
 | `m8 plan` | Show what would be applied without making changes (exit code 2 if pending) |
 | `m8 status` | Show applied, pending, changed, and drifted migrations |
 | `m8 sync` | One-time convergence for brownfield adoption |

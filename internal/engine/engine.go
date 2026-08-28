@@ -71,6 +71,8 @@ type ApplyResult struct {
 	Schema      []SchemaResult
 	Logic       []MigrationResult
 	Permissions []MigrationResult
+	// Data holds the one-time data/ migrations, applied after everything else.
+	Data []MigrationResult
 	// PendingPGSchemas lists PostgreSQL schemas implied by schema/ subfolders
 	// that do not exist yet on the target. Populated by Plan (which never
 	// creates them); Apply creates them instead of reporting them.
@@ -122,7 +124,8 @@ func New(conn *pgx.Conn, sqlDB *sql.DB, differ *schema.Differ, config *Config, l
 	}
 }
 
-// Apply discovers and executes pending migrations: ops → schema → logic → permissions.
+// Apply discovers and executes pending migrations:
+// ops → schema → logic → permissions → data.
 func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 	if err := e.acquireLock(ctx); err != nil {
 		return nil, err
@@ -141,7 +144,7 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 	result := &ApplyResult{}
 
 	// Phase A: Ops
-	r, err := e.applyOps(ctx, filterByType(all, migration.TypeOps))
+	r, err := e.applyVersioned(ctx, filterByType(all, migration.TypeOps), migration.TypeOps)
 	result.Ops = r
 	if err != nil {
 		return result, err
@@ -172,6 +175,14 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 		return result, err
 	}
 
+	// Phase E: Data — one-time, like ops, but only now that every object the
+	// release introduces exists. This is the phase a backfill belongs in.
+	r, err = e.applyVersioned(ctx, filterByType(all, migration.TypeData), migration.TypeData)
+	result.Data = r
+	if err != nil {
+		return result, err
+	}
+
 	return result, nil
 }
 
@@ -198,25 +209,9 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 	result := &ApplyResult{}
 
 	// Phase A: Ops — find unapplied
-	var applied []state.HistoryRow
-	if stateReady {
-		applied, err = e.store.GetAppliedOps(ctx)
-		if err != nil {
-			return nil, err
-		}
-	}
-	appliedSet := make(map[string]bool)
-	for _, h := range applied {
-		if h.Version != nil {
-			appliedSet[*h.Version] = true
-		}
-	}
-	for _, m := range filterByType(all, migration.TypeOps) {
-		if appliedSet[m.Version] {
-			result.Ops = append(result.Ops, MigrationResult{Migration: m, Skipped: true})
-		} else {
-			result.Ops = append(result.Ops, MigrationResult{Migration: m})
-		}
+	result.Ops, err = e.planVersioned(ctx, filterByType(all, migration.TypeOps), migration.TypeOps, stateReady)
+	if err != nil {
+		return nil, err
 	}
 
 	// Phase B: Schema — report (never create) missing PG schemas, then diff.
@@ -285,7 +280,37 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		return result, err
 	}
 
+	// Phase E: Data — find unapplied
+	result.Data, err = e.planVersioned(ctx, filterByType(all, migration.TypeData), migration.TypeData, stateReady)
+	if err != nil {
+		return result, err
+	}
+
 	return result, nil
+}
+
+// planVersioned reports which one-time migrations of a versioned type (ops/,
+// data/) have not been applied yet.
+func (e *Engine) planVersioned(ctx context.Context, migrations []*migration.Migration, typ migration.Type, stateReady bool) ([]MigrationResult, error) {
+	var applied []state.HistoryRow
+	if stateReady {
+		var err error
+		applied, err = e.store.GetAppliedVersioned(ctx, typ.String())
+		if err != nil {
+			return nil, err
+		}
+	}
+	appliedSet := make(map[string]bool)
+	for _, h := range applied {
+		if h.Version != nil {
+			appliedSet[*h.Version] = true
+		}
+	}
+	var results []MigrationResult
+	for _, m := range migrations {
+		results = append(results, MigrationResult{Migration: m, Skipped: appliedSet[m.Version]})
+	}
+	return results, nil
 }
 
 // Status shows applied vs pending migrations.
@@ -304,15 +329,26 @@ func (e *Engine) Status(ctx context.Context) (*StatusResult, error) {
 		return nil, err
 	}
 
-	appliedOps, err := e.store.GetAppliedOps(ctx)
+	versionedMap := func(typ string) (map[string]state.HistoryRow, error) {
+		rows, err := e.store.GetAppliedVersioned(ctx, typ)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]state.HistoryRow)
+		for _, h := range rows {
+			if h.Version != nil {
+				out[*h.Version] = h
+			}
+		}
+		return out, nil
+	}
+	opsMap, err := versionedMap("ops")
 	if err != nil {
 		return nil, err
 	}
-	opsMap := make(map[string]state.HistoryRow)
-	for _, h := range appliedOps {
-		if h.Version != nil {
-			opsMap[*h.Version] = h
-		}
+	dataMap, err := versionedMap("data")
+	if err != nil {
+		return nil, err
 	}
 
 	latestSchema, err := e.store.GetLatestByType(ctx, "schema")
@@ -332,8 +368,12 @@ func (e *Engine) Status(ctx context.Context) (*StatusResult, error) {
 
 	for _, m := range all {
 		switch m.Type {
-		case migration.TypeOps:
-			if h, ok := opsMap[m.Version]; ok {
+		case migration.TypeOps, migration.TypeData:
+			seen := opsMap
+			if m.Type == migration.TypeData {
+				seen = dataMap
+			}
+			if h, ok := seen[m.Version]; ok {
 				if h.Checksum != m.Checksum {
 					result.Drift = append(result.Drift, DriftEntry{Migration: m, AppliedChecksum: h.Checksum})
 				}
@@ -381,11 +421,11 @@ func (e *Engine) Baseline(ctx context.Context, version string, all bool) error {
 	}
 
 	for _, m := range allMigrations {
-		if !all && m.Type == migration.TypeOps && m.Version > version {
+		if !all && migration.IsVersioned(m.Type) && m.Version > version {
 			continue
 		}
 		var ver *string
-		if m.Type == migration.TypeOps {
+		if migration.IsVersioned(m.Type) {
 			ver = &m.Version
 		}
 		var pgSchema *string
@@ -428,6 +468,16 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 		_ = e.store.RecordBaseline(ctx, &m.Version, m.Name, m.Type.String(), nil, m.Checksum)
 		result.Ops = append(result.Ops, MigrationResult{Migration: m, Skipped: true})
 		e.logger.Info("baselined (sync)", "file", m.Filename, "type", "ops")
+	}
+
+	// data/ is baselined for the same reason ops/ is, and it matters more here:
+	// sync adopts a database whose data is already whatever it is, and re-running
+	// a backfill over it is at best wasted work and at worst destructive. Adopt
+	// the history, do not replay it.
+	for _, m := range filterByType(all, migration.TypeData) {
+		_ = e.store.RecordBaseline(ctx, &m.Version, m.Name, m.Type.String(), nil, m.Checksum)
+		result.Data = append(result.Data, MigrationResult{Migration: m, Skipped: true})
+		e.logger.Info("baselined (sync)", "file", m.Filename, "type", "data")
 	}
 
 	// Schema — ensure PG schemas exist, then diff and apply
@@ -482,8 +532,11 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 
 // --- apply helpers ---
 
-func (e *Engine) applyOps(ctx context.Context, migrations []*migration.Migration) ([]MigrationResult, error) {
-	applied, err := e.store.GetAppliedOps(ctx)
+// applyVersioned executes the pending one-time migrations of a versioned type
+// (ops/ or data/) in timestamp order. The two phases differ only in where Apply
+// calls this from -- ops/ first, data/ last.
+func (e *Engine) applyVersioned(ctx context.Context, migrations []*migration.Migration, typ migration.Type) ([]MigrationResult, error) {
+	applied, err := e.store.GetAppliedVersioned(ctx, typ.String())
 	if err != nil {
 		return nil, err
 	}
@@ -512,7 +565,7 @@ func (e *Engine) applyOps(ctx context.Context, migrations []*migration.Migration
 		mr.ExecutionMs = time.Since(start).Milliseconds()
 		mr.Applied = true
 		_ = e.store.RecordApplied(ctx, &m.Version, m.Name, m.Type.String(), nil, m.Checksum, mr.ExecutionMs, true)
-		e.logger.Info("applied", "file", m.Filename, "type", "ops", "ms", mr.ExecutionMs)
+		e.logger.Info("applied", "file", m.Filename, "type", typ.String(), "ms", mr.ExecutionMs)
 		results = append(results, mr)
 	}
 	return results, nil
@@ -966,6 +1019,13 @@ func FormatPlanOutput(result *ApplyResult) string {
 		}
 	}
 
+	for _, r := range result.Data {
+		if !r.Skipped {
+			fmt.Fprintf(&b, "  + %s (data)\n", r.Migration.Filename)
+			pending++
+		}
+	}
+
 	// A diff that produced no statements is marked Skipped, so the loop above
 	// never reaches it -- but "clean" and "clean, and we could not verify it"
 	// are different answers. Surface the warning either way, without counting
@@ -1047,6 +1107,7 @@ func FormatApplyOutput(result *ApplyResult) string {
 	}
 	writeResults(result.Logic)
 	writeResults(result.Permissions)
+	writeResults(result.Data)
 
 	summary := fmt.Sprintf("\nApplied: %d, Skipped: %d, Failed: %d\n", applied, skipped, failed)
 	return w.String() + b.String() + summary
