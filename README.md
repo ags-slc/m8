@@ -64,6 +64,26 @@ go install github.com/ags-slc/m8@latest
 
 Download from [GitHub Releases](https://github.com/ags-slc/m8/releases).
 
+#### Verify the download
+
+Releases are signed with cosign keyless signing. The signature covers
+`checksums.txt`, so verify the bundle, then check your archive against it:
+
+```bash
+cosign verify-blob \
+  --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp 'https://github.com/ags-slc/m8/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  checksums.txt
+
+shasum -a 256 --ignore-missing -c checksums.txt   # sha256sum -c on Linux
+```
+
+Verifying the bundle alone only authenticates a checksums file you never
+compared against, so both steps are needed. Verification requires **cosign >=
+v2.4.2**: the signature is a single `.sigstore.json` bundle, not a `.pem`/`.sig`
+pair. `v0.1.0` is unsigned.
+
 ## Quick Start
 
 ```bash
@@ -92,7 +112,7 @@ m8 new data "backfill destination country"
 
 ## Migration Layout
 
-Organize SQL files in four directories:
+Organize SQL files in five directories:
 
 ```
 migrations/
@@ -231,6 +251,13 @@ Identifiers are always quoted, so mixed case, spaces, and reserved words
 (`order`, `select`) survive the round trip. Unquoted, a foreign-key target does
 not error -- it resolves to a different table.
 
+A schema or table whose name is not usable as a single path component makes
+`m8 dump` refuse the run rather than write the file somewhere else -- rename the
+object, or pass `--stdout`, which prints the DDL instead of writing anything.
+Function and view names are instead sanitized into filenames and
+hash-disambiguated on collision, so a `logic/` file's name may differ from the
+catalog name while the quoted identifier inside it does not.
+
 Privileges are read from the catalog (`relacl`, `attacl`, `nspacl`, `proacl`),
 not from `information_schema`, whose views are filtered to grants the *dumping*
 role can see. The capture covers schema `USAGE`/`CREATE`, relation and
@@ -269,7 +296,7 @@ and replica identity**, plus roles themselves, event triggers, and
 | `m8 apply` | Apply pending migrations (ops → schema → logic → permissions → data) |
 | `m8 plan` | Show what would be applied without making changes (exit code 2 if pending) |
 | `m8 status` | Show applied, pending, changed, and drifted migrations |
-| `m8 sync` | One-time convergence for brownfield adoption |
+| `m8 sync` | One-time convergence for brownfield adoption (`ops/` and `data/` are baselined, not run) |
 | `m8 baseline` | Mark migrations as applied without running them |
 | `m8 dump` | Export database objects to migration files |
 | `m8 new` | Scaffold a new migration file in the correct folder |
@@ -348,6 +375,12 @@ database_url: postgres://user:pass@localhost:5432/mydb?sslmode=prefer
 ```
 
 **Priority order:** CLI flags > environment variables > `.m8.yaml` > defaults
+
+The boolean safety settings are the exception: `strict`, `fail_on_unvalidated`
+and `require_shadow` are OR-ed across sources, so a lower-priority source can
+turn one on and a higher-priority one cannot turn it back off. `--strict=false`
+does not clear `strict: true` in `.m8.yaml`, and `require_shadow` forces
+`fail_on_unvalidated` on unconditionally. Clear the setting at its source.
 
 ### Environment Variables
 

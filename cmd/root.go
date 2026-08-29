@@ -46,7 +46,7 @@ var (
 var rootCmd = &cobra.Command{
 	Use:   "m8",
 	Short: "PostgreSQL migration tool",
-	Long:  "m8 (mate) -- a PostgreSQL-specific migration tool with schema, logic, permissions, and ops migrations.",
+	Long:  "m8 (mate) -- a PostgreSQL-specific migration tool with schema, logic, permissions, ops, and data migrations.",
 	// A failed connection or migration is not a usage error: don't answer it
 	// with the full help text. Execute() is the single place errors are printed.
 	SilenceUsage:  true,

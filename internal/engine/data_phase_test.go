@@ -5,8 +5,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ags-slc/m8/internal/migration"
+	"github.com/ags-slc/m8/internal/state"
+	"github.com/jackc/pgx/v5"
 )
 
 // The migration this phase exists for: a one-time backfill that reads a column
@@ -291,5 +294,119 @@ CREATE TABLE IF NOT EXISTS _m8.history (
 	}
 	if n != 1 {
 		t.Errorf("history has %d successful data rows, want 1", n)
+	}
+}
+
+// The CHECK upgrade is a probe followed by a mutation, so two m8 processes can
+// both pass the guard: Status calls EnsureSchema without the advisory lock
+// Apply takes, and the upgrade window is exactly when a team runs both against
+// the same database. The loser blocks on the winner's ALTER, then finds the
+// constraint already there. Without the exception handler in schema.sql that is
+// a 42710 that aborts the whole bootstrap -- an upgrade to this release failing
+// a deploy because a dashboard ran `m8 status` at the wrong moment.
+//
+// The race is driven deterministically rather than raced for: the winner holds
+// its transaction open until the loser is provably parked on the lock.
+func TestEnsureSchemaSurvivesAConcurrentTypeCheckUpgrade(t *testing.T) {
+	conn, _, connStr, cleanup := testDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	legacy := `
+CREATE SCHEMA IF NOT EXISTS _m8;
+CREATE TABLE IF NOT EXISTS _m8.history (
+    id            BIGSERIAL PRIMARY KEY,
+    version       TEXT,
+    name          TEXT NOT NULL,
+    type          TEXT NOT NULL CHECK (type IN ('ops', 'schema', 'logic', 'permissions')),
+    pg_schema     TEXT,
+    checksum      TEXT NOT NULL,
+    applied_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    execution_ms  BIGINT NOT NULL DEFAULT 0,
+    applied_by    TEXT NOT NULL DEFAULT current_user,
+    success       BOOLEAN NOT NULL DEFAULT true
+);`
+	if _, err := conn.Exec(ctx, legacy); err != nil {
+		t.Fatalf("seeding the legacy state table: %v", err)
+	}
+
+	// The winner: the same upgrade schema.sql performs, held open so it owns
+	// ACCESS EXCLUSIVE on _m8.history and stays invisible to the loser's probe.
+	winner, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		t.Fatalf("connecting the second session: %v", err)
+	}
+	defer func() { _ = winner.Close(ctx) }()
+
+	tx, err := winner.Begin(ctx)
+	if err != nil {
+		t.Fatalf("beginning the winner's transaction: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(ctx, `
+ALTER TABLE _m8.history DROP CONSTRAINT IF EXISTS history_type_check;
+ALTER TABLE _m8.history ADD CONSTRAINT m8_history_type_check
+    CHECK (type IN ('ops', 'schema', 'logic', 'permissions', 'data'));`); err != nil {
+		t.Fatalf("the winner's upgrade: %v", err)
+	}
+
+	// The loser. conn is handed to the goroutine and must not be touched here
+	// until it comes back -- a pgx.Conn is not safe for concurrent use.
+	done := make(chan error, 1)
+	go func() { done <- state.NewStore(conn).EnsureSchema(ctx) }()
+
+	// Park until the loser is demonstrably inside the DO block's ALTER, waiting
+	// on the winner's lock. Asserting the mode is what keeps this test honest:
+	// AccessExclusiveLock on _m8.history is requested by nothing else in
+	// schema.sql, so reaching it proves the guard was passed by both sessions
+	// and the exception handler is about to be the thing under test.
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		var waiting int
+		if err := tx.QueryRow(ctx, `
+SELECT count(*) FROM pg_locks
+WHERE relation = '_m8.history'::regclass
+  AND mode = 'AccessExclusiveLock'
+  AND NOT granted`).Scan(&waiting); err != nil {
+			t.Fatalf("polling pg_locks: %v", err)
+		}
+		if waiting > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the second EnsureSchema never blocked on the upgrade; " +
+				"this test is not exercising the race it exists for")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("committing the winner: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("EnsureSchema lost the upgrade race instead of tolerating it: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("EnsureSchema never returned after the winner committed")
+	}
+
+	// One constraint, not two, and the table now admits 'data'.
+	var n int
+	if err := conn.QueryRow(ctx, `
+SELECT count(*) FROM pg_constraint
+WHERE conrelid = '_m8.history'::regclass
+  AND conname = 'm8_history_type_check'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("_m8.history carries %d constraints named m8_history_type_check, want 1", n)
+	}
+	if _, err := conn.Exec(ctx,
+		"INSERT INTO _m8.history (name, type, checksum) VALUES ('probe', 'data', 'x')"); err != nil {
+		t.Errorf("the upgraded table still rejects type='data': %v", err)
 	}
 }
