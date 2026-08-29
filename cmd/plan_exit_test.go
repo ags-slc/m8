@@ -51,3 +51,28 @@ func schemaDiffWithChanges() *schema.DiffResult {
 		HasChanges: true,
 	}
 }
+
+// A pending data/ migration must set exit code 2 like any other pending work.
+// The gate is what tells a reviewer the merge will change the database; a phase
+// invisible to it applies unannounced.
+func TestPendingDataMigrationIsPending(t *testing.T) {
+	r := &engine.ApplyResult{
+		Data: []engine.MigrationResult{
+			{Migration: &migration.Migration{Filename: "data/20260828_001__backfill.sql"}},
+		},
+	}
+	if !hasPending(r) {
+		t.Error("a non-skipped data/ migration should count as pending")
+	}
+}
+
+func TestAppliedDataMigrationIsNotPending(t *testing.T) {
+	r := &engine.ApplyResult{
+		Data: []engine.MigrationResult{
+			{Migration: &migration.Migration{Filename: "data/20260828_001__backfill.sql"}, Skipped: true},
+		},
+	}
+	if hasPending(r) {
+		t.Error("an already-applied data/ migration should not count as pending")
+	}
+}

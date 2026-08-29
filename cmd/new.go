@@ -19,7 +19,12 @@ Types and naming:
   m8 new schema materialized/rpt   → migrations/schema/materialized/rpt.sql
   m8 new logic proc_refresh        → migrations/logic/proc_refresh.sql
   m8 new permissions grants        → migrations/permissions/grants.sql
-  m8 new ops "create extensions"   → migrations/ops/{timestamp}__create_extensions.sql`,
+  m8 new ops "create extensions"   → migrations/ops/{timestamp}__create_extensions.sql
+  m8 new data "backfill country"   → migrations/data/{timestamp}__backfill_country.sql
+
+ops/ runs FIRST, before schema/ and logic/; data/ runs LAST, after them. A
+one-time migration that reads or writes the objects this release introduces
+belongs in data/ -- in ops/ it would find nothing.`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		migType := strings.ToLower(args[0])
@@ -57,16 +62,16 @@ Types and naming:
 			}
 			relDir, filename = migType, name+".sql"
 
-		case "ops":
+		case "ops", "data":
 			ts := time.Now().UTC().Format("20060102_150405")
 			safeName := strings.ReplaceAll(strings.ToLower(name), " ", "_")
-			relDir, filename = "ops", ts+"__"+safeName+".sql"
+			relDir, filename = migType, ts+"__"+safeName+".sql"
 			if !safeComponent(filename) {
 				return fmt.Errorf("invalid name %q: must be a plain filename", name)
 			}
 
 		default:
-			return fmt.Errorf("unknown type %q (expected: schema, logic, permissions, ops)", migType)
+			return fmt.Errorf("unknown type %q (expected: schema, logic, permissions, ops, data)", migType)
 		}
 
 		r, err := openRoot(migrationsDir)
@@ -112,7 +117,10 @@ func templateFor(migType, name string) string {
 	case "permissions":
 		return "-- Define grants, revokes, and role permissions here.\n"
 	case "ops":
-		return "-- One-time operation. This file runs once in order.\n"
+		return "-- One-time operation. This file runs once in order, BEFORE schema/ and logic/.\n"
+	case "data":
+		return "-- One-time data migration. Runs once in order, AFTER schema/, logic/ and\n" +
+			"-- permissions/ -- so every object this release introduces already exists.\n"
 	default:
 		return ""
 	}

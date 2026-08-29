@@ -71,7 +71,7 @@ func testDB(t *testing.T) (*pgx.Conn, *sql.DB, string, func()) {
 func setupMigrationsDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	for _, sub := range []string{"ops", "schema/public", "logic", "permissions"} {
+	for _, sub := range []string{"ops", "schema/public", "logic", "permissions", "data"} {
 		mustMkdirAll(t, filepath.Join(dir, sub), 0755)
 	}
 	return dir

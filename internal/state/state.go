@@ -61,14 +61,21 @@ func (s *Store) SchemaExists(ctx context.Context) (bool, error) {
 
 // GetAppliedOps returns all successfully applied ops migrations, sorted by version.
 func (s *Store) GetAppliedOps(ctx context.Context) ([]HistoryRow, error) {
+	return s.GetAppliedVersioned(ctx, "ops")
+}
+
+// GetAppliedVersioned returns all successfully applied one-time migrations of a
+// versioned type ("ops" or "data"), sorted by version. The two are separate
+// namespaces: each has its own partial unique index on version.
+func (s *Store) GetAppliedVersioned(ctx context.Context, typ string) ([]HistoryRow, error) {
 	rows, err := s.conn.Query(ctx, `
 		SELECT id, version, name, type, pg_schema, checksum, applied_at, execution_ms, applied_by, success
 		FROM _m8.history
-		WHERE type = 'ops' AND success = true
+		WHERE type = $1 AND success = true
 		ORDER BY version ASC
-	`)
+	`, typ)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query ops history: %w", err)
+		return nil, fmt.Errorf("failed to query %s history: %w", typ, err)
 	}
 	defer rows.Close()
 	return scanHistoryRows(rows)

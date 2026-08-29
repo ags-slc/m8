@@ -4,7 +4,8 @@ CREATE TABLE IF NOT EXISTS _m8.history (
     id            BIGSERIAL PRIMARY KEY,
     version       TEXT,
     name          TEXT NOT NULL,
-    type          TEXT NOT NULL CHECK (type IN ('ops', 'schema', 'logic', 'permissions')),
+    type          TEXT NOT NULL CONSTRAINT m8_history_type_check
+                      CHECK (type IN ('ops', 'schema', 'logic', 'permissions', 'data')),
     pg_schema     TEXT,
     checksum      TEXT NOT NULL,
     applied_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -13,9 +14,32 @@ CREATE TABLE IF NOT EXISTS _m8.history (
     success       BOOLEAN NOT NULL DEFAULT true
 );
 
+-- Widen the type CHECK on installs created before data/ existed. Those carry
+-- PostgreSQL's auto-generated `history_type_check`, which rejects 'data' and
+-- would fail the first data/ migration's history row -- after the migration had
+-- already run. Keyed on the NAMED constraint so this is a no-op forever after.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = '_m8.history'::regclass
+          AND conname = 'm8_history_type_check'
+    ) THEN
+        ALTER TABLE _m8.history DROP CONSTRAINT IF EXISTS history_type_check;
+        ALTER TABLE _m8.history ADD CONSTRAINT m8_history_type_check
+            CHECK (type IN ('ops', 'schema', 'logic', 'permissions', 'data'));
+    END IF;
+END $$;
+
 CREATE UNIQUE INDEX IF NOT EXISTS idx_history_version_success
     ON _m8.history (version)
     WHERE success = true AND type = 'ops';
+
+-- data/ versions are one-time too, and live in their own namespace: a data/
+-- file may carry the same timestamp as an ops/ file without colliding.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_history_data_version_success
+    ON _m8.history (version)
+    WHERE success = true AND type = 'data';
 
 CREATE INDEX IF NOT EXISTS idx_history_latest_by_name
     ON _m8.history (name, type, applied_at DESC)
