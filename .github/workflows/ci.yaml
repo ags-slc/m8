@@ -34,12 +34,14 @@ jobs:
           done
 
       - name: Unit tests
-        run: go test ./internal/parser/... ./internal/migration/... ./internal/schema/... ./internal/config/... -v -count=1
+        run: go test ./internal/parser/... ./internal/migration/... ./internal/schema/... ./internal/pgident/... ./internal/config/... -v -count=1
 
-      # -p 1: these two packages each spin up PostgreSQL containers; running them
-      # in parallel has produced intermittent failures.
+      # -p 1: these packages each spin up PostgreSQL containers; running them in
+      # parallel has produced intermittent failures. cmd belongs here rather than
+      # above because cmd/pool_test.go starts a container too -- and until it was
+      # listed, nothing under ./cmd ran on a pull request at all.
       - name: Integration tests
-        run: go test ./internal/engine/... ./internal/dump/... -v -count=1 -p 1 -timeout 600s
+        run: go test ./internal/engine/... ./internal/dump/... ./cmd/... -v -count=1 -p 1 -timeout 600s
 
   lint:
     runs-on: ubuntu-latest

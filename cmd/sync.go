@@ -11,8 +11,8 @@ var syncCmd = &cobra.Command{
 	Use:   "sync",
 	Short: "One-time convergence of an existing database to match migration files",
 	Long: `Diffs schema/ files against the live database and applies changes,
-then applies all logic/ and permissions/ files. Ops/ files are baselined
-(marked as applied without executing).
+then applies all logic/ and permissions/ files. Ops/ and data/ files are
+baselined (marked as applied without executing).
 
 Use this for brownfield adoption: you have an existing database and want
 m8 to bring it in line with your migration files. After sync, use 'apply'

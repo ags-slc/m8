@@ -18,6 +18,13 @@ CREATE TABLE IF NOT EXISTS _m8.history (
 -- PostgreSQL's auto-generated `history_type_check`, which rejects 'data' and
 -- would fail the first data/ migration's history row -- after the migration had
 -- already run. Keyed on the NAMED constraint so this is a no-op forever after.
+--
+-- The guard is a probe followed by a mutation, so two m8 processes can both
+-- pass it: `status` calls EnsureSchema without the advisory lock that `apply`
+-- takes, and the upgrade window is exactly when everyone runs both. The loser
+-- blocks on the winner's ALTER, then finds the constraint already there and
+-- raises 42710, which would abort the whole bootstrap. Swallow that one error
+-- -- it means the upgrade this block exists to perform has happened.
 DO $$
 BEGIN
     IF NOT EXISTS (
@@ -29,6 +36,8 @@ BEGIN
         ALTER TABLE _m8.history ADD CONSTRAINT m8_history_type_check
             CHECK (type IN ('ops', 'schema', 'logic', 'permissions', 'data'));
     END IF;
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
 END $$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_history_version_success

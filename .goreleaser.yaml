@@ -55,9 +55,14 @@ changelog:
   sort: asc
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
+      # Scoped, per conventional commits: a bare "^docs:" misses
+      # "docs(changelog):", which is how this repo actually writes them. v0.2.0's
+      # published notes carried six such commits plus ten "Merge pull request"
+      # lines -- every one of them noise these filters were meant to drop.
+      - '^docs(\(.+\))?:'
+      - '^test(\(.+\))?:'
+      - '^chore(\(.+\))?:'
+      - '^Merge '
 
 # Homebrew tap (cask — the formula path is deprecated in GoReleaser).
 # Works on macOS and Linux (Homebrew supports casks on both since brew 4.x).

@@ -3,7 +3,32 @@
 Notable changes to m8. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-29
+
+> ### Upgrade before your next `m8 dump` of a database others can write to
+>
+> **In `v0.1.0` and `v0.2.0`, a name in the target database chose where `m8 dump`
+> wrote.** Schema, table, function and view names all become path components, a
+> quoted PostgreSQL identifier may legally contain `/` and `..`, and nothing
+> sanitized them -- so an object named `../../../../x` wrote outside the
+> migrations tree, and the `MkdirAll` on the schema component created whatever
+> directories it took to get there. Planting such a name needs `CREATE` on one
+> schema and nothing else: the dump's introspection applies no ownership or ACL
+> filter.
+>
+> Escaping the tree is the smaller half. A name of `../ops/20260101_001__x` lands
+> in `ops/`, whose contents `apply` runs verbatim rather than diffing them as
+> declarative state, and overwriting a reviewed `logic/` file is exactly what
+> makes the next `apply` **re-run** it -- the checksum in `_m8.history` is a
+> re-run trigger, not a tamper gate. Either way SQL written by an unprivileged
+> database user is executed by the role that runs your migrations, in every
+> environment the repository reaches.
+>
+> It is not remote and not unattended: an operator has to run `m8 dump`, commit
+> the result, and apply it. It is fixed in this release. **If you dumped with
+> `v0.1.0` or `v0.2.0` against a database you do not fully control, re-run
+> `m8 dump` on this release and read the diff before applying** -- especially any
+> file in `ops/`, `logic/` or `permissions/` you do not remember reviewing.
 
 ### Added
 
@@ -24,16 +49,77 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `data/` also has its own version namespace, so a release may add an `ops/` and
   a `data/` file bearing the same timestamp.
 
-  `m8 new data "<name>"` scaffolds one.
+  `m8 new data "<name>"` scaffolds one. `plan`, `status` and `apply` report
+  `data/` alongside the other phases, and a pending `data/` file makes `plan`
+  exit 2 like any other pending change.
+
+  `sync` and `baseline` **baseline** `data/` rather than run it, exactly as they
+  do `ops/`. Brownfield adoption meets a database whose data is already whatever
+  it is; replaying a backfill over it is at best wasted work. A `data/` file
+  written after adoption has to go through `apply` -- `sync` and `baseline` will
+  record it applied without executing it.
+
+  **Upgrade every runner before the first `data/` file merges.** `v0.2.0` and
+  earlier do not know the folder exists -- they discover nothing in it, report
+  the release fully applied, and exit 0 from `plan` when a `data/` migration is
+  the only pending work. Nothing is destroyed, because no history row is written
+  and the file applies on the first run of a new enough binary. But a CI gate
+  keyed on `plan`'s exit code goes green while the backfill has not run.
 
 ### Changed
 
 - `_m8.history`'s `type` CHECK now admits `'data'`, and carries the explicit
-  name `m8_history_type_check`. **Existing installs are upgraded in place** by
-  `EnsureSchema` on the next command: they carry PostgreSQL's auto-generated
-  `history_type_check`, which would have let a `data/` migration run and then
-  rejected its history row -- applied but unrecorded, the worst possible order.
-  The upgrade is keyed on the constraint name, so it happens once.
+  name `m8_history_type_check`. Existing installs carry PostgreSQL's
+  auto-generated `history_type_check`, which would have let a `data/` migration
+  run and then rejected its history row -- applied but unrecorded, the worst
+  possible order. **They are upgraded in place** by `EnsureSchema` on the next
+  `apply`, `status`, `sync` or `baseline`; `plan` stays read-only and changes
+  nothing. The upgrade is keyed on the constraint name, so it happens once, and
+  is safe against two m8 processes racing into it.
+
+- **`m8 dump` settles a logic filename before it writes it.** Function and view
+  file names now route through a sanitizer -- every run of characters outside
+  `[A-Za-z0-9_.-]` becomes `_`, with the existing hash dedup separating whatever
+  that collapses together. `$` and non-ASCII letters are both legal in a
+  PostgreSQL identifier, so an object named `v_orders$raw` or `vista_café` gets a
+  different filename than it did in `v0.2.0`. Re-dumping an existing tree leaves
+  the old file beside the new one: delete the superseded `logic/` files, or the
+  next `apply` re-runs the object under its new name while the old file stays
+  recorded as applied. Schema and table names are refused rather than sanitized
+  -- see **Security**.
+
+### Fixed
+
+- **`dump` silently omitted every schema and function whose name starts with
+  `pg` followed by any single character.** `ListSchemas` and `ListFunctions`
+  filtered on `NOT LIKE 'pg_%'` with the `_` unescaped, where it is a
+  single-character wildcard -- so `pgboss`, `pgagent` and anything shaped like
+  them were excluded along with the `pg_` catalog names the filter was aimed at.
+  A schema dropped this way took every table, view, function and grant in it
+  with no error and no warning, and a baseline taken from such a database was
+  quietly incomplete. Both patterns are now `'pg\_%'`, as the grant queries in
+  `internal/dump/permissions.go` already were. Re-dumping on this release adds
+  files for objects it previously ignored, and the next `m8 plan` will propose
+  to manage them.
+
+### Security
+
+- **`dump` and `new` can no longer be steered outside the migrations
+  directory.** Every mkdir and open now goes through `os.Root` confined to the
+  migrations tree, which also defeats a symlink that a lexical path check would
+  miss. Names are settled before they are joined, because confinement alone is
+  not enough: `filepath.Join("schema", "../ops")` cleans to `ops`, which is
+  perfectly local and perfectly executable.
+
+  Schema and table names **fail closed** -- `dump` refuses the run rather than
+  merge two objects into one filename, because there is no dedup pass on that
+  path. `--stdout` still prints such a database. Function and view names are
+  sanitized instead, which is safe only because logic filenames already end in a
+  hash-based dedup. `m8 new` built paths out of `argv` the same way
+  (`m8 new logic ../../../x`) and now validates through the same helper.
+
+  This is a behaviour change as well as a fix: a table literally named `a/b`
+  used to dump, and now fails the run with exit 1.
 
 ## [0.2.0] - 2026-08-25
 
@@ -161,5 +247,6 @@ Initial release. The m8 CLI scaffold: `plan`, `apply`, `dump`, `baseline`,
 `sync`, `status`, `new`, and `version`. Superseded by `0.2.0` — see the upgrade
 note above before running it against anything you care about.
 
+[0.3.0]: https://github.com/ags-slc/m8/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ags-slc/m8/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ags-slc/m8/releases/tag/v0.1.0
