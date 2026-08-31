@@ -42,6 +42,27 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   rather than a raw total plus one arbitrary example, so a single genuinely
   unbuildable table is not buried under noise.
 
+## [Unreleased]
+
+### Fixed
+
+- **m8 refused a plan without saying it had tried to rescue it.** `0.3.2` moved
+  the explanation of a failed dependency import into its own `RecoveryNote`
+  field, because folding it into `ValidationSkippedReason` meant `firstLine`
+  truncated it away — but only the plan renderer was taught to print it. Three
+  of the four places that render the reason still dropped the note, including
+  the refusal raised under `--fail-on-unvalidated` / `require_shadow`. That is
+  the message an operator is actually stopped by, and the configuration this
+  whole recovery exists to unblock: m8 declined the plan, showed one truncated
+  line of a pg-schema-diff error, and said nothing about what it had imported,
+  skipped, or given up on. The note now appears in the refusal, in `status`
+  output, and in the apply summary.
+
+- **The refusal's advice was stale.** It stated that validation "fails when an
+  object in this schema is defined in terms of another schema" — the exact case
+  m8 has tried to handle since `0.3.1`. It now says validation imports the
+  schemas a rebuild depends on and reports what actually went wrong.
+
 ## [0.3.2] - 2026-08-31
 
 ### Fixed

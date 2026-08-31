@@ -2275,3 +2275,180 @@ func TestUnvalidatedSchemasReportsADiffWithStatements(t *testing.T) {
 		t.Errorf("unvalidated diff with statements was not reported: %v", names)
 	}
 }
+
+// recoveryNoteDiff is a degraded diff whose recovery was attempted and failed.
+// It is the shape that made this gap invisible: the reason is a multi-line
+// pg-schema-diff error, every renderer truncates it with firstLine, and the
+// explanation of what m8 tried lives in RecoveryNote.
+func recoveryNoteDiff(hasChanges bool) *schema.DiffResult {
+	d := &schema.DiffResult{
+		Name:              "materialized",
+		HasChanges:        hasChanges,
+		ValidationSkipped: true,
+		ValidationSkippedReason: "validating plan: rebuilding the schema failed\n" +
+			"  detail: relation \"app_admin.contract\" does not exist\n" +
+			"  hint: this line and everything after it is truncated by firstLine",
+		RecoveryNote: "importing the schemas it depends on did not help: " +
+			"schemas app_admin hold 4210 relations, over the 200 m8 will import",
+	}
+	if hasChanges {
+		d.Statements = []schema.DiffStatement{{DDL: `ALTER TABLE "materialized"."rpt" ADD COLUMN "c" text`}}
+	}
+	return d
+}
+
+const recoveryNoteMarker = "did not help"
+
+// The refusal is the message an operator is actually stopped by, and it is the
+// one place the note matters most: m8 declines to apply the plan, and without
+// this said nothing about having tried to rescue it. Diagnosing that took a
+// psql session against production.
+func TestRefusalNamesWhatTheRecoveryTried(t *testing.T) {
+	err := unvalidatedRefusal("materialized", recoveryNoteDiff(true))
+	msg := err.Error()
+
+	if !strings.Contains(msg, recoveryNoteMarker) {
+		t.Errorf("the refusal says nothing about the attempted recovery:\n%s", msg)
+	}
+	if !strings.Contains(msg, "over the 200 m8 will import") {
+		t.Errorf("the refusal drops the reason the recovery gave up:\n%s", msg)
+	}
+	// The truncated tail must not appear: the note is a separate clause, not
+	// something folded into a reason that firstLine cuts.
+	if strings.Contains(msg, "truncated by firstLine") {
+		t.Errorf("the refusal leaks the truncated tail of the reason:\n%s", msg)
+	}
+	if !strings.Contains(msg, "materialized") || !strings.Contains(msg, "1 statement(s)") {
+		t.Errorf("the refusal lost the schema or the statement count:\n%s", msg)
+	}
+}
+
+// A recovery that was never attempted must not leave a dangling clause.
+func TestRefusalWithoutARecoveryNoteReadsCleanly(t *testing.T) {
+	d := recoveryNoteDiff(true)
+	d.RecoveryNote = ""
+	msg := unvalidatedRefusal("materialized", d).Error()
+
+	if strings.Contains(msg, recoveryNoteMarker) {
+		t.Errorf("refusal invented a recovery note:\n%s", msg)
+	}
+	if strings.Contains(msg, "set). Validation") == false {
+		t.Errorf("refusal has a gap or doubled space where the note would go:\n%s", msg)
+	}
+}
+
+func TestFormatPlanOutputShowsRecoveryNoteOnADegradedPlan(t *testing.T) {
+	result := &ApplyResult{
+		Schema: []SchemaResult{{
+			Migration: &migration.Migration{Filename: "schema/materialized/x.sql"},
+			Diff:      recoveryNoteDiff(true),
+		}},
+	}
+	out := FormatPlanOutput(result)
+	if !strings.Contains(out, recoveryNoteMarker) {
+		t.Errorf("plan output drops the recovery note:\n%s", out)
+	}
+}
+
+// The clean-but-unvalidated branch is a separate code path with its own
+// renderer -- the same split that once let the PLAN_NOT_VALIDATED warning
+// itself go missing here.
+func TestFormatPlanOutputShowsRecoveryNoteWhenNothingIsPending(t *testing.T) {
+	result := &ApplyResult{
+		Schema: []SchemaResult{{
+			Migration: &migration.Migration{Filename: "schema/materialized/x.sql"},
+			Skipped:   true,
+			Diff:      recoveryNoteDiff(false),
+		}},
+	}
+	out := FormatPlanOutput(result)
+	if !strings.Contains(out, "No pending migrations") {
+		t.Fatalf("test drives the wrong branch:\n%s", out)
+	}
+	if !strings.Contains(out, recoveryNoteMarker) {
+		t.Errorf("up-to-date output drops the recovery note:\n%s", out)
+	}
+}
+
+func TestFormatApplyOutputShowsRecoveryNoteAfterApplying(t *testing.T) {
+	result := &ApplyResult{
+		Schema: []SchemaResult{{
+			Migration: &migration.Migration{Filename: "schema/materialized/x.sql"},
+			Applied:   true,
+			Diff:      recoveryNoteDiff(true),
+		}},
+	}
+	out := FormatApplyOutput(result)
+	if !strings.Contains(out, recoveryNoteMarker) {
+		t.Errorf("apply output drops the recovery note:\n%s", out)
+	}
+}
+
+// The note must never be folded into the reason: that string is multi-line and
+// every renderer truncates it, which is the precise mechanism that hid it.
+func TestRecoveryNoteIsNotFoldedIntoTheTruncatedReason(t *testing.T) {
+	result := &ApplyResult{
+		Schema: []SchemaResult{{
+			Migration: &migration.Migration{Filename: "schema/materialized/x.sql"},
+			Applied:   true, // FormatApplyOutput only warns about what it applied
+			Diff:      recoveryNoteDiff(true),
+		}},
+	}
+	for name, out := range map[string]string{
+		"plan":  FormatPlanOutput(result),
+		"apply": FormatApplyOutput(result),
+	} {
+		if strings.Contains(out, "truncated by firstLine") {
+			t.Errorf("%s output leaks the truncated tail of the reason:\n%s", name, out)
+		}
+		if !strings.Contains(out, recoveryNoteMarker) {
+			t.Errorf("%s output drops the recovery note:\n%s", name, out)
+		}
+	}
+}
+
+// TestEveryRenderOfTheReasonAlsoRendersTheNote is a guard on the CLASS of bug,
+// not an instance of it.
+//
+// ValidationSkippedReason is a multi-line pg-schema-diff error and every
+// renderer truncates it with firstLine. RecoveryNote exists because anything
+// appended to that reason is therefore invisible. The failure mode is not that
+// the field is wrong -- it was always set correctly -- but that a renderer
+// forgets it, which is silent: the operator simply is not told what m8 tried.
+// That shipped in v0.3.2 at three of the four sites.
+//
+// So: any code that renders the reason must render the note beside it. This
+// scans the source because the defect lives in the seam between a correct
+// struct and the code that prints it, which per-renderer tests keep missing --
+// they are only ever written for the renderers someone remembered.
+func TestEveryRenderOfTheReasonAlsoRendersTheNote(t *testing.T) {
+	src, err := os.ReadFile("engine.go")
+	if err != nil {
+		t.Fatalf("read engine.go: %v", err)
+	}
+	lines := strings.Split(string(src), "\n")
+
+	const window = 12
+	for i, line := range lines {
+		// Only actual renders: skip prose in comments.
+		if !strings.Contains(line, "ValidationSkippedReason") {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		lo, hi := i-window, i+window
+		if lo < 0 {
+			lo = 0
+		}
+		if hi >= len(lines) {
+			hi = len(lines) - 1
+		}
+		if !strings.Contains(strings.Join(lines[lo:hi+1], "\n"), "RecoveryNote") {
+			t.Errorf("engine.go:%d renders ValidationSkippedReason with no RecoveryNote "+
+				"within %d lines:\n\t%s\n\nThe reason is truncated by firstLine, so a note "+
+				"folded into it is invisible. Render it on its own line.",
+				i+1, window, strings.TrimSpace(line))
+		}
+	}
+}
