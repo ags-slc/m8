@@ -3,7 +3,7 @@
 Notable changes to m8. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.2] - 2026-08-31
 
 ### Fixed
 
@@ -301,6 +301,7 @@ Initial release. The m8 CLI scaffold: `plan`, `apply`, `dump`, `baseline`,
 `sync`, `status`, `new`, and `version`. Superseded by `0.2.0` — see the upgrade
 note above before running it against anything you care about.
 
+[0.3.2]: https://github.com/ags-slc/m8/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ags-slc/m8/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ags-slc/m8/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ags-slc/m8/compare/v0.1.0...v0.2.0
