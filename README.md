@@ -484,19 +484,36 @@ output says what had to be imported to get there:
 Importing is best effort *within* the import too. A dependency schema routinely
 holds objects of its own that reach into a third schema, and those simply cannot
 be created in the rebuild — so they are **skipped**, and the plan output says how
-many and which. That is safe because the seed is scaffolding, not the thing under
-test: what must hold is that the target schema rebuilds and the plan converges
-against it. If a skipped object was one the target actually needed, the rebuild
-fails and the plan degrades as before. A skipped object cannot make a bad plan
-look good.
+many and of what kind:
+
+```
+      imported app_admin into the rebuild; 1 object(s) in it could not be
+      created and were skipped: 1 CREATE VIEW (first: CREATE VIEW
+      "app_admin"."usage_summary" AS ... (ERROR: relation
+      "billing.usage_record" does not exist))
+```
+
+Skipping is safe because the seed is scaffolding, not the thing under test: what
+must hold is that the target schema rebuilds and the plan converges against it.
+If a skipped object was one the target actually needed, the rebuild fails and the
+plan degrades as before. A skipped object cannot make a bad plan look good.
+
+The import carries **shape only**. Privileges are dropped from it: a throwaway
+database holds none of the roles, so every `GRANT` would fail and be skipped, and
+no generated statement's success depends on a grant existing. Harvesting them
+was both pure waste and actively misleading — they outnumbered everything else,
+so the one object that genuinely could not be built was buried behind them.
 
 The recovery as a whole is best effort by construction: it can turn a refused
 plan into a validated one, never the reverse. It gives up — leaving exactly the
 `PLAN_NOT_VALIDATED` degrade that came before it, and saying why — when
 
-- the dependency is **too large** to import cheaply (over 200 relations — a
-  dependency that big is a sign the schema boundary is wrong, not that the cap
-  is too low);
+- the dependency is **too large** to import cheaply — over 200 relations, or a
+  harvest of over 2000 statements. The relation count is a cheap pre-filter; the
+  statement count is what is actually paid, once per temp database, and the two
+  are not proportional (indexes and constraints multiply per relation). A
+  dependency that big is a sign the schema boundary is wrong, not that the cap is
+  too low;
 - the object's **only** reach into another schema is a **function call**, which
   the catalog records against `pg_proc` and this does not chase. (When the object
   also reads a relation there, the schema is discovered and the import brings its

@@ -104,7 +104,7 @@ type Differ struct {
 	// the validation retry.
 	seedMu      sync.Mutex
 	seedDDL     []string
-	seedSkipped []string
+	seedSkipped []seedSkip
 	created     *tempDBTracker // temp DBs this process asked the factory to create
 }
 
@@ -478,8 +478,8 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 			seededSchemas = seeded
 			if skipped := d.takeSkipped(); len(skipped) > 0 {
 				recoveryNote = fmt.Sprintf(
-					"imported %s into the rebuild; %d object(s) in it could not be created and were skipped (first: %s)",
-					strings.Join(seeded, ", "), len(skipped), skipped[0])
+					"imported %s into the rebuild; %d object(s) in it could not be created and were skipped: %s",
+					strings.Join(seeded, ", "), len(skipped), summarizeSkips(skipped))
 			}
 		} else {
 			// Seeding is best effort by construction: it can turn a refused
@@ -624,6 +624,14 @@ func (d *Differ) validateWithDependencies(
 	}
 	if len(seedDDL) == 0 {
 		return nil, nil, fmt.Errorf("schemas %s produced no DDL to import", strings.Join(deps, ", "))
+	}
+	// The relation count above is a pre-filter on a proxy. This is the cap on
+	// what the harvest actually produced, and applySeed pays it once per temp
+	// database the retry creates.
+	if len(seedDDL) > maxSeededStatements {
+		return nil, nil, fmt.Errorf(
+			"schemas %s harvested %d statements, over the %d m8 will import into a validation rebuild",
+			strings.Join(deps, ", "), len(seedDDL), maxSeededStatements)
 	}
 
 	disarm := d.seedTempDatabases(seedDDL)

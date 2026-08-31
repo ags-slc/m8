@@ -3,6 +3,45 @@
 Notable changes to m8. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The dependency import harvested the whole grant matrix, which it can never
+  apply.** Rebuilding a dependency schema means asking pg-schema-diff for an
+  empty-to-live diff, and that emits privileges along with shape — one statement
+  per privilege per grantee. A throwaway database holds none of those roles, so
+  every one failed with `42704` and was skipped. Against the database that
+  surfaced this, a schema of 84 relations produced **5268 statements**, and the
+  plan reported 5268 skipped objects with a `GRANT` as the example. Privileges
+  are now dropped from the harvest: no generated statement's success depends on
+  a grant existing, so the rebuild does not need them. A two-relation fixture
+  went from 15 harvested statements to 8.
+
+  This also *hid* real problems. The report named only the first skipped
+  statement, and with grants in the list the first was always a grant — an
+  object that genuinely could not be built was invisible behind thousands of
+  them.
+
+- **The seeding cap counted relations while the cost is statements.**
+  `maxSeededRelations` (200) is checked against `pg_class` entries of relkind
+  `r,p,v,m,f`; in the case above that returned 84, comfortably under the cap,
+  while the harvest went on to emit and execute 5268 statements against every
+  temp database the retry creates. The relation count stays as a cheap
+  pre-filter — one catalog query, and it rules out a CDC schema before the
+  expensive diff runs at all — and a `maxSeededStatements` cap (2000) now bounds
+  what the harvest actually produced.
+
+- **The skip count was multiplied by the number of temp databases.** The seed is
+  applied to every temp database a validation run creates, and each failure was
+  recorded again, so one unbuildable view was reported as two objects. Skips are
+  now deduplicated: the count means "objects that could not be built", not
+  "failures observed".
+
+- **Skips are reported by class.** `2 CREATE VIEW, 1 CREATE TABLE (first: …)`
+  rather than a raw total plus one arbitrary example, so a single genuinely
+  unbuildable table is not buried under noise.
+
 ## [0.3.2] - 2026-08-31
 
 ### Fixed

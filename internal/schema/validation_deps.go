@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/stripe/pg-schema-diff/pkg/diff"
@@ -19,6 +20,20 @@ import (
 // is too low -- so exceed it and m8 gives up on seeding and degrades to the
 // unvalidated plan it would have produced anyway.
 const maxSeededRelations = 200
+
+// maxSeededStatements caps the harvest itself.
+//
+// maxSeededRelations bounds the wrong unit: it counts pg_class entries, while
+// the cost is the statements applySeed executes once per temp database. The two
+// are not proportional. A schema of 84 relations harvested 5268 statements
+// against the database this was built for -- comfortably under the relation cap
+// and two orders of magnitude over its intent -- because indexes, constraints
+// and (until they were filtered) grants all multiply per relation.
+//
+// The relation count stays as a cheap pre-filter: it is one catalog query and
+// rules out a CDC schema before the expensive empty-to-live diff runs at all.
+// This is the backstop on what that diff actually produced.
+const maxSeededStatements = 2000
 
 // dependencySchemas returns the schemas that objects in targetSchema reach into.
 //
@@ -146,12 +161,29 @@ func (d *Differ) harvestSchemaDDL(ctx context.Context, liveDB *sql.DB, schemas [
 
 	out := make([]string, 0, len(plan.Statements))
 	for _, s := range plan.Statements {
+		// Permissions are not shape. No generated statement's success depends
+		// on a grant existing, and a throwaway database holds none of the
+		// roles, so every one of these fails with 42704 and is skipped --
+		// pure waste that also buries the skips that mean something. The
+		// harvest expands them per privilege per grantee, so they dominate:
+		// a 2-relation fixture emits 7 grants among 15 statements, and the
+		// 84-relation schema that prompted this emitted 5268 statements whose
+		// skip list opened with a grant to a role that does not exist.
+		if isGrantOrRevoke(s.DDL) {
+			continue
+		}
 		// CONCURRENTLY cannot run inside a transaction and buys nothing on an
 		// empty database. The seeded copy only has to satisfy the dependent
 		// object's definition, not reproduce its build strategy.
 		out = append(out, strings.ReplaceAll(s.DDL, " CONCURRENTLY", ""))
 	}
 	return out, nil
+}
+
+// isGrantOrRevoke reports whether a harvested statement only moves privileges.
+func isGrantOrRevoke(ddl string) bool {
+	t := strings.ToUpper(strings.TrimLeft(ddl, " \t\n\r"))
+	return strings.HasPrefix(t, "GRANT ") || strings.HasPrefix(t, "REVOKE ")
 }
 
 // seedTempDatabases arms the factory so every temp database it creates from now
@@ -185,18 +217,82 @@ func (d *Differ) seedTempDatabases(ddl []string) func() {
 // against it. If a skipped object was one the target actually needed, that
 // rebuild fails and the plan degrades exactly as it did before any of this
 // existed. A skipped object cannot make a bad plan look good.
-func (d *Differ) applySeed(ctx context.Context, db *sql.DB) []string {
+func (d *Differ) applySeed(ctx context.Context, db *sql.DB) []seedSkip {
 	d.seedMu.Lock()
 	ddl := d.seedDDL
 	d.seedMu.Unlock()
 
-	var skipped []string
+	var skipped []seedSkip
 	for _, stmt := range ddl {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			skipped = append(skipped, fmt.Sprintf("%s (%v)", firstLineOf(stmt), err))
+			skipped = append(skipped, seedSkip{
+				Kind:   statementKind(stmt),
+				Detail: fmt.Sprintf("%s (%v)", firstLineOf(stmt), err),
+			})
 		}
 	}
 	return skipped
+}
+
+// seedSkip is one statement the seed could not run.
+//
+// Kind is carried separately so the operator gets a breakdown rather than a
+// total and one arbitrary example. The total alone was actively misleading: it
+// was dominated by grants, and "first" was therefore always a grant, so a
+// single table that genuinely failed to build was invisible behind it.
+type seedSkip struct {
+	Kind   string
+	Detail string
+}
+
+// statementKind labels a DDL statement for grouping: "CREATE VIEW",
+// "ALTER TABLE", "CREATE MATERIALIZED VIEW". Falls back to the first word.
+func statementKind(ddl string) string {
+	fields := strings.Fields(strings.ToUpper(strings.TrimSpace(ddl)))
+	if len(fields) == 0 {
+		return "UNKNOWN"
+	}
+	switch fields[0] {
+	case "CREATE", "ALTER", "DROP":
+		// Skip the noise words some statements carry between the verb and the
+		// object type, so CREATE UNIQUE INDEX groups with CREATE INDEX.
+		for _, f := range fields[1:] {
+			switch f {
+			case "UNIQUE", "OR", "REPLACE", "IF", "NOT", "EXISTS", "TEMP", "TEMPORARY":
+				continue
+			case "MATERIALIZED":
+				return fields[0] + " MATERIALIZED VIEW"
+			default:
+				return fields[0] + " " + strings.TrimSuffix(f, "(")
+			}
+		}
+		return fields[0]
+	default:
+		return fields[0]
+	}
+}
+
+// summarizeSkips renders a skip list as a per-kind breakdown plus one example.
+func summarizeSkips(skipped []seedSkip) string {
+	counts := map[string]int{}
+	var order []string
+	for _, s := range skipped {
+		if _, seen := counts[s.Kind]; !seen {
+			order = append(order, s.Kind)
+		}
+		counts[s.Kind]++
+	}
+	sort.Slice(order, func(i, j int) bool {
+		if counts[order[i]] != counts[order[j]] {
+			return counts[order[i]] > counts[order[j]]
+		}
+		return order[i] < order[j]
+	})
+	parts := make([]string, 0, len(order))
+	for _, k := range order {
+		parts = append(parts, fmt.Sprintf("%d %s", counts[k], k))
+	}
+	return fmt.Sprintf("%s (first: %s)", strings.Join(parts, ", "), skipped[0].Detail)
 }
 
 func firstLineOf(s string) string {
@@ -207,7 +303,7 @@ func firstLineOf(s string) string {
 }
 
 // noteSkipped records objects the seed could not create, for the operator.
-func (d *Differ) noteSkipped(skipped []string) {
+func (d *Differ) noteSkipped(skipped []seedSkip) {
 	if len(skipped) == 0 {
 		return
 	}
@@ -216,11 +312,28 @@ func (d *Differ) noteSkipped(skipped []string) {
 	d.seedMu.Unlock()
 }
 
-// takeSkipped returns and clears the skipped-object list.
-func (d *Differ) takeSkipped() []string {
+// takeSkipped returns and clears the skipped-object list, deduplicated.
+//
+// The seed is applied to EVERY temp database the retry creates, and a validation
+// run creates more than one, so an object that cannot be built is recorded once
+// per database. Reporting that raw would tell the operator two views failed when
+// one did -- the count is meant to be "objects that could not be built", not
+// "failures observed". Identical statement and identical error is the same
+// object hitting the same wall in another copy of the same empty database.
+func (d *Differ) takeSkipped() []seedSkip {
 	d.seedMu.Lock()
 	defer d.seedMu.Unlock()
-	out := d.seedSkipped
+	all := d.seedSkipped
 	d.seedSkipped = nil
+
+	seen := make(map[string]struct{}, len(all))
+	out := make([]seedSkip, 0, len(all))
+	for _, s := range all {
+		if _, dup := seen[s.Detail]; dup {
+			continue
+		}
+		seen[s.Detail] = struct{}{}
+		out = append(out, s)
+	}
 	return out
 }

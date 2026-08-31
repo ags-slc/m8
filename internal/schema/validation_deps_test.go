@@ -275,3 +275,194 @@ CREATE VIEW tgt.orphans AS
 		t.Errorf("RecoveryNote does not name what was skipped: %q", res.RecoveryNote)
 	}
 }
+
+// #18, cause 1: the harvest used to carry the whole grant matrix. A throwaway
+// database holds none of those roles, so every one of them failed and was
+// skipped -- 5268 of them against the database that prompted this. They expand
+// per privilege per grantee, so they dominate the harvest and bury the skips
+// that mean something.
+func TestHarvestDropsGrantsAndRevokes(t *testing.T) {
+	ctx := context.Background()
+	db, connStr := depDB(t)
+	if _, err := db.ExecContext(ctx, `
+CREATE ROLE alice;
+CREATE ROLE bob;
+CREATE SCHEMA dep;
+CREATE TABLE dep.contract (id bigint primary key, org text);
+CREATE TABLE dep.invoice (id bigint primary key, amt numeric);
+CREATE INDEX ix_invoice_amt ON dep.invoice(amt);
+GRANT SELECT, INSERT, UPDATE, DELETE ON dep.contract TO alice;
+GRANT SELECT ON dep.contract TO bob;
+GRANT SELECT, DELETE ON dep.invoice TO alice;`); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	d := newDepDiffer(t, connStr)
+
+	stmts, err := d.harvestSchemaDDL(ctx, db, []string{"dep"})
+	if err != nil {
+		t.Fatalf("harvest: %v", err)
+	}
+	if len(stmts) == 0 {
+		t.Fatal("harvest produced nothing")
+	}
+	for _, s := range stmts {
+		if isGrantOrRevoke(s) {
+			t.Errorf("harvest still carries a privilege statement: %s", firstLineOf(s))
+		}
+	}
+	// The shape must survive the filter: dropping grants must not drop tables.
+	var tables int
+	for _, s := range stmts {
+		if strings.Contains(strings.ToUpper(s), "CREATE TABLE") {
+			tables++
+		}
+	}
+	if tables != 2 {
+		t.Errorf("CREATE TABLE count = %d, want 2 (the filter took too much)", tables)
+	}
+}
+
+// #18, cause 2: the cap counted relations while the cost is statements. This
+// schema is two relations -- far under maxSeededRelations -- and the guard has
+// to be able to see past that to what the harvest actually emits.
+func TestStatementCapIsCheckedAgainstHarvestNotRelations(t *testing.T) {
+	ctx := context.Background()
+	db, connStr := depDB(t)
+	if _, err := db.ExecContext(ctx, crossSchemaFixture); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	d := newDepDiffer(t, connStr)
+
+	n, err := countRelations(ctx, db, []string{"dep"})
+	if err != nil {
+		t.Fatalf("countRelations: %v", err)
+	}
+	if n > maxSeededRelations {
+		t.Fatalf("fixture is meant to pass the relation pre-filter, got %d", n)
+	}
+	stmts, err := d.harvestSchemaDDL(ctx, db, []string{"dep"})
+	if err != nil {
+		t.Fatalf("harvest: %v", err)
+	}
+	// The point of the issue: statements outnumber relations, so a cap on
+	// relations does not bound the work.
+	if len(stmts) <= n {
+		t.Errorf("harvest emitted %d statements for %d relations; the units were "+
+			"expected to diverge, which is why the statement cap exists", len(stmts), n)
+	}
+	if maxSeededStatements <= maxSeededRelations {
+		t.Errorf("maxSeededStatements (%d) must exceed maxSeededRelations (%d): "+
+			"every relation costs at least one statement", maxSeededStatements, maxSeededRelations)
+	}
+}
+
+func TestStatementKindGroups(t *testing.T) {
+	cases := map[string]string{
+		`CREATE UNIQUE INDEX contract_pkey ON dep.contract USING btree (id)`: "CREATE INDEX",
+		`CREATE INDEX ix ON dep.invoice USING btree (amt)`:                   "CREATE INDEX",
+		`CREATE VIEW "dep"."v" AS SELECT 1`:                                  "CREATE VIEW",
+		`CREATE MATERIALIZED VIEW "dep"."mv" AS SELECT 1`:                    "CREATE MATERIALIZED VIEW",
+		`CREATE TABLE "dep"."t" (`:                                           "CREATE TABLE",
+		`ALTER TABLE "dep"."t" ADD CONSTRAINT "c" PRIMARY KEY`:               "ALTER TABLE",
+		`GRANT SELECT ON "dep"."t" TO "alice"`:                               "GRANT",
+	}
+	for ddl, want := range cases {
+		if got := statementKind(ddl); got != want {
+			t.Errorf("statementKind(%q) = %q, want %q", firstLineOf(ddl), got, want)
+		}
+	}
+}
+
+// #18, cause 3: a raw total plus "first" was misleading, because first was
+// always a grant. The breakdown has to name the kinds and their counts.
+func TestSummarizeSkipsReportsByClass(t *testing.T) {
+	got := summarizeSkips([]seedSkip{
+		{Kind: "CREATE VIEW", Detail: `CREATE VIEW "dep"."a" ... (ERROR: no such table)`},
+		{Kind: "CREATE TABLE", Detail: `CREATE TABLE "dep"."b" ... (ERROR: no such type)`},
+		{Kind: "CREATE VIEW", Detail: `CREATE VIEW "dep"."c" ... (ERROR: no such table)`},
+	})
+	if !strings.Contains(got, "2 CREATE VIEW") {
+		t.Errorf("summary does not count the dominant kind: %q", got)
+	}
+	if !strings.Contains(got, "1 CREATE TABLE") {
+		t.Errorf("summary does not mention the single table: %q", got)
+	}
+	// Ordered by count, so the dominant kind leads.
+	if strings.Index(got, "2 CREATE VIEW") > strings.Index(got, "1 CREATE TABLE") {
+		t.Errorf("summary is not ordered by count: %q", got)
+	}
+	if !strings.Contains(got, `"dep"."a"`) {
+		t.Errorf("summary drops the example: %q", got)
+	}
+}
+
+// #18 end to end. The reported symptom was a correct plan reporting "5268
+// object(s) ... could not be created and were skipped (first: GRANT ...)". The
+// dependency schema here carries both a grant matrix and one genuinely
+// unbuildable view, which is the production shape: the grants must vanish from
+// the skip list entirely, and the view -- previously buried behind them -- must
+// be what the operator is told about.
+func TestGrantsDoNotInflateTheSkipReport(t *testing.T) {
+	ctx := context.Background()
+	db, connStr := depDB(t)
+	if _, err := db.ExecContext(ctx, `
+CREATE ROLE clintreid;
+CREATE SCHEMA cdc;
+CREATE TABLE cdc.usage_record (id bigint primary key, n int);
+CREATE SCHEMA dep;
+CREATE TABLE dep.contract (id bigint primary key, org text);
+CREATE TABLE dep.revenue (id bigint primary key, amt numeric);
+-- The grant matrix: none of these roles exist in a throwaway database.
+GRANT SELECT, INSERT, UPDATE, DELETE ON dep.contract TO clintreid;
+GRANT SELECT, INSERT, UPDATE, DELETE ON dep.revenue TO clintreid;
+-- The one object that genuinely cannot be rebuilt in isolation.
+CREATE VIEW dep.usage_summary AS SELECT id, n FROM cdc.usage_record;
+CREATE SCHEMA tgt;
+CREATE TABLE tgt.rpt (id bigint primary key, note text);
+CREATE VIEW tgt.orphans AS
+    SELECT r.id, r.note, c.org FROM tgt.rpt r JOIN dep.contract c ON c.id = r.id;`); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	d := newDepDiffer(t, connStr)
+
+	res, err := d.Diff(ctx, db, "tgt", desiredWithNewColumn(), false)
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	if res.ValidationSkipped {
+		t.Fatalf("recovery should still succeed: %s\n%s",
+			res.ValidationSkippedReason, res.RecoveryNote)
+	}
+	// The whole point: the grants are gone from the report.
+	if strings.Contains(res.RecoveryNote, "GRANT") {
+		t.Errorf("skip report still mentions a grant: %q", res.RecoveryNote)
+	}
+	// And the object that actually matters is the one named.
+	if !strings.Contains(res.RecoveryNote, "usage_summary") {
+		t.Errorf("skip report does not name the unbuildable view: %q", res.RecoveryNote)
+	}
+	if !strings.Contains(res.RecoveryNote, "1 CREATE VIEW") {
+		t.Errorf("skip report does not classify the skip: %q", res.RecoveryNote)
+	}
+	t.Logf("RecoveryNote: %s", res.RecoveryNote)
+}
+
+// The seed runs against every temp database the retry creates, so one
+// unbuildable object is recorded once per database. The operator is told how
+// many objects could not be built, not how many times that was observed.
+func TestSkipsAreDeduplicatedAcrossTempDatabases(t *testing.T) {
+	d := &Differ{}
+	failure := seedSkip{Kind: "CREATE VIEW", Detail: `CREATE VIEW "dep"."v" ... (ERROR: nope)`}
+	other := seedSkip{Kind: "CREATE TABLE", Detail: `CREATE TABLE "dep"."t" ... (ERROR: nope)`}
+	// Three temp databases, same two failures in each.
+	for i := 0; i < 3; i++ {
+		d.noteSkipped([]seedSkip{failure, other})
+	}
+	got := d.takeSkipped()
+	if len(got) != 2 {
+		t.Errorf("takeSkipped() returned %d skips, want 2 distinct objects", len(got))
+	}
+	if len(d.takeSkipped()) != 0 {
+		t.Error("takeSkipped did not clear the list")
+	}
+}
