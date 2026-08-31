@@ -174,10 +174,17 @@ func TestOversizedDependencyDegradesInsteadOfImporting(t *testing.T) {
 	if len(res.SeededSchemas) != 0 {
 		t.Errorf("SeededSchemas = %v, want none", res.SeededSchemas)
 	}
-	// The operator must be told m8 tried and why it stopped, not just see the
-	// original rebuild error.
-	if !strings.Contains(res.ValidationSkippedReason, "over the") {
-		t.Errorf("reason does not explain the refusal:\n%s", res.ValidationSkippedReason)
+	// The operator must be told m8 tried and why it stopped. This lives in
+	// RecoveryNote, NOT appended to ValidationSkippedReason: that string is a
+	// multi-line pg-schema-diff error and every caller renders only its first
+	// line, so an appended explanation is invisible exactly when it is needed.
+	// Found the hard way -- a production plan degraded with the reason silently
+	// truncated away, and the cause took a database session to work out.
+	if !strings.Contains(res.RecoveryNote, "over the") {
+		t.Errorf("RecoveryNote does not explain the refusal: %q", res.RecoveryNote)
+	}
+	if strings.Contains(res.ValidationSkippedReason, "over the") {
+		t.Error("the explanation was folded back into the multi-line reason, where it gets truncated")
 	}
 	// And the diff itself is unaffected.
 	if len(res.Statements) != 1 {
@@ -224,4 +231,47 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b)
+}
+
+// The production shape this was found by: the target's view reaches into
+// app_admin, and app_admin holds a view of its own over a CDC schema. Importing
+// app_admin therefore cannot fully succeed -- and must not have to. The target
+// only needs app_admin's TABLE.
+func TestSeedSkipsObjectsItCannotCreate(t *testing.T) {
+	ctx := context.Background()
+	db, connStr := depDB(t)
+	if _, err := db.ExecContext(ctx, `
+CREATE SCHEMA cdc;
+CREATE TABLE cdc.usage_record (id bigint primary key, n int);
+CREATE SCHEMA dep;
+CREATE TABLE dep.contract (id bigint primary key, org text);
+-- dep's own view reaches into a third schema. Rebuilding dep in isolation
+-- cannot create this, and chasing the closure would mean importing cdc too.
+CREATE VIEW dep.usage_summary AS SELECT id, n FROM cdc.usage_record;
+CREATE SCHEMA tgt;
+CREATE TABLE tgt.rpt (id bigint primary key, note text);
+CREATE VIEW tgt.orphans AS
+    SELECT r.id, r.note, c.org FROM tgt.rpt r JOIN dep.contract c ON c.id = r.id;`); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	d := newDepDiffer(t, connStr)
+
+	res, err := d.Diff(ctx, db, "tgt", desiredWithNewColumn(), false)
+	if err != nil {
+		t.Fatalf("diff: %v", err)
+	}
+	if res.ValidationSkipped {
+		t.Fatalf("a transitive dependency should not defeat the recovery: %s\n%s",
+			res.ValidationSkippedReason, res.RecoveryNote)
+	}
+	if len(res.SeededSchemas) != 1 || res.SeededSchemas[0] != "dep" {
+		t.Errorf("SeededSchemas = %v, want [dep]", res.SeededSchemas)
+	}
+	// The skip must be reported, not swallowed.
+	if !strings.Contains(res.RecoveryNote, "skipped") {
+		t.Errorf("RecoveryNote does not mention the skipped object: %q", res.RecoveryNote)
+	}
+	if !strings.Contains(res.RecoveryNote, "usage_summary") {
+		t.Errorf("RecoveryNote does not name what was skipped: %q", res.RecoveryNote)
+	}
 }

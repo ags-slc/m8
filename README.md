@@ -481,17 +481,26 @@ output says what had to be imported to get there:
     ALTER TABLE "materialized"."rpt_invoice_detail" ADD COLUMN "destination_country_code" text
 ```
 
-The recovery is best effort by construction: it can turn a refused plan into a
-validated one, never the reverse. It gives up — leaving exactly the
-`PLAN_NOT_VALIDATED` degrade that came before it, with the reason appended — when
+Importing is best effort *within* the import too. A dependency schema routinely
+holds objects of its own that reach into a third schema, and those simply cannot
+be created in the rebuild — so they are **skipped**, and the plan output says how
+many and which. That is safe because the seed is scaffolding, not the thing under
+test: what must hold is that the target schema rebuilds and the plan converges
+against it. If a skipped object was one the target actually needed, the rebuild
+fails and the plan degrades as before. A skipped object cannot make a bad plan
+look good.
 
-- the dependency is a **cycle** (the other schema reaches back into this one, so
-  it cannot be imported first);
+The recovery as a whole is best effort by construction: it can turn a refused
+plan into a validated one, never the reverse. It gives up — leaving exactly the
+`PLAN_NOT_VALIDATED` degrade that came before it, and saying why — when
+
 - the dependency is **too large** to import cheaply (over 200 relations — a
   dependency that big is a sign the schema boundary is wrong, not that the cap
   is too low);
-- the object reaches out through a **function call** rather than a relation
-  reference, which the catalog records against `pg_proc` and this does not chase.
+- the object's **only** reach into another schema is a **function call**, which
+  the catalog records against `pg_proc` and this does not chase. (When the object
+  also reads a relation there, the schema is discovered and the import brings its
+  routines along.)
 
 Why it matters: without the recovery, the *first* real schema change to a schema
 containing such a view is refused outright, and the only way forward is turning

@@ -31,16 +31,20 @@ const maxSeededRelations = 200
 // Scoped to RELATION dependencies: those recorded through pg_rewrite (views,
 // materialized views) and through pg_constraint (foreign keys).
 //
-// Two known gaps, both of which degrade rather than mislead -- the plan comes
-// back unvalidated exactly as it did before this existed:
+// One known gap, which degrades rather than misleads -- the plan comes back
+// unvalidated exactly as it did before this existed:
 //
-//   - A view that CALLS a function in another schema. That dependency is
-//     recorded against pg_proc, not pg_class, so it is not found here and the
-//     schema holding the function is not imported. (A function's own body is
-//     never the problem: PostgreSQL does not resolve it at creation time.)
-//   - A cycle. If a dependency schema reaches back into the target, importing
-//     it fails on the way in, and seedTempDatabases surfaces that as the reason
-//     the recovery did not work.
+//   - A view whose ONLY reach into another schema is a function call. That
+//     dependency is recorded against pg_proc, not pg_class, so the schema
+//     holding the function is never discovered. Note the "only": when the view
+//     also reads a relation there, the schema IS discovered, and the import
+//     brings the function with it -- pg-schema-diff emits routines as well as
+//     tables. (A function's own body is never the problem; PostgreSQL does not
+//     resolve it at creation time.)
+//
+// Cycles are NOT a gap. A dependency schema that reaches back into the target
+// cannot be fully created here, and does not need to be: applySeed skips what
+// it cannot build.
 func dependencySchemas(ctx context.Context, db *sql.DB, targetSchema string) ([]string, error) {
 	const q = `
 WITH refs AS (
@@ -169,16 +173,30 @@ func (d *Differ) seedTempDatabases(ddl []string) func() {
 }
 
 // applySeed runs the armed seed DDL against a freshly created temp database.
-func (d *Differ) applySeed(ctx context.Context, db *sql.DB) error {
+//
+// Statements that fail are SKIPPED, not fatal. A dependency schema routinely
+// contains objects of its own that reach into a third schema -- app_admin holds
+// a view over a CDC schema in the database this was built for -- and those
+// cannot be created here. Chasing the full transitive closure instead would
+// mean importing whole CDC schemas to satisfy a view the plan never touches.
+//
+// Skipping is safe because the seed is scaffolding, not the thing under test:
+// what has to hold is that the TARGET schema rebuilds and the plan converges
+// against it. If a skipped object was one the target actually needed, that
+// rebuild fails and the plan degrades exactly as it did before any of this
+// existed. A skipped object cannot make a bad plan look good.
+func (d *Differ) applySeed(ctx context.Context, db *sql.DB) []string {
 	d.seedMu.Lock()
 	ddl := d.seedDDL
 	d.seedMu.Unlock()
+
+	var skipped []string
 	for _, stmt := range ddl {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("seeding validation database (%s): %w", firstLineOf(stmt), err)
+			skipped = append(skipped, fmt.Sprintf("%s (%v)", firstLineOf(stmt), err))
 		}
 	}
-	return nil
+	return skipped
 }
 
 func firstLineOf(s string) string {
@@ -186,4 +204,23 @@ func firstLineOf(s string) string {
 		return strings.TrimSpace(s[:i]) + " ..."
 	}
 	return strings.TrimSpace(s)
+}
+
+// noteSkipped records objects the seed could not create, for the operator.
+func (d *Differ) noteSkipped(skipped []string) {
+	if len(skipped) == 0 {
+		return
+	}
+	d.seedMu.Lock()
+	d.seedSkipped = append(d.seedSkipped, skipped...)
+	d.seedMu.Unlock()
+}
+
+// takeSkipped returns and clears the skipped-object list.
+func (d *Differ) takeSkipped() []string {
+	d.seedMu.Lock()
+	defer d.seedMu.Unlock()
+	out := d.seedSkipped
+	d.seedSkipped = nil
+	return out
 }

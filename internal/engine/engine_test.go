@@ -1390,13 +1390,18 @@ func TestSchemaDiffDegradesWhenPlanCannotBeValidated(t *testing.T) {
 		CREATE TABLE elsewhere.source_rows (id BIGINT PRIMARY KEY, label TEXT);
 		CREATE SCHEMA managed;
 		CREATE TABLE managed.thing (id BIGINT PRIMARY KEY);
-		-- A view in the managed schema whose definition reaches outside it, and
-		-- a view outside that reaches back in. The cycle is what makes this
-		-- genuinely unvalidatable: m8 recovers from a one-way cross-schema
-		-- reference by importing the other schema into the rebuild, but it
-		-- cannot import a schema that depends on the one being rebuilt.
-		CREATE VIEW managed.reaching_out AS SELECT id, label FROM elsewhere.source_rows;
-		CREATE VIEW elsewhere.reaching_back AS SELECT id FROM managed.thing;
+		-- Reaches outside its own schema through a FUNCTION CALL. That is the
+		-- one cross-schema shape m8 cannot recover from: the dependency is
+		-- recorded against pg_proc, not pg_class, so importing the schemas this
+		-- one references never finds it and the rebuild stays impossible.
+		--
+		-- Deliberately not a plain cross-schema view, and deliberately not a
+		-- dependency cycle -- m8 recovers from both, so either would make this
+		-- test pass for a reason that has nothing to do with its subject.
+		CREATE FUNCTION elsewhere.decorate(t TEXT) RETURNS TEXT
+			LANGUAGE sql IMMUTABLE AS $fn$ SELECT $1 || '!' $fn$;
+		CREATE VIEW managed.reaching_out AS
+			SELECT id, elsewhere.decorate(id::TEXT) AS label FROM managed.thing;
 	`)
 	if err != nil {
 		t.Fatal(err)
@@ -1735,11 +1740,13 @@ func TestApplyRefusesUnvalidatedPlanWhenConfigured(t *testing.T) {
 		CREATE TABLE elsewhere.source_rows (id BIGINT PRIMARY KEY, label TEXT);
 		CREATE SCHEMA managed;
 		CREATE TABLE managed.thing (id BIGINT PRIMARY KEY);
-		CREATE VIEW managed.reaching_out AS SELECT id, label FROM elsewhere.source_rows;
-		-- Cyclic on purpose, so the plan stays unvalidatable and this test keeps
-		-- testing the refusal rather than the recovery. See
-		-- TestSchemaDiffDegradesWhenPlanCannotBeValidated.
-		CREATE VIEW elsewhere.reaching_back AS SELECT id FROM managed.thing;
+		-- Unvalidatable by design; see the note in
+		-- TestSchemaDiffDegradesWhenPlanCannotBeValidated for why it is a
+		-- function call and not a plain cross-schema view.
+		CREATE FUNCTION elsewhere.decorate(t TEXT) RETURNS TEXT
+			LANGUAGE sql IMMUTABLE AS $fn$ SELECT $1 || '!' $fn$;
+		CREATE VIEW managed.reaching_out AS
+			SELECT id, elsewhere.decorate(id::TEXT) AS label FROM managed.thing;
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -2163,15 +2170,16 @@ func TestApplyRefusesBeforeAnyFolderIsApplied(t *testing.T) {
 		CREATE TABLE alpha.thing (id BIGINT PRIMARY KEY);
 		CREATE SCHEMA omega;
 		CREATE TABLE omega.thing (id BIGINT PRIMARY KEY);
-		-- omega cannot be validated against a single-schema rebuild: its view
-		-- reaches into elsewhere.
-		CREATE VIEW omega.reaching_out AS SELECT id, label FROM elsewhere.source_rows;
-		-- ...and the recovery for that -- importing elsewhere into the rebuild
-		-- -- cannot work here either, because elsewhere reaches back into omega.
-		-- The cycle is deliberate: it keeps this test about what it is named
-		-- for (apply refuses BEFORE touching any folder) rather than about
-		-- whether a cross-schema view happens to be recoverable today.
-		CREATE VIEW elsewhere.reaching_back AS SELECT id FROM omega.thing;
+		-- omega cannot be validated against a single-schema rebuild, and cannot
+		-- be recovered either: the reach into elsewhere is a FUNCTION CALL,
+		-- recorded against pg_proc, which the dependency import does not chase.
+		-- That keeps this test about what it is named for -- apply refuses
+		-- BEFORE touching any folder -- rather than about whether a given
+		-- cross-schema shape happens to be recoverable today.
+		CREATE FUNCTION elsewhere.decorate(t TEXT) RETURNS TEXT
+			LANGUAGE sql IMMUTABLE AS $fn$ SELECT $1 || '!' $fn$;
+		CREATE VIEW omega.reaching_out AS
+			SELECT id, elsewhere.decorate(id::TEXT) AS label FROM omega.thing;
 	`); err != nil {
 		t.Fatal(err)
 	}
