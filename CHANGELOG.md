@@ -3,6 +3,36 @@
 Notable changes to m8. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The dependency import introduced in 0.3.1 gave up too easily.** Importing a
+  schema into the validation rebuild was all-or-nothing: if any object in it
+  could not be created, the whole recovery failed and the plan degraded. That is
+  the normal case, not the exceptional one — a dependency schema usually holds
+  objects of its own that reach into a third schema. Found on the first real
+  target: `materialized` reaches into `app_admin`, which holds a view over a CDC
+  schema, so the import failed and the plan was refused exactly as it had been
+  before 0.3.1.
+
+  Objects the import cannot create are now **skipped**, and the plan reports how
+  many and which. The seed is scaffolding, not the thing under test: what has to
+  hold is that the target schema rebuilds and the plan converges against it. A
+  skipped object cannot make a bad plan look good — if it was one the target
+  needed, the rebuild fails and the plan degrades as before.
+
+  This also makes dependency **cycles** recoverable, which 0.3.1 listed as a
+  hard limit: the back-reference is simply one of the objects that gets skipped.
+
+- **The explanation of a failed recovery was invisible.** It was appended to
+  `ValidationSkippedReason`, which is a multi-line pg-schema-diff error that
+  every caller renders as `firstLine(...)` — so the appended text was always
+  truncated away. Diagnosing the `app_admin` failure above needed a database
+  session precisely because of this. The explanation now travels in its own
+  `RecoveryNote` field and is printed on its own line, whether the recovery
+  succeeded with skips or failed outright.
+
 ## [0.3.1] - 2026-08-31
 
 ### Fixed
