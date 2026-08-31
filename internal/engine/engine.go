@@ -994,6 +994,12 @@ func FormatPlanOutput(result *ApplyResult) string {
 			if s.Diff.ValidationSkipped {
 				fmt.Fprintf(&b, "    ⚠ PLAN_NOT_VALIDATED — the current schema could not be rebuilt in isolation\n")
 				fmt.Fprintf(&b, "      (%s)\n", firstLine(s.Diff.ValidationSkippedReason))
+			} else if len(s.Diff.SeededSchemas) > 0 {
+				// Validated, but only after importing a copy of another schema.
+				// Say so: the rebuild this plan was checked against is not the
+				// database as it stands.
+				fmt.Fprintf(&b, "    ℹ validated against a rebuild that imported: %s\n",
+					strings.Join(s.Diff.SeededSchemas, ", "))
 			}
 			for _, stmt := range s.Diff.Statements {
 				fmt.Fprintf(&b, "    %s\n", strings.TrimSpace(stmt.DDL))

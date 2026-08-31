@@ -3,6 +3,30 @@
 Notable changes to m8. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A schema containing a view that reaches into another schema can now be
+  changed at all.** Plan validation rebuilds the current schema in a throwaway
+  database; because each diff is scoped to one PostgreSQL schema, that rebuild
+  failed on any object defined in terms of another one, and the plan came back
+  `PLAN_NOT_VALIDATED`. With `--fail-on-unvalidated` (implied by
+  `require_shadow`) the plan was then refused — so the FIRST real change to such
+  a schema was unshippable, and the only way forward was disabling the check
+  globally.
+
+  m8 now asks the catalog which schemas the target's objects reach into,
+  imports those into the throwaway database, and validates again. The plan
+  output names what it imported (`ℹ validated against a rebuild that imported:
+  …`).
+
+  Best effort by construction: it can turn a refused plan into a validated one,
+  never the reverse. It gives up and leaves the previous degrade in place — with
+  the reason appended — on a dependency cycle, on a dependency over 200
+  relations, and on a reference made through a function call rather than a
+  relation (recorded against `pg_proc`, which this does not chase).
+
 ## [0.3.0] - 2026-08-29
 
 > ### Upgrade before your next `m8 dump` of a database others can write to

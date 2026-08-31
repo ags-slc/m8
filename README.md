@@ -468,8 +468,34 @@ covers the other degrade. pg-schema-diff validates a plan by rebuilding the
 current schema in a throwaway database and replaying the generated statements
 against it. Because m8 scopes each diff to one PostgreSQL schema, that rebuild
 cannot resolve an object whose definition reaches outside it — a view over
-another schema's tables, for instance — and m8 then produces the diff *without*
-that check, marked `PLAN_NOT_VALIDATED`.
+another schema's tables, for instance.
+
+**m8 first tries to recover.** It asks the catalog which schemas the target's
+objects actually reach into, imports those into the throwaway database, and runs
+the validation again. When that works the plan is genuinely validated, and the
+output says what had to be imported to get there:
+
+```
+  ~ schema/materialized/rpt_invoice_detail.sql (schema)
+    ℹ validated against a rebuild that imported: app_admin
+    ALTER TABLE "materialized"."rpt_invoice_detail" ADD COLUMN "destination_country_code" text
+```
+
+The recovery is best effort by construction: it can turn a refused plan into a
+validated one, never the reverse. It gives up — leaving exactly the
+`PLAN_NOT_VALIDATED` degrade that came before it, with the reason appended — when
+
+- the dependency is a **cycle** (the other schema reaches back into this one, so
+  it cannot be imported first);
+- the dependency is **too large** to import cheaply (over 200 relations — a
+  dependency that big is a sign the schema boundary is wrong, not that the cap
+  is too low);
+- the object reaches out through a **function call** rather than a relation
+  reference, which the catalog records against `pg_proc` and this does not chase.
+
+Why it matters: without the recovery, the *first* real schema change to a schema
+containing such a view is refused outright, and the only way forward is turning
+the check off for everything.
 
 Only that one phase degrades. "The generated DDL does not execute" and "the plan
 does not converge to the desired state" always abort, in `plan` and `apply`

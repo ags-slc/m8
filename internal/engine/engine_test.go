@@ -1390,8 +1390,13 @@ func TestSchemaDiffDegradesWhenPlanCannotBeValidated(t *testing.T) {
 		CREATE TABLE elsewhere.source_rows (id BIGINT PRIMARY KEY, label TEXT);
 		CREATE SCHEMA managed;
 		CREATE TABLE managed.thing (id BIGINT PRIMARY KEY);
-		-- A view in the managed schema whose definition reaches outside it.
+		-- A view in the managed schema whose definition reaches outside it, and
+		-- a view outside that reaches back in. The cycle is what makes this
+		-- genuinely unvalidatable: m8 recovers from a one-way cross-schema
+		-- reference by importing the other schema into the rebuild, but it
+		-- cannot import a schema that depends on the one being rebuilt.
 		CREATE VIEW managed.reaching_out AS SELECT id, label FROM elsewhere.source_rows;
+		CREATE VIEW elsewhere.reaching_back AS SELECT id FROM managed.thing;
 	`)
 	if err != nil {
 		t.Fatal(err)
@@ -1731,6 +1736,10 @@ func TestApplyRefusesUnvalidatedPlanWhenConfigured(t *testing.T) {
 		CREATE SCHEMA managed;
 		CREATE TABLE managed.thing (id BIGINT PRIMARY KEY);
 		CREATE VIEW managed.reaching_out AS SELECT id, label FROM elsewhere.source_rows;
+		-- Cyclic on purpose, so the plan stays unvalidatable and this test keeps
+		-- testing the refusal rather than the recovery. See
+		-- TestSchemaDiffDegradesWhenPlanCannotBeValidated.
+		CREATE VIEW elsewhere.reaching_back AS SELECT id FROM managed.thing;
 	`); err != nil {
 		t.Fatal(err)
 	}
@@ -2154,9 +2163,15 @@ func TestApplyRefusesBeforeAnyFolderIsApplied(t *testing.T) {
 		CREATE TABLE alpha.thing (id BIGINT PRIMARY KEY);
 		CREATE SCHEMA omega;
 		CREATE TABLE omega.thing (id BIGINT PRIMARY KEY);
-		-- Reaches outside its own schema, so the plan for omega cannot be
-		-- validated against a single-schema rebuild.
+		-- omega cannot be validated against a single-schema rebuild: its view
+		-- reaches into elsewhere.
 		CREATE VIEW omega.reaching_out AS SELECT id, label FROM elsewhere.source_rows;
+		-- ...and the recovery for that -- importing elsewhere into the rebuild
+		-- -- cannot work here either, because elsewhere reaches back into omega.
+		-- The cycle is deliberate: it keeps this test about what it is named
+		-- for (apply refuses BEFORE touching any folder) rather than about
+		-- whether a cross-schema view happens to be recoverable today.
+		CREATE VIEW elsewhere.reaching_back AS SELECT id FROM omega.thing;
 	`); err != nil {
 		t.Fatal(err)
 	}
