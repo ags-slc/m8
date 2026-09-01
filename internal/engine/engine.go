@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/ags-slc/m8/internal/migration"
 	"github.com/ags-slc/m8/internal/parser"
@@ -631,14 +632,7 @@ func (e *Engine) applySchema(ctx context.Context, migrations []*migration.Migrat
 		// diff has nothing to validate, and refusing it would block every clean
 		// run on any database whose views cross schema boundaries.
 		if diffResult.ValidationSkipped && len(diffResult.Statements) > 0 && e.config.FailOnUnvalidated {
-			refusal := fmt.Errorf(
-				"plan for schema %s proposes %d statement(s) and was not validated (%s); "+
-					"refusing to apply it (--fail-on-unvalidated / require_shadow is set). "+
-					"Validation rebuilds the current schema in a throwaway database; it fails when "+
-					"an object in this schema is defined in terms of another schema. Dry-run the "+
-					"statements against the shadow by hand, or pass --fail-on-unvalidated=false "+
-					"once you have",
-				pgSchema, len(diffResult.Statements), firstLine(diffResult.ValidationSkippedReason))
+			refusal := unvalidatedRefusal(pgSchema, diffResult)
 			results = append(results, attributeSchemaError(pgMigrations, refusal, diffResult)...)
 			return results, refusal
 		}
@@ -1051,6 +1045,9 @@ func FormatPlanOutput(result *ApplyResult) string {
 			fmt.Fprintf(&w, "  ⚠ PLAN_NOT_VALIDATED %s (schema) — the current schema could not be rebuilt in isolation\n",
 				s.Diff.Name)
 			fmt.Fprintf(&w, "      (%s)\n", firstLine(s.Diff.ValidationSkippedReason))
+			if s.Diff.RecoveryNote != "" {
+				fmt.Fprintf(&w, "      %s\n", s.Diff.RecoveryNote)
+			}
 		}
 	}
 
@@ -1086,6 +1083,9 @@ func FormatApplyOutput(result *ApplyResult) string {
 		fmt.Fprintf(&w, "  ⚠ PLAN_NOT_VALIDATED %s (schema) — the statements %s without the check that they execute\n",
 			s.Diff.Name, verb)
 		fmt.Fprintf(&w, "      (%s)\n", firstLine(s.Diff.ValidationSkippedReason))
+		if s.Diff.RecoveryNote != "" {
+			fmt.Fprintf(&w, "      %s\n", s.Diff.RecoveryNote)
+		}
 	}
 
 	writeResults := func(results []MigrationResult) {
@@ -1215,6 +1215,46 @@ func UnvalidatedSchemas(r *ApplyResult) []string {
 		names = append(names, s.Diff.Name)
 	}
 	return names
+}
+
+// unvalidatedRefusal is the error m8 stops on when a plan could not be
+// validated and --fail-on-unvalidated (or require_shadow) is set.
+//
+// Extracted so it can be tested without a database: this is the message an
+// operator is actually blocked by, and it is the one place the recovery note
+// matters most. Without it m8 refused a plan while saying nothing about having
+// tried to rescue it -- working out why took a psql session against production.
+//
+// The note is a separate clause by necessity, not style. ValidationSkippedReason
+// is a multi-line pg-schema-diff error rendered through firstLine, so anything
+// folded into it after a newline is truncated away, which is precisely how the
+// explanation went missing in the first place.
+func unvalidatedRefusal(pgSchema string, d *schema.DiffResult) error {
+	recovery := ""
+	if d.RecoveryNote != "" {
+		// The note is written lowercase for the indented plan output, where it
+		// hangs under a bullet. Here it lands mid-paragraph after a full stop,
+		// so it has to read as a sentence.
+		recovery = " " + capitalizeFirst(d.RecoveryNote) + "."
+	}
+	return fmt.Errorf(
+		"plan for schema %s proposes %d statement(s) and was not validated (%s); "+
+			"refusing to apply it (--fail-on-unvalidated / require_shadow is set)."+
+			"%s Validation rebuilds the current schema in a throwaway database, importing "+
+			"the schemas it depends on when it has to; it fails when something in that "+
+			"rebuild cannot be recreated. Dry-run the statements against the shadow by "+
+			"hand, or pass --fail-on-unvalidated=false once you have",
+		pgSchema, len(d.Statements), firstLine(d.ValidationSkippedReason), recovery)
+}
+
+// capitalizeFirst upper-cases the first rune, leaving the rest alone.
+func capitalizeFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	r := []rune(s)
+	r[0] = unicode.ToUpper(r[0])
+	return string(r)
 }
 
 // firstLine trims a multi-line error to its first line, so a plan stays
