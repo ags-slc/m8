@@ -3,7 +3,7 @@
 Notable changes to m8. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.3] - 2026-09-05
 
 ### Fixed
 
@@ -41,10 +41,6 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Skips are reported by class.** `2 CREATE VIEW, 1 CREATE TABLE (first: …)`
   rather than a raw total plus one arbitrary example, so a single genuinely
   unbuildable table is not buried under noise.
-
-## [Unreleased]
-
-### Fixed
 
 - **m8 refused a plan without saying it had tried to rescue it.** `0.3.2` moved
   the explanation of a failed dependency import into its own `RecoveryNote`
@@ -361,6 +357,7 @@ Initial release. The m8 CLI scaffold: `plan`, `apply`, `dump`, `baseline`,
 `sync`, `status`, `new`, and `version`. Superseded by `0.2.0` — see the upgrade
 note above before running it against anything you care about.
 
+[0.3.3]: https://github.com/ags-slc/m8/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ags-slc/m8/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ags-slc/m8/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ags-slc/m8/compare/v0.2.0...v0.3.0
