@@ -1643,4 +1643,7 @@ func TestDumpPartitionedTable(t *testing.T) {
 	if !strings.Contains(ddl, "CREATE INDEX event_log_created_at_idx ON public.event_log USING btree (created_at);") {
 		t.Errorf("expected the index on the whole table, got:\n%s", ddl)
 	}
+	if table.Partman != nil {
+		t.Errorf("no pg_partman here, but dumped a directive: %s", table.Partman.Directive())
+	}
 }
