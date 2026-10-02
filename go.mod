@@ -82,3 +82,5 @@ require (
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 )
+
+replace github.com/stripe/pg-schema-diff => github.com/deusin/pg-schema-diff v0.0.0-20261002164924-c9d5e72018a2
