@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/ags-slc/m8/internal/partman"
 	"github.com/ags-slc/m8/internal/pgident"
 	"github.com/jackc/pgx/v5"
 )
@@ -23,6 +24,8 @@ type Table struct {
 	// PartitionKey is pg_get_partkeydef's output -- RANGE (created_at) -- for a
 	// partitioned table, and empty otherwise.
 	PartitionKey string
+	// Partman is the table's pg_partman configuration, if pg_partman manages it.
+	Partman *partman.Spec
 }
 
 // QualifiedName returns the schema-qualified, quoted table name, e.g.
@@ -93,6 +96,11 @@ type Dumper struct {
 	// because nothing downstream can tell the difference between "this database
 	// has no materialized views" and "m8 did not look".
 	AllowUnsupported bool
+
+	// partmanSchema caches pg_partman's schema for the run ("" when it is not
+	// installed); partmanLooked records that it has been asked.
+	partmanSchema string
+	partmanLooked bool
 }
 
 // NewDumper creates a new Dumper.
@@ -193,7 +201,8 @@ func (d *Dumper) DumpTable(ctx context.Context, schema, table string) (*Table, e
 	return t, nil
 }
 
-// loadPartitioning records a partitioned table's partition key.
+// loadPartitioning records a partitioned table's partition key and, when
+// pg_partman manages it, its configuration.
 //
 // Without the key the dump describes a different table: a plain one, which the
 // diff plans as DROP TABLE and CREATE TABLE against the partitioned original.
@@ -201,10 +210,24 @@ func (d *Dumper) DumpTable(ctx context.Context, schema, table string) (*Table, e
 // they are the partition manager's, and the diff adopts them from the live
 // database on every run.
 func (d *Dumper) loadPartitioning(ctx context.Context, t *Table) error {
-	return d.conn.QueryRow(ctx, `
+	err := d.conn.QueryRow(ctx, `
 		SELECT coalesce(pg_get_partkeydef(c.oid), '')
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1 AND c.relname = $2`, t.Schema, t.Name).Scan(&t.PartitionKey)
+	if err != nil || t.PartitionKey == "" {
+		return err
+	}
+	if !d.partmanLooked {
+		if d.partmanSchema, err = partman.ExtensionSchema(ctx, d.conn); err != nil {
+			return err
+		}
+		d.partmanLooked = true
+	}
+	if d.partmanSchema == "" {
+		return nil
+	}
+	t.Partman, err = partman.Load(ctx, d.conn, d.partmanSchema, t.Schema, t.Name)
+	return err
 }
 
 func (d *Dumper) loadColumns(ctx context.Context, t *Table) error {
@@ -452,6 +475,10 @@ var onOnlyRe = regexp.MustCompile(`^(CREATE (?:UNIQUE )?INDEX (?:"(?:[^"]|"")+"|
 // RenderDDL generates the CREATE TABLE + CREATE INDEX statements for a table.
 func RenderDDL(t *Table) string {
 	var b strings.Builder
+
+	if t.Partman != nil {
+		b.WriteString(t.Partman.Directive() + "\n")
+	}
 
 	// Schema-qualify every object. The desired-state DDL is replayed into a
 	// throwaway database through a *connection pool*, so a leading

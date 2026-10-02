@@ -48,3 +48,10 @@ func Qualify(parts ...string) string {
 	}
 	return strings.Join(out, ".")
 }
+
+// Literal single-quotes a string constant, doubling any embedded quote. It
+// relies on standard_conforming_strings, on by default since PostgreSQL 9.1:
+// with it, a backslash inside the quotes is an ordinary character.
+func Literal(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}

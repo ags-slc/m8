@@ -34,7 +34,7 @@ jobs:
           done
 
       - name: Unit tests
-        run: go test ./internal/parser/... ./internal/migration/... ./internal/schema/... ./internal/pgident/... ./internal/config/... -v -count=1
+        run: go test ./internal/parser/... ./internal/migration/... ./internal/schema/... ./internal/pgident/... ./internal/config/... ./internal/partman/... -v -count=1
 
       # -p 1: these packages each spin up PostgreSQL containers; running them in
       # parallel has produced intermittent failures. cmd belongs here rather than
