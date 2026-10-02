@@ -441,12 +441,26 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 		diff.WithIncludeSchemas(targetSchema),
 	}
 
+	// The diff sees the live, undeclared partitions of every declared
+	// partitioned table as declared (see adoptPartitions). Only the diff: the
+	// filtering below still reads the files as written, so adopting a child
+	// whose replica identity is FULL does not count as this folder declaring
+	// replica identity, and unlock that class of statement for every table in it.
+	adoption, err := adoptPartitions(ctx, liveDB, targetSchema, desiredDDL)
+	if err != nil {
+		return nil, err
+	}
+	diffDDL := desiredDDL
+	if adoption.ddl != "" {
+		diffDDL = append(append([]string{}, desiredDDL...), adoption.ddl)
+	}
+
 	var validationSkipped string
 	var seededSchemas []string
 	var recoveryNote string
 	plan, err := diff.Generate(ctx,
 		diff.DBSchemaSource(liveDB),
-		diff.DDLSchemaSource(desiredDDL),
+		diff.DDLSchemaSource(diffDDL),
 		opts...,
 	)
 	if err != nil {
@@ -472,7 +486,7 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 		// is worth an extra round trip, and until this existed the FIRST real
 		// change to such a schema was refused outright by
 		// --fail-on-unvalidated with no way forward but turning the check off.
-		if seeded, retryPlan, rerr := d.validateWithDependencies(ctx, liveDB, targetSchema, desiredDDL, opts); rerr == nil && retryPlan != nil {
+		if seeded, retryPlan, rerr := d.validateWithDependencies(ctx, liveDB, targetSchema, diffDDL, opts); rerr == nil && retryPlan != nil {
 			plan = *retryPlan
 			validationSkipped = ""
 			seededSchemas = seeded
@@ -499,13 +513,22 @@ func (d *Differ) Diff(ctx context.Context, liveDB *sql.DB, targetSchema string, 
 			// shadow instance.
 			plan, err = diff.Generate(ctx,
 				diff.DBSchemaSource(liveDB),
-				diff.DDLSchemaSource(desiredDDL),
+				diff.DDLSchemaSource(diffDDL),
 				append(opts, diff.WithDoNotValidatePlan())...,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("failed to generate schema diff (validation already skipped): %w", err)
 			}
 		}
+	}
+
+	planned := make([]string, len(plan.Statements))
+	for i, st := range plan.Statements {
+		planned[i] = st.DDL
+	}
+	if name := adoption.recreated(targetSchema, planned); name != "" {
+		return nil, fmt.Errorf("partition %s.%s disappeared while the plan was being computed "+
+			"(retired by partition maintenance?); the plan would recreate it -- run it again", targetSchema, name)
 	}
 
 	// In default (non-strict) mode, only include statements targeting objects
