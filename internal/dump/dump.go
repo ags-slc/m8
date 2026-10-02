@@ -3,6 +3,7 @@ package dump
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/ags-slc/m8/internal/pgident"
@@ -19,6 +20,9 @@ type Table struct {
 	Checks  []CheckConstraint
 	FKs     []ForeignKey
 	Indexes []Index
+	// PartitionKey is pg_get_partkeydef's output -- RANGE (created_at) -- for a
+	// partitioned table, and empty otherwise.
+	PartitionKey string
 }
 
 // QualifiedName returns the schema-qualified, quoted table name, e.g.
@@ -182,8 +186,25 @@ func (d *Dumper) DumpTable(ctx context.Context, schema, table string) (*Table, e
 	if err := d.loadIndexes(ctx, t); err != nil {
 		return nil, fmt.Errorf("indexes for %s.%s: %w", schema, table, err)
 	}
+	if err := d.loadPartitioning(ctx, t); err != nil {
+		return nil, fmt.Errorf("partitioning for %s.%s: %w", schema, table, err)
+	}
 
 	return t, nil
+}
+
+// loadPartitioning records a partitioned table's partition key.
+//
+// Without the key the dump describes a different table: a plain one, which the
+// diff plans as DROP TABLE and CREATE TABLE against the partitioned original.
+// Child partitions are not dumped at all -- ListTables leaves them out -- because
+// they are the partition manager's, and the diff adopts them from the live
+// database on every run.
+func (d *Dumper) loadPartitioning(ctx context.Context, t *Table) error {
+	return d.conn.QueryRow(ctx, `
+		SELECT coalesce(pg_get_partkeydef(c.oid), '')
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2`, t.Schema, t.Name).Scan(&t.PartitionKey)
 }
 
 func (d *Dumper) loadColumns(ctx context.Context, t *Table) error {
@@ -415,10 +436,18 @@ func (d *Dumper) loadIndexes(ctx context.Context, t *Table) error {
 		if err := rows.Scan(&idx.Name, &idx.Unique, &idx.Definition); err != nil {
 			return err
 		}
+		idx.Definition = onOnlyRe.ReplaceAllString(idx.Definition, "$1 ON ")
 		t.Indexes = append(t.Indexes, idx)
 	}
 	return rows.Err()
 }
+
+// onOnlyRe matches the ON ONLY that pg_get_indexdef writes for an index on a
+// partitioned table. ONLY means "this table, not its partitions" -- an index
+// built on no partition and left invalid -- which is how Postgres describes the
+// parent's half of the index, not what the declaration means: the index on the
+// table and all of its partitions, which plain ON says.
+var onOnlyRe = regexp.MustCompile(`^(CREATE (?:UNIQUE )?INDEX (?:"(?:[^"]|"")+"|\S+)) ON ONLY `)
 
 // RenderDDL generates the CREATE TABLE + CREATE INDEX statements for a table.
 func RenderDDL(t *Table) string {
@@ -531,7 +560,11 @@ func RenderDDL(t *Table) string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(");\n")
+	b.WriteString(")")
+	if t.PartitionKey != "" {
+		b.WriteString(" PARTITION BY " + t.PartitionKey)
+	}
+	b.WriteString(";\n")
 
 	// Indexes (non-constraint). pg_get_indexdef() already emits a
 	// schema-qualified target ("ON materialized.foo"); keep it, for the same
