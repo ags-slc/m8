@@ -12,6 +12,7 @@ import (
 
 	"github.com/ags-slc/m8/internal/migration"
 	"github.com/ags-slc/m8/internal/parser"
+	"github.com/ags-slc/m8/internal/partman"
 	"github.com/ags-slc/m8/internal/pgident"
 	"github.com/ags-slc/m8/internal/reference"
 	"github.com/ags-slc/m8/internal/schema"
@@ -70,8 +71,11 @@ type Config struct {
 
 // ApplyResult holds the outcome of an apply or plan operation.
 type ApplyResult struct {
-	Ops         []MigrationResult
-	Schema      []SchemaResult
+	Ops    []MigrationResult
+	Schema []SchemaResult
+	// Partman holds each m8:partman-declared table's reconciliation, run
+	// after schema/ (the parent must exist) and before logic/.
+	Partman     []PartmanResult
 	Logic       []MigrationResult
 	Permissions []MigrationResult
 	// Reference holds one diff per reference/ file, in the order they apply.
@@ -113,6 +117,9 @@ type StatusResult struct {
 	// only plan, which diffs them against the live tables, can say whether
 	// they have drifted.
 	Reference []*migration.Migration
+	// Partman reports, for each m8:partman-declared table, whether pg_partman
+	// manages it and when maintenance last ran over it.
+	Partman []partman.Status
 }
 
 // DriftEntry represents an ops migration whose file content changed after being applied.
@@ -134,7 +141,7 @@ func New(conn *pgx.Conn, sqlDB *sql.DB, differ *schema.Differ, config *Config, l
 }
 
 // Apply discovers and executes pending migrations:
-// ops → schema → logic → permissions → reference → data.
+// ops → schema → partman → logic → permissions → reference → data.
 func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 	if err := e.acquireLock(ctx); err != nil {
 		return nil, err
@@ -161,11 +168,21 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 
 	// Phase B: Schema — ensure PG schemas exist, then diff and apply
 	schemaMigrations := filterByType(all, migration.TypeSchema)
+	if err := e.refusePartman(ctx, schemaMigrations); err != nil {
+		return result, err
+	}
 	if err := e.ensurePGSchemas(ctx, schemaMigrations); err != nil {
 		return result, err
 	}
 	s, err := e.applySchema(ctx, schemaMigrations)
 	result.Schema = s
+	if err != nil {
+		return result, err
+	}
+
+	// Phase B2: pg_partman — register declared tables and reconcile their
+	// part_config rows, now that the schema phase has created the parents.
+	result.Partman, err = e.applyPartman(ctx, schemaMigrations)
 	if err != nil {
 		return result, err
 	}
@@ -285,6 +302,13 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		return nil, errDifferUnavailable(len(schemaMigrations))
 	}
 
+	// Phase B2: pg_partman — what registering and reconciling the declared
+	// tables would run.
+	result.Partman, err = e.planPartman(ctx, schemaMigrations)
+	if err != nil {
+		return nil, err
+	}
+
 	// Phase C: Logic — find changed checksums
 	result.Logic, err = e.planIdempotent(ctx, filterByType(all, migration.TypeLogic), "logic", stateReady)
 	if err != nil {
@@ -388,6 +412,14 @@ func (e *Engine) Status(ctx context.Context) (*StatusResult, error) {
 	}
 
 	result := &StatusResult{Applied: history}
+
+	specs, err := collectPartmanSpecs(filterByType(all, migration.TypeSchema))
+	if err != nil {
+		return nil, err
+	}
+	if result.Partman, err = partman.Statuses(ctx, e.conn, specs); err != nil {
+		return nil, err
+	}
 
 	for _, m := range all {
 		switch m.Type {
@@ -511,11 +543,20 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 
 	// Schema — ensure PG schemas exist, then diff and apply
 	syncSchemaMigrations := filterByType(all, migration.TypeSchema)
+	if err := e.refusePartman(ctx, syncSchemaMigrations); err != nil {
+		return result, err
+	}
 	if err := e.ensurePGSchemas(ctx, syncSchemaMigrations); err != nil {
 		return result, err
 	}
 	s, err := e.applySchema(ctx, syncSchemaMigrations)
 	result.Schema = s
+	if err != nil {
+		return result, err
+	}
+
+	// pg_partman configuration converges with the schema it belongs to.
+	result.Partman, err = e.applyPartman(ctx, syncSchemaMigrations)
 	if err != nil {
 		return result, err
 	}
@@ -1043,6 +1084,24 @@ func FormatPlanOutput(result *ApplyResult) string {
 		}
 	}
 
+	for _, p := range result.Partman {
+		name := p.Action.Spec.QualifiedName()
+		switch {
+		case p.Error != nil:
+			fmt.Fprintf(&b, "  ! %s (partman) ERROR: %v\n", name, p.Error)
+			pending++
+		case len(p.Action.Statements) > 0:
+			fmt.Fprintf(&b, "  ~ %s (partman)\n", name)
+			if !p.Action.Installed {
+				fmt.Fprintf(&b, "    ℹ pg_partman is not installed yet; statements assume it will be in schema %s\n", partman.AssumedSchema)
+			}
+			for _, stmt := range p.Action.Statements {
+				fmt.Fprintf(&b, "    %s\n", stmt)
+			}
+			pending++
+		}
+	}
+
 	for _, r := range result.Logic {
 		if !r.Skipped {
 			fmt.Fprintf(&b, "  ~ %s (logic)\n", r.Migration.Filename)
@@ -1168,6 +1227,19 @@ func FormatApplyOutput(result *ApplyResult) string {
 			skipped++
 		}
 	}
+	for _, p := range result.Partman {
+		name := p.Action.Spec.QualifiedName()
+		switch {
+		case p.Error != nil:
+			fmt.Fprintf(&b, "  ✗ %s (partman, %dms) ERROR: %v\n", name, p.ExecMs, p.Error)
+			failed++
+		case p.Applied:
+			fmt.Fprintf(&b, "  ✓ %s (partman, %dms, %d statements)\n", name, p.ExecMs, len(p.Action.Statements))
+			applied++
+		default:
+			skipped++
+		}
+	}
 	writeResults(result.Logic)
 	writeResults(result.Permissions)
 	for _, d := range result.Reference {
@@ -1233,6 +1305,26 @@ func FormatStatusOutput(result *StatusResult) string {
 		fmt.Fprintf(&b, "Reference (diffed on every apply; run m8 plan for drift) (%d):\n", len(result.Reference))
 		for _, m := range result.Reference {
 			fmt.Fprintf(&b, "  = %s\n", m.Filename)
+		}
+		b.WriteString("\n")
+	}
+
+	// Maintenance is reported, not just registration: a table pg_partman
+	// manages but whose maintenance never runs keeps its first premake months
+	// of children and then routes every new row into its default partition.
+	// Nothing about that shows up as a pending migration.
+	if len(result.Partman) > 0 {
+		fmt.Fprintf(&b, "pg_partman (%d):\n", len(result.Partman))
+		for _, p := range result.Partman {
+			name := p.Spec.QualifiedName()
+			switch {
+			case !p.Registered:
+				fmt.Fprintf(&b, "  + %s not registered yet (apply runs create_parent)\n", name)
+			case p.LastRun == "":
+				fmt.Fprintf(&b, "  ⚠ %s maintenance has never run (is partman.run_maintenance() scheduled?)\n", name)
+			default:
+				fmt.Fprintf(&b, "  ✓ %s maintenance last ran %s\n", name, p.LastRun)
+			}
 		}
 		b.WriteString("\n")
 	}
