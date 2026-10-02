@@ -1599,3 +1599,51 @@ func TestListTablesExcludesExtensionOwnedTables(t *testing.T) {
 		t.Errorf("the filter also removed an ordinary table: %v", tables)
 	}
 }
+
+// A partitioned table dumped without its partition key is a different table:
+// the diff plans DROP TABLE and CREATE TABLE against the original. Its children
+// are not dumped -- they are the partition manager's, adopted by the diff from
+// the live database -- and its indexes are declared on the whole table (ON),
+// not as the empty parent-only half pg_get_indexdef describes (ON ONLY).
+func TestDumpPartitionedTable(t *testing.T) {
+	conn, cleanup := testDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE event_log (id text NOT NULL, created_at timestamptz NOT NULL)
+			PARTITION BY RANGE (created_at);
+		CREATE INDEX event_log_created_at_idx ON event_log (created_at);
+		CREATE TABLE event_log_p202610 PARTITION OF event_log
+			FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	d := NewDumper(conn)
+	tables, err := d.ListTables(ctx, "public")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tables) != 1 || tables[0] != "event_log" {
+		t.Fatalf("expected only the parent to be listed, got %v", tables)
+	}
+
+	table, err := d.DumpTable(ctx, "public", "event_log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddl := RenderDDL(table)
+	if !strings.Contains(ddl, ") PARTITION BY RANGE (created_at);") {
+		t.Errorf("expected the partition key, got:\n%s", ddl)
+	}
+	if strings.Contains(ddl, "ON ONLY") {
+		t.Errorf("index declared ON ONLY:\n%s", ddl)
+	}
+	if !strings.Contains(ddl, "CREATE INDEX event_log_created_at_idx ON public.event_log USING btree (created_at);") {
+		t.Errorf("expected the index on the whole table, got:\n%s", ddl)
+	}
+	if table.Partman != nil {
+		t.Errorf("no pg_partman here, but dumped a directive: %s", table.Partman.Directive())
+	}
+}
