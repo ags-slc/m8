@@ -19,6 +19,7 @@ Types and naming:
   m8 new schema materialized/rpt   → migrations/schema/materialized/rpt.sql
   m8 new logic proc_refresh        → migrations/logic/proc_refresh.sql
   m8 new permissions grants        → migrations/permissions/grants.sql
+  m8 new reference carrier         → migrations/reference/carrier.sql
   m8 new ops "create extensions"   → migrations/ops/{timestamp}__create_extensions.sql
   m8 new data "backfill country"   → migrations/data/{timestamp}__backfill_country.sql
 
@@ -56,7 +57,7 @@ belongs in data/ -- in ops/ it would find nothing.`,
 			}
 			relDir, filename = filepath.Join("schema", pgSchema), objName+".sql"
 
-		case "logic", "permissions":
+		case "logic", "permissions", "reference":
 			if !safeComponent(name) {
 				return fmt.Errorf("invalid name %q: must be a plain filename", name)
 			}
@@ -71,7 +72,7 @@ belongs in data/ -- in ops/ it would find nothing.`,
 			}
 
 		default:
-			return fmt.Errorf("unknown type %q (expected: schema, logic, permissions, ops, data)", migType)
+			return fmt.Errorf("unknown type %q (expected: schema, logic, permissions, reference, ops, data)", migType)
 		}
 
 		r, err := openRoot(migrationsDir)
@@ -116,6 +117,12 @@ func templateFor(migType, name string) string {
 		return fmt.Sprintf("CREATE OR REPLACE FUNCTION %s()\nRETURNS void\nLANGUAGE plpgsql AS $$\nBEGIN\n    -- TODO\nEND;\n$$;\n", name)
 	case "permissions":
 		return "-- Define grants, revokes, and role permissions here.\n"
+	case "reference":
+		return fmt.Sprintf("-- The rows %s must hold. Every apply inserts the missing ones and updates the\n"+
+			"-- changed ones; add prune to delete rows not listed. Columns the query does not\n"+
+			"-- name are left alone.\n"+
+			"-- m8:reference public.%s key=id\n"+
+			"SELECT * FROM (VALUES\n    (1, 'example')\n) AS v(id, name);\n", name, name)
 	case "ops":
 		return "-- One-time operation. This file runs once in order, BEFORE schema/ and logic/.\n"
 	case "data":

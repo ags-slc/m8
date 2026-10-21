@@ -70,9 +70,9 @@ func init() {
 	rootCmd.PersistentFlags().BoolVar(&flagFailOnUnvalidated, "fail-on-unvalidated", false,
 		"Refuse to plan or apply a schema diff whose plan could not be validated (env: M8_FAIL_ON_UNVALIDATED; implied by require_shadow)")
 	rootCmd.PersistentFlags().DurationVar(&flagLockTimeout, "lock-timeout", 0,
-		"Override the lock_timeout applied to every generated schema statement (default: pg-schema-diff's hazard-derived value, 3s for ordinary DDL)")
+		"Override the lock_timeout applied to every generated schema statement and to reference/ (default: pg-schema-diff's hazard-derived value, 3s for ordinary DDL; 3s for reference/)")
 	rootCmd.PersistentFlags().DurationVar(&flagStatementTimeout, "statement-timeout", 0,
-		"Override the statement_timeout applied to every generated schema statement (default: pg-schema-diff's hazard-derived value, 3s for ordinary DDL / 20m for a concurrent index build)")
+		"Override the statement_timeout applied to every generated schema statement and to reference/ (default: pg-schema-diff's hazard-derived value, 3s for ordinary DDL / 20m for a concurrent index build; none for reference/)")
 }
 
 func loadEnv() {
