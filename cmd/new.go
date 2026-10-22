@@ -121,8 +121,8 @@ func templateFor(migType, name string) string {
 		return fmt.Sprintf("-- The rows %s must hold. Every apply inserts the missing ones and updates the\n"+
 			"-- changed ones; add prune to delete rows not listed. Columns the query does not\n"+
 			"-- name are left alone.\n"+
-			"-- m8:reference public.%s key=id\n"+
-			"SELECT * FROM (VALUES\n    (1, 'example')\n) AS v(id, name);\n", name, name)
+			"-- m8:reference public.%s key=code\n"+
+			"SELECT * FROM (VALUES\n    ('example', 'Example')\n) AS v(code, name);\n", name, name)
 	case "ops":
 		return "-- One-time operation. This file runs once in order, BEFORE schema/ and logic/.\n"
 	case "data":

@@ -108,11 +108,13 @@ type Diff struct {
 	// apply will write to. Apply never returns it.
 	Pending string
 
-	oid    uint32
-	qname  string // the table, quoted for SQL
-	temp   string // the temporary table holding the declared rows
-	nonKey []string
-	types  map[string]string // declared column -> type
+	oid       uint32
+	qname     string // the table, quoted for SQL
+	temp      string // the temporary table holding the declared rows
+	nonKey    []string
+	types     map[string]string // declared column -> type
+	compare   map[string]string // declared column -> cast that gives it an equality operator, if it needs one
+	sequences map[string]string // declared column -> the sequence behind its default, if any
 }
 
 // Empty reports whether applying the diff would write nothing.
@@ -124,11 +126,11 @@ func (d *Diff) Empty() bool {
 // be applied in. It writes nothing but temporary tables.
 //
 // changing is set for m8 plan. It reports whether this release's schema/
-// changes a table, by name; such a table is reported Pending instead of being
+// changes a table, by schema and name; such a table is reported Pending instead of being
 // diffed. Plan also runs the declared queries in a read-only transaction, so
 // one that calls nextval() or setval() -- whose effects a rollback does not
 // undo -- fails instead of moving a sequence.
-func Plan(ctx context.Context, tx pgx.Tx, specs []Spec, changing func(rel string) bool) ([]*Diff, error) {
+func Plan(ctx context.Context, tx pgx.Tx, specs []Spec, changing func(nsp, rel string) bool) ([]*Diff, error) {
 	diffs := make([]*Diff, 0, len(specs))
 	seen := map[uint32]string{}
 	for _, s := range specs {
@@ -198,6 +200,9 @@ func Apply(ctx context.Context, tx pgx.Tx, diffs []*Diff) error {
 		return err
 	}
 	first := write(ctx, tx, diffs, true)
+	if first == nil {
+		return advanceSequences(ctx, tx, diffs)
+	}
 	var pgErr *pgconn.PgError
 	if !errors.As(first, &pgErr) || !strings.HasPrefix(pgErr.Code, "23") {
 		return first
@@ -205,8 +210,32 @@ func Apply(ctx context.Context, tx pgx.Tx, diffs []*Diff) error {
 	if _, err := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT m8_reference"); err != nil {
 		return err
 	}
-	if write(ctx, tx, diffs, false) != nil {
-		return first
+	if second := write(ctx, tx, diffs, false); second != nil {
+		return fmt.Errorf("%w; with deletes last instead: %w", first, second)
+	}
+	return advanceSequences(ctx, tx, diffs)
+}
+
+// advanceSequences moves the sequence behind each declared column that has
+// one -- serial, or an identity column -- past the highest value now in the
+// table, so an application insert that takes the default does not collide
+// with a declared row. It never moves a sequence backwards.
+func advanceSequences(ctx context.Context, tx pgx.Tx, diffs []*Diff) error {
+	for _, d := range diffs {
+		if len(d.Inserts) == 0 {
+			continue
+		}
+		for _, c := range d.Columns {
+			seq := d.sequences[c]
+			if seq == "" {
+				continue
+			}
+			if _, err := tx.Exec(ctx, fmt.Sprintf(`SELECT setval(%s, m) FROM (SELECT max(%s) AS m FROM %s) x
+				WHERE m > (SELECT last_value - CASE WHEN is_called THEN 0 ELSE 1 END FROM %s)`,
+				pgLiteral(seq), pgident.Quote(c), d.qname, seq)); err != nil {
+				return fmt.Errorf("%s: advancing %s: %w", d.Spec.File, seq, err)
+			}
+		}
 	}
 	return nil
 }
@@ -270,7 +299,7 @@ func upsertSQL(d *Diff) []string {
 			set = append(set, pgident.Quote(t)+" = now()")
 		}
 		out = append(out, fmt.Sprintf("UPDATE %s AS t SET %s FROM %s r WHERE %s AND NOT %s",
-			d.qname, strings.Join(set, ", "), d.temp, same, rowsEqual("t", "r", d.nonKey)))
+			d.qname, strings.Join(set, ", "), d.temp, same, rowsEqual(d, "t", "r")))
 	}
 	if len(d.Inserts) > 0 {
 		cols := pgident.QuoteAll(d.Columns)
@@ -288,7 +317,7 @@ func upsertSQL(d *Diff) []string {
 				set = append(set, fmt.Sprintf("%s = excluded.%s", pgident.Quote(c), pgident.Quote(c)))
 			}
 			conflict = fmt.Sprintf("DO UPDATE SET %s WHERE NOT %s",
-				strings.Join(append(set, touch...), ", "), rowsEqual("t", "excluded", d.nonKey))
+				strings.Join(append(set, touch...), ", "), rowsEqual(d, "t", "excluded"))
 		}
 		out = append(out, fmt.Sprintf("INSERT INTO %s AS t (%s) SELECT %s FROM %s r WHERE NOT EXISTS (SELECT 1 FROM %s t WHERE %s) ON CONFLICT (%s) %s",
 			d.qname, strings.Join(cols, ", "), strings.Join(vals, ", "), d.temp, d.qname, same,
@@ -301,12 +330,13 @@ type column struct {
 	typ            string
 	generated      bool
 	identityAlways bool
+	sequence       string // the sequence behind a serial or identity column
 }
 
 // resolve finds the table and checks the declaration against it: the columns
 // exist and can be written, the key is backed by a unique index, and pruning
 // cannot reach into another table.
-func resolve(ctx context.Context, tx pgx.Tx, d *Diff, changing func(rel string) bool) error {
+func resolve(ctx context.Context, tx pgx.Tx, d *Diff, changing func(nsp, rel string) bool) error {
 	var kind, nsp, rel string
 	err := tx.QueryRow(ctx, `SELECT c.oid, c.oid::regclass::text, c.relkind::text, n.nspname::text, c.relname::text
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass($1)`,
@@ -316,9 +346,14 @@ func resolve(ctx context.Context, tx pgx.Tx, d *Diff, changing func(rel string) 
 		return err
 	}
 	if !found {
-		d.Table, rel = d.Spec.Table, relName(d.Spec.Table)
+		d.Table = d.Spec.Table
+		if nsp, rel = splitName(d.Spec.Table); nsp == "" {
+			if err := tx.QueryRow(ctx, "SELECT current_schema()::text").Scan(&nsp); err != nil {
+				return err
+			}
+		}
 	}
-	if changing != nil && changing(rel) {
+	if changing != nil && changing(nsp, rel) {
 		d.Pending = fmt.Sprintf("schema/ changes %s in this release", d.Table)
 		return nil
 	}
@@ -337,7 +372,7 @@ func resolve(ctx context.Context, tx pgx.Tx, d *Diff, changing func(rel string) 
 	if d.Columns, err = queryColumns(ctx, tx, d.Spec.Query); err != nil {
 		return fmt.Errorf("the query failed: %w", err)
 	}
-	d.types = map[string]string{}
+	d.types, d.compare, d.sequences = map[string]string{}, map[string]string{}, map[string]string{}
 	for _, c := range d.Columns {
 		lc, ok := live[c]
 		switch {
@@ -352,6 +387,10 @@ func resolve(ctx context.Context, tx pgx.Tx, d *Diff, changing func(rel string) 
 			return fmt.Errorf("the query names column %s twice", c)
 		}
 		d.types[c] = lc.typ
+		d.compare[c] = comparable(lc.typ)
+		if lc.sequence != "" {
+			d.sequences[c] = lc.sequence
+		}
 	}
 
 	d.Key = d.Spec.Key
@@ -401,7 +440,8 @@ func liveColumns(ctx context.Context, tx pgx.Tx, oid uint32) (map[string]column,
 		    CASE t.typname WHEN 'bpchar' THEN 'bpchar' WHEN '_bpchar' THEN 'bpchar[]'
 		                   WHEN 'bit' THEN 'varbit' WHEN '_bit' THEN 'varbit[]'
 		                   ELSE format_type(a.atttypid, NULL) END,
-		    a.attgenerated <> '', a.attidentity = 'a'
+		    a.attgenerated <> '', a.attidentity = 'a',
+		    coalesce(pg_get_serial_sequence(a.attrelid::regclass::text, a.attname), '')
 		FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
 		WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped`, oid)
 	if err != nil {
@@ -411,7 +451,7 @@ func liveColumns(ctx context.Context, tx pgx.Tx, oid uint32) (map[string]column,
 	for rows.Next() {
 		var name string
 		var c column
-		if err := rows.Scan(&name, &c.typ, &c.generated, &c.identityAlways); err != nil {
+		if err := rows.Scan(&name, &c.typ, &c.generated, &c.identityAlways, &c.sequence); err != nil {
 			return nil, err
 		}
 		live[name] = c
@@ -419,17 +459,43 @@ func liveColumns(ctx context.Context, tx pgx.Tx, oid uint32) (map[string]column,
 	return live, rows.Err()
 }
 
-// relName is the relation part of a table name as a file writes it, folded the
-// way PostgreSQL folds an unquoted identifier.
+// splitName splits a table name as a file writes it into schema and relation,
+// each folded the way PostgreSQL folds an unquoted identifier. The schema is
+// empty when the name is unqualified.
 //
 // ponytail: splits on the last dot, so a quoted name containing one is misread.
-func relName(table string) string {
-	name := table[strings.LastIndex(table, ".")+1:]
-	if unquoted, ok := strings.CutPrefix(name, `"`); ok {
-		return strings.ReplaceAll(strings.TrimSuffix(unquoted, `"`), `""`, `"`)
+func splitName(table string) (nsp, rel string) {
+	fold := func(name string) string {
+		if unquoted, ok := strings.CutPrefix(name, `"`); ok {
+			return strings.ReplaceAll(strings.TrimSuffix(unquoted, `"`), `""`, `"`)
+		}
+		return strings.ToLower(name)
 	}
-	return strings.ToLower(name)
+	i := strings.LastIndex(table, ".")
+	if i < 0 {
+		return "", fold(table)
+	}
+	return fold(table[:i]), fold(table[i+1:])
 }
+
+// comparable is the cast that gives a column type an equality operator, for
+// the core types that have none: json compares as jsonb, which ignores
+// whitespace and key order, and xml and the geometric types compare as text.
+func comparable(typ string) string {
+	base, array := strings.CutSuffix(typ, "[]")
+	switch base {
+	case "json":
+		if array {
+			return "::jsonb[]"
+		}
+		return "::jsonb"
+	case "xml", "point", "line", "lseg", "box", "path", "polygon", "circle":
+		return "::text"
+	}
+	return ""
+}
+
+func pgLiteral(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
 
 // readsNoDeclaredTable refuses a query that reads a table another file -- or
 // this one -- declares. Every query is loaded before anything is written, so
@@ -653,7 +719,7 @@ func compute(ctx context.Context, tx pgx.Tx, d *Diff) error {
 	if len(d.nonKey) > 0 {
 		rows, err := queryRows(ctx, tx, fmt.Sprintf("SELECT %s, %s, %s FROM %s r JOIN %s t ON %s WHERE NOT %s ORDER BY %s",
 			textCols("r", d.Key), textCols("t", d.nonKey), textCols("r", d.nonKey), d.temp, d.qname, match,
-			rowsEqual("t", "r", d.nonKey), joined("r", d.Key)))
+			rowsEqual(d, "t", "r"), joined("r", d.Key)))
 		if err != nil {
 			return err
 		}
@@ -719,9 +785,16 @@ func keyMatch(a, b string, key []string) string {
 	return strings.Join(out, " AND ")
 }
 
-// rowsEqual compares columns NULL-safely: two NULLs are equal.
-func rowsEqual(a, b string, cols []string) string {
-	return fmt.Sprintf("ROW(%s) IS NOT DISTINCT FROM ROW(%s)", joined(a, cols), joined(b, cols))
+// rowsEqual compares the non-key columns NULL-safely: two NULLs are equal.
+func rowsEqual(d *Diff, a, b string) string {
+	side := func(alias string) string {
+		out := qualified(alias, d.nonKey)
+		for i, c := range d.nonKey {
+			out[i] += d.compare[c]
+		}
+		return strings.Join(out, ", ")
+	}
+	return fmt.Sprintf("ROW(%s) IS NOT DISTINCT FROM ROW(%s)", side(a), side(b))
 }
 
 // formatValue renders a value as a SQL literal, so a plan line reads unambiguously.
@@ -729,7 +802,7 @@ func formatValue(v *string) string {
 	if v == nil {
 		return "NULL"
 	}
-	return "'" + strings.ReplaceAll(*v, "'", "''") + "'"
+	return pgLiteral(*v)
 }
 
 func formatRow(r Row) string {

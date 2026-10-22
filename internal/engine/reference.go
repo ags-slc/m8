@@ -39,10 +39,11 @@ func (e *Engine) discover() ([]*migration.Migration, []reference.Spec, error) {
 
 // reconcileReference diffs the declared rows against the live tables and, when
 // changing is nil, writes the difference. A plan passes changing: whether this
-// release's schema/ changes a table, which plan cannot diff against yet. Every file runs in one transaction, so
-// a failure in one leaves every table as it was; a plan rolls it back, and the
-// only thing it wrote is the temporary tables the diff is read from.
-func (e *Engine) reconcileReference(ctx context.Context, specs []reference.Spec, changing func(rel string) bool) ([]*reference.Diff, error) {
+// release's schema/ changes a table, which plan cannot diff against yet. Every
+// file runs in one transaction, so a failure in one leaves every table as it
+// was; a plan rolls it back, and the only thing it wrote is the temporary
+// tables the diff is read from.
+func (e *Engine) reconcileReference(ctx context.Context, specs []reference.Spec, changing func(nsp, rel string) bool) ([]*reference.Diff, error) {
 	if len(specs) == 0 {
 		return nil, nil
 	}
@@ -93,14 +94,11 @@ func setLocalTimeouts(ctx context.Context, tx pgx.Tx, lock, statement time.Durat
 	return nil
 }
 
-// schemaChanges reports whether a planned schema diff touches a table, by
-// name. pg-schema-diff quotes every identifier it emits, so a table appears in
-// a statement as its quoted name.
-//
-// ponytail: matches the quoted name anywhere in the DDL, so a same-named table
-// in another schema counts too -- that only defers a diff to apply, never
-// skips one.
-func schemaChanges(r *ApplyResult) func(rel string) bool {
+// schemaChanges reports whether a planned schema diff touches a table.
+// pg-schema-diff schema-qualifies and quotes every table it emits, so a table
+// appears in a statement as "schema"."name" -- which a column or a same-named
+// table in another schema does not match.
+func schemaChanges(r *ApplyResult) func(nsp, rel string) bool {
 	var ddl strings.Builder
 	for _, s := range r.Schema {
 		if s.Diff != nil {
@@ -110,5 +108,5 @@ func schemaChanges(r *ApplyResult) func(rel string) bool {
 		}
 	}
 	text := ddl.String()
-	return func(rel string) bool { return strings.Contains(text, pgident.Quote(rel)) }
+	return func(nsp, rel string) bool { return strings.Contains(text, pgident.Qualify(nsp, rel)) }
 }

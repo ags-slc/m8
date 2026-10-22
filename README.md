@@ -240,10 +240,11 @@ m8 refuses, naming the file, rather than guess when:
   `SET NULL` or `SET DEFAULT`, which would change rows in a table the file does
   not declare.
 
-Every declared column needs an equality operator to be compared: declare
-`jsonb`, not `json`. Explicit values in a `serial` or identity column do not
-advance its sequence, so a table that also takes application inserts should
-leave that column out and match on a natural `key=`.
+`json` columns are compared as `jsonb`, so whitespace and key order are not
+changes; `xml` and the geometric types are compared as text. When a file
+declares a `serial` or identity column, apply moves its sequence past the
+highest value in the table -- never backwards -- so an application insert
+that takes the default does not collide with a declared row.
 
 All `reference/` files apply in one transaction, ordered by the foreign keys
 between their tables -- parents first for inserts and updates, children first
@@ -255,8 +256,9 @@ release before anything is applied.
 
 `m8 plan` runs the queries in a read-only transaction, so one that calls
 `nextval()` fails rather than moving a sequence. When this release's `schema/`
-changes a table, plan cannot diff it against the table apply will write to, and
-reports it as diffed at apply; any other problem -- a misspelt column -- fails
+changes a table -- a statement naming it as `"schema"."table"` -- plan cannot
+diff it against the table apply will write to, and reports it as diffed at
+apply; any other problem -- a misspelt column -- fails
 plan as it would fail apply. `m8 sync` converges `reference/`; `m8 baseline`
 skips it, since there is no history to adopt; `m8 status` lists it, but only
 plan can say whether it has drifted. Plan and apply wait at most
