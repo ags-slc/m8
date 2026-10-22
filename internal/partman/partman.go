@@ -28,6 +28,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/ags-slc/m8/internal/parser"
 	"github.com/ags-slc/m8/internal/pgident"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -50,8 +51,9 @@ type Spec struct {
 	DefaultTable   *bool
 	StartPartition *string
 
-	// Settings are part_config columns that can be changed in place, keyed by
-	// column name. Only declared keys are present.
+	// Settings are part_config columns, keyed by column name. Only declared
+	// keys are present. Most can be changed in place; the fixed ones are
+	// compared like Control and Interval.
 	Settings map[string]string
 }
 
@@ -66,28 +68,51 @@ type kind int
 const (
 	kindBool kind = iota
 	kindInt
+	kindText
 	kindNullableText // "none" declares NULL
+	kindInterval     // "none" declares NULL; compares canonically
+	kindTextArray    // a,b declares {a,b}; "none" declares NULL
 	kindMaintenance  // on | off | none
 )
 
-// column is a part_config column a directive may manage in place.
-type column struct {
-	kind kind
-	// createArg: create_parent also takes it, as p_<column>, and it belongs
-	// there rather than in the UPDATE after -- premake decides how many
-	// children the first call creates, and by then they already exist.
-	createArg bool
+// nullable kinds declare NULL as "none".
+func (k kind) nullable() bool {
+	return k == kindNullableText || k == kindInterval || k == kindTextArray
 }
 
+// column is a part_config column a directive may declare.
+type column struct {
+	kind kind
+	// arg is create_parent's parameter for it, if it has one. A value with a
+	// parameter belongs there rather than in the UPDATE after -- premake
+	// decides how many children the first call creates, and by then they
+	// already exist.
+	arg string
+	// fixed: pg_partman cannot change it once the table is registered -- it
+	// decides the partition boundaries -- so a declaration that disagrees with
+	// the live row is refused, not reconciled.
+	fixed bool
+}
+
+// settable lists the part_config columns a directive may declare: those every
+// pg_partman 5.x has. Columns later releases added are left alone, so a
+// directive reads the same against any 5.x.
 var settable = map[string]column{
-	"premake":                  {kindInt, true},
-	"retention":                {kindNullableText, false},
-	"retention_keep_table":     {kindBool, false},
-	"retention_keep_index":     {kindBool, false},
-	"infinite_time_partitions": {kindBool, false},
-	"inherit_privileges":       {kindBool, false},
-	"automatic_maintenance":    {kindMaintenance, true},
-	"jobmon":                   {kindBool, true},
+	"partition_type":           {kindText, "p_type", true},
+	"epoch":                    {kindText, "p_epoch", true},
+	"date_trunc_interval":      {kindNullableText, "p_date_trunc_interval", true},
+	"premake":                  {kindInt, "p_premake", false},
+	"constraint_cols":          {kindTextArray, "p_constraint_cols", false},
+	"optimize_constraint":      {kindInt, "", false},
+	"ignore_default_data":      {kindBool, "", false},
+	"retention":                {kindInterval, "", false},
+	"retention_schema":         {kindNullableText, "", false},
+	"retention_keep_table":     {kindBool, "", false},
+	"retention_keep_index":     {kindBool, "", false},
+	"infinite_time_partitions": {kindBool, "", false},
+	"inherit_privileges":       {kindBool, "", false},
+	"automatic_maintenance":    {kindMaintenance, "p_automatic_maintenance", false},
+	"jobmon":                   {kindBool, "p_jobmon", false},
 }
 
 const directivePrefix = "-- m8:partman"
@@ -96,18 +121,10 @@ const directivePrefix = "-- m8:partman"
 // file's schema/{pg_schema}/ folder, which every table it names belongs to.
 func Parse(content []byte, pgSchema string) ([]Spec, error) {
 	var specs []Spec
-	for i, line := range strings.Split(string(content), "\n") {
-		trimmed := strings.TrimSpace(line)
-		rest, ok := strings.CutPrefix(trimmed, directivePrefix)
-		if !ok {
-			continue
-		}
-		if rest != "" && rest[0] != ' ' && rest[0] != '\t' {
-			continue // -- m8:partmanfoo is some other directive, not this one
-		}
-		spec, err := parseDirective(rest, pgSchema)
+	for _, body := range parser.ExtractDirectives(content).Partman {
+		spec, err := parseDirective(body, pgSchema)
 		if err != nil {
-			return nil, fmt.Errorf("line %d: %w", i+1, err)
+			return nil, err
 		}
 		specs = append(specs, spec)
 	}
@@ -245,6 +262,22 @@ func normalize(k kind, v string) (string, error) {
 			return v, nil
 		}
 		return "", fmt.Errorf("%q must be on, off or none", v)
+	case kindTextArray:
+		// An array literal -- what dump writes -- is kept as written: its
+		// quoting is PostgreSQL's, and the server validates it at plan time.
+		if v == "none" || strings.HasPrefix(v, "{") {
+			return v, nil
+		}
+		items := strings.Split(v, ",")
+		for i := range items {
+			if items[i] = strings.TrimSpace(items[i]); items[i] == "" {
+				return "", fmt.Errorf("%q has an empty element", v)
+			}
+		}
+		return "{" + strings.Join(items, ",") + "}", nil
+	}
+	if v == "" {
+		return "", errors.New("empty value")
 	}
 	return v, nil
 }
@@ -296,10 +329,13 @@ func ExtensionSchema(ctx context.Context, conn *pgx.Conn) (string, error) {
 		return "", err
 	}
 	if major, _, _ := strings.Cut(version, "."); atoiOr(major, 0) < 5 {
-		return "", fmt.Errorf("pg_partman %s is installed; m8:partman supports pg_partman 5.0 and later", version)
+		return "", fmt.Errorf("%w: pg_partman %s is installed; m8:partman supports pg_partman 5.0 and later", ErrUnsupportedVersion, version)
 	}
 	return nsp, nil
 }
+
+// ErrUnsupportedVersion is a pg_partman older than 5.0.
+var ErrUnsupportedVersion = errors.New("unsupported pg_partman version")
 
 // Action is what bringing one table's pg_partman configuration in line with its
 // declaration takes. No statements means it already matches.
@@ -358,8 +394,8 @@ func Plan(ctx context.Context, conn *pgx.Conn, specs []Spec) ([]Action, error) {
 // liveConfig is the subset of a part_config row a spec can declare, every
 // value rendered as text ("" for NULL), plus when maintenance last ran.
 type liveConfig struct {
-	control, interval, lastRun string
-	settings                   map[string]string
+	control, interval, lastRun, template string
+	settings                             map[string]string
 }
 
 func loadLive(ctx context.Context, conn *pgx.Conn, nsp string, s Spec) (*liveConfig, error) {
@@ -368,12 +404,12 @@ func loadLive(ctx context.Context, conn *pgx.Conn, nsp string, s Spec) (*liveCon
 	for i, c := range cols {
 		sel[i] = "coalesce(" + pgident.Quote(c) + "::text, '')"
 	}
-	q := fmt.Sprintf(`SELECT control, partition_interval, coalesce(maintenance_last_run::text, ''), %s
+	q := fmt.Sprintf(`SELECT control, partition_interval, coalesce(maintenance_last_run::text, ''), coalesce(template_table, ''), %s
 		FROM %s.part_config WHERE parent_table = $1`, strings.Join(sel, ", "), pgident.Quote(nsp))
 
 	live := &liveConfig{settings: map[string]string{}}
 	vals := make([]string, len(cols))
-	dest := []any{&live.control, &live.interval, &live.lastRun}
+	dest := []any{&live.control, &live.interval, &live.lastRun, &live.template}
 	for i := range vals {
 		dest = append(dest, &vals[i])
 	}
@@ -393,15 +429,27 @@ func loadLive(ctx context.Context, conn *pgx.Conn, nsp string, s Spec) (*liveCon
 // settable key present -- the complete declaration `m8 dump` writes. nsp is
 // pg_partman's schema (ExtensionSchema). It returns nil if pg_partman does not
 // manage the table.
-func Load(ctx context.Context, conn *pgx.Conn, nsp, pgSchema, table string) (*Spec, error) {
+func Load(ctx context.Context, conn *pgx.Conn, nsp, pgSchema, table string) (*Spec, []string, error) {
 	s := Spec{Schema: pgSchema, Table: table}
 	live, err := loadLive(ctx, conn, nsp, s)
 	if err != nil || live == nil {
-		return nil, err
+		return nil, nil, err
 	}
 	s.Control, s.Interval, s.Settings = live.control, live.interval, live.settings
-	if s.Settings["retention"] == "" {
-		s.Settings["retention"] = "none"
+	for k, v := range s.Settings {
+		if settable[k].kind.nullable() {
+			s.Settings[k] = orNone(v)
+		}
+	}
+
+	// template_table is not declarable: it names a table, which create_parent
+	// makes itself unless told to use one that already exists. A custom one
+	// is the one thing a fresh environment built from the files would not
+	// reproduce, so dump says so.
+	var notes []string
+	if def := defaultTemplate(nsp, pgSchema, table); live.template != "" && live.template != def {
+		notes = append(notes, fmt.Sprintf("pg_partman uses the template table %s, which m8:partman cannot declare; "+
+			"create_parent in a new environment makes its own (%s) instead", live.template, def))
 	}
 
 	// default_table has no part_config column; whether the table has one is the
@@ -413,10 +461,48 @@ func Load(ctx context.Context, conn *pgx.Conn, nsp, pgSchema, table string) (*Sp
 			SELECT 1 FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
 			WHERE i.inhparent = to_regclass($1) AND pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT')`,
 		pgident.Qualify(pgSchema, table)).Scan(&hasDefault); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	s.DefaultTable = &hasDefault
-	return &s, nil
+	return &s, notes, nil
+}
+
+// defaultTemplate is the template table create_parent makes when it is not
+// given one: template_<schema>_<table>, cut to PostgreSQL's 63-byte limit.
+//
+// ponytail: assumes pg_partman's schema needs no quoting -- pg_partman
+// writes a quoted one into the name, which this does not reproduce.
+func defaultTemplate(nsp, pgSchema, table string) string {
+	name := "template_" + pgSchema + "_" + table
+	if len(name) > 63 {
+		name = name[:63]
+	}
+	return nsp + "." + name
+}
+
+// ManagedTemplates returns, as schema.table, every template create_parent made
+// for itself. They are pg_partman's, like the children: its maintenance owns
+// their shape, and declaring one would hand that to the files. A custom
+// template is the user's own table and is not among them.
+func ManagedTemplates(ctx context.Context, conn *pgx.Conn, nsp string) (map[string]bool, error) {
+	rows, err := conn.Query(ctx, fmt.Sprintf(`SELECT parent_table, template_table FROM %s.part_config
+		WHERE template_table IS NOT NULL`, pgident.Quote(nsp)))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var parent, template string
+		if err := rows.Scan(&parent, &template); err != nil {
+			return nil, err
+		}
+		parentSchema, parentTable, _ := strings.Cut(parent, ".")
+		if template == defaultTemplate(nsp, parentSchema, parentTable) {
+			out[template] = true
+		}
+	}
+	return out, rows.Err()
 }
 
 func createStatements(nsp string, s Spec) []string {
@@ -433,8 +519,8 @@ func createStatements(nsp string, s Spec) []string {
 	}
 	var rest []string
 	for _, k := range slices.Sorted(maps.Keys(s.Settings)) {
-		if settable[k].createArg {
-			args = append(args, "p_"+k+" := "+renderValue(settable[k].kind, s.Settings[k]))
+		if col := settable[k]; col.arg != "" {
+			args = append(args, col.arg+" := "+renderValue(col.kind, s.Settings[k]))
 		} else {
 			rest = append(rest, k)
 		}
@@ -469,9 +555,14 @@ func reconcile(ctx context.Context, conn *pgx.Conn, nsp string, s Spec, live *li
 		if err != nil {
 			return nil, err
 		}
-		if !eq {
-			changed = append(changed, k)
+		if eq {
+			continue
 		}
+		if settable[k].fixed {
+			return nil, fmt.Errorf("m8:partman %s: %s is %s in the database but declared %s; pg_partman cannot change it for an existing partition set",
+				s.QualifiedName(), k, orNone(live.settings[k]), s.Settings[k])
+		}
+		changed = append(changed, k)
 	}
 	if len(changed) == 0 {
 		return nil, nil
@@ -479,17 +570,27 @@ func reconcile(ctx context.Context, conn *pgx.Conn, nsp string, s Spec, live *li
 	return []string{updateStatement(nsp, s, changed)}, nil
 }
 
-func sameSetting(ctx context.Context, conn *pgx.Conn, key, live, want string) (bool, error) {
-	if settable[key].kind != kindNullableText {
-		return live == want, nil
+func orNone(v string) string {
+	if v == "" {
+		return "none"
 	}
-	if want == "none" {
+	return v
+}
+
+func sameSetting(ctx context.Context, conn *pgx.Conn, key, live, want string) (bool, error) {
+	k := settable[key].kind
+	if k.nullable() && want == "none" {
 		return live == "", nil
 	}
-	if live == "" {
-		return false, nil
+	switch {
+	case live == "":
+		return live == want, nil
+	case k == kindInterval:
+		return sameInterval(ctx, conn, live, want)
+	case k == kindTextArray:
+		return sameCanonical(ctx, conn, "text[]", live, want)
 	}
-	return sameInterval(ctx, conn, live, want)
+	return live == want, nil
 }
 
 // sameInterval compares two interval spellings by the server's canonical
@@ -500,13 +601,20 @@ func sameSetting(ctx context.Context, conn *pgx.Conn, key, live, want string) (b
 // will not read as an interval compares as text. Only called outside a
 // transaction, so a failed cast costs nothing but the round trip.
 func sameInterval(ctx context.Context, conn *pgx.Conn, a, b string) (bool, error) {
+	return sameCanonical(ctx, conn, "interval", a, b)
+}
+
+// sameCanonical compares two spellings of a typ value by the server's
+// rendering of each -- for text[], '{org}' and '{"org"}' are the same array.
+// A value the server will not read as typ compares as text.
+func sameCanonical(ctx context.Context, conn *pgx.Conn, typ, a, b string) (bool, error) {
 	if a == b {
 		return true, nil
 	}
 	var eq bool
-	err := conn.QueryRow(ctx, `SELECT $1::interval::text = $2::interval::text`, a, b).Scan(&eq)
+	err := conn.QueryRow(ctx, fmt.Sprintf(`SELECT $1::%s::text = $2::%s::text`, typ, typ), a, b).Scan(&eq)
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "22") { // data exception: not an interval
+	if errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "22") { // data exception: not a typ
 		return false, nil
 	}
 	return eq, err
@@ -522,13 +630,14 @@ func updateStatement(nsp string, s Spec, keys []string) string {
 }
 
 func renderValue(k kind, v string) string {
+	if k.nullable() && v == "none" {
+		return "NULL"
+	}
 	switch k {
 	case kindBool, kindInt:
 		return v
-	case kindNullableText:
-		if v == "none" {
-			return "NULL"
-		}
+	case kindTextArray:
+		return pgident.Literal(v) + "::text[]"
 	}
 	return pgident.Literal(v)
 }

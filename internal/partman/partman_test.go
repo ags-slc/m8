@@ -95,3 +95,39 @@ func TestCreateStatementsPassCreateParentArguments(t *testing.T) {
 		t.Errorf("unexpected UPDATE: %s", stmts[1])
 	}
 }
+
+// A tab after the directive name is a separator, as a space is.
+func TestParseAcceptsATabSeparator(t *testing.T) {
+	specs, err := Parse([]byte("-- m8:partman\tevt control=created_at partition_interval='1 day'\nCREATE TABLE evt (created_at timestamptz);"), "public")
+	if err != nil || len(specs) != 1 || specs[0].Table != "evt" {
+		t.Fatalf("got %+v, %v", specs, err)
+	}
+}
+
+// An array literal -- what dump writes for constraint_cols -- is kept as
+// written: an empty array, and an element whose quoting holds a comma.
+func TestConstraintColsArrayLiterals(t *testing.T) {
+	for _, v := range []string{"{}", `'{"a, b"}'`, "{org}"} {
+		specs, err := Parse([]byte("-- m8:partman evt control=created_at partition_interval='1 day' constraint_cols="+v+"\n"), "public")
+		if err != nil {
+			t.Fatalf("%s: %v", v, err)
+		}
+		if got, want := specs[0].Settings["constraint_cols"], strings.Trim(v, "'"); got != want {
+			t.Errorf("%s: parsed as %q, want %q", v, got, want)
+		}
+	}
+	specs, err := Parse([]byte("-- m8:partman evt control=created_at partition_interval='1 day' constraint_cols='org, region'\n"), "public")
+	if err != nil || specs[0].Settings["constraint_cols"] != "{org,region}" {
+		t.Errorf("comma list: %+v, %v", specs, err)
+	}
+}
+
+// The directive is all Parse reads: SQL m8's statement splitter misreads --
+// valid PostgreSQL that pg-schema-diff gets whole -- must not stop it.
+func TestParseReadsOnlyTheDirective(t *testing.T) {
+	specs, err := Parse([]byte(`-- m8:partman evt control=created_at partition_interval='1 day'
+CREATE TABLE evt (created_at timestamptz, note text CHECK (note <> E'\''));`), "public")
+	if err != nil || len(specs) != 1 {
+		t.Fatalf("got %+v, %v", specs, err)
+	}
+}

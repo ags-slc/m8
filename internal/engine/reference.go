@@ -2,40 +2,11 @@ package engine
 
 import (
 	"context"
-	"fmt"
 	"strings"
-	"time"
 
-	"github.com/ags-slc/m8/internal/migration"
 	"github.com/ags-slc/m8/internal/pgident"
 	"github.com/ags-slc/m8/internal/reference"
-	"github.com/jackc/pgx/v5"
 )
-
-// referenceLockTimeout bounds the wait for a lock when --lock-timeout is not
-// set. Plan reads the target and apply writes rows an application may hold
-// locked; left unbounded, either queues behind a long transaction instead of
-// failing.
-const referenceLockTimeout = 3 * time.Second
-
-// discover finds every migration file and parses the reference/ ones, which
-// needs no database. Every command calls it before its first phase, so a
-// malformed reference/ file stops the run before anything has been changed.
-func (e *Engine) discover() ([]*migration.Migration, []reference.Spec, error) {
-	all, err := migration.Discover(e.config.MigrationsDir)
-	if err != nil {
-		return nil, nil, err
-	}
-	var specs []reference.Spec
-	for _, m := range filterByType(all, migration.TypeReference) {
-		s, err := reference.Parse(m.Filename, m.Content)
-		if err != nil {
-			return nil, nil, err
-		}
-		specs = append(specs, s)
-	}
-	return all, specs, nil
-}
 
 // reconcileReference diffs the declared rows against the live tables and, when
 // changing is nil, writes the difference. A plan passes changing: whether this
@@ -47,19 +18,11 @@ func (e *Engine) reconcileReference(ctx context.Context, specs []reference.Spec,
 	if len(specs) == 0 {
 		return nil, nil
 	}
-	tx, err := e.conn.Begin(ctx)
+	tx, err := e.beginBounded(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-
-	lockTimeout := referenceLockTimeout
-	if e.config.LockTimeout > 0 {
-		lockTimeout = e.config.LockTimeout
-	}
-	if err := setLocalTimeouts(ctx, tx, lockTimeout, e.config.StatementTimeout); err != nil {
-		return nil, err
-	}
 
 	diffs, err := reference.Plan(ctx, tx, specs, changing)
 	if err != nil || changing != nil {
@@ -78,20 +41,6 @@ func (e *Engine) reconcileReference(ctx context.Context, specs []reference.Spec,
 		}
 	}
 	return diffs, nil
-}
-
-// setLocalTimeouts bounds the rest of tx. A zero duration leaves that timeout
-// as it is.
-func setLocalTimeouts(ctx context.Context, tx pgx.Tx, lock, statement time.Duration) error {
-	for name, d := range map[string]time.Duration{"lock_timeout": lock, "statement_timeout": statement} {
-		if d <= 0 {
-			continue
-		}
-		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL %s = '%dms'", name, d.Milliseconds())); err != nil {
-			return fmt.Errorf("failed to set %s: %w", name, err)
-		}
-	}
-	return nil
 }
 
 // schemaChanges reports whether a planned schema diff touches a table.

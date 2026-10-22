@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -194,6 +195,10 @@ func TestDumpedPartmanTablePlansClean(t *testing.T) {
 	}
 
 	d := dump.NewDumper(conn)
+	// The template create_parent made is pg_partman's, not the files'.
+	if templates, err := d.ListTables(ctx, "partman"); err != nil || len(templates) != 0 {
+		t.Fatalf("partman schema tables listed for dump: %v, %v", templates, err)
+	}
 	table, err := d.DumpTable(ctx, "public", "audit_log")
 	if err != nil {
 		t.Fatal(err)
@@ -284,5 +289,165 @@ func TestPartmanCreateParentDoesNotWaitForeverOnALock(t *testing.T) {
 	_, err = eng.Apply(applyCtx)
 	if err == nil || !strings.Contains(err.Error(), "lock timeout") {
 		t.Fatalf("expected apply to give up on the lock, got %v", err)
+	}
+}
+
+// The settings that fix a partition set's boundaries are declarable, and
+// create_parent receives them; afterwards the ones pg_partman can change are
+// reconciled and the ones it cannot are refused.
+func TestPartmanDeclaresBoundaryAndConstraintSettings(t *testing.T) {
+	conn, engine := partmanDB(t)
+	ctx := context.Background()
+	dir := setupMigrationsDir(t)
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260101_000000__partman.sql"), []byte(installPartman), 0644)
+	file := func(directive string) {
+		mustWriteFile(t, filepath.Join(dir, "schema", "public", "evt.sql"), []byte(directive+`
+CREATE TABLE evt (
+    id text NOT NULL,
+    org text NOT NULL,
+    created_at timestamptz NOT NULL
+) PARTITION BY RANGE (created_at);
+`), 0644)
+	}
+	const base = "-- m8:partman evt control=created_at partition_interval='1 week' date_trunc_interval=week constraint_cols=org ignore_default_data=false"
+	file(base + " optimize_constraint=5")
+	eng := engine(t, dir, false)
+	// The boundary settings go to create_parent itself: the children it makes
+	// in that call are laid out by them, and an UPDATE afterwards is too late.
+	plan, err := eng.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Partman) != 1 || len(plan.Partman[0].Action.Statements) == 0 ||
+		!strings.Contains(plan.Partman[0].Action.Statements[0], "p_date_trunc_interval := 'week'") ||
+		!strings.Contains(plan.Partman[0].Action.Statements[0], "p_constraint_cols := '{org}'::text[]") {
+		t.Fatalf("create_parent call: %+v", plan.Partman)
+	}
+	if _, err := eng.Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var row string
+	if err := conn.QueryRow(ctx, `SELECT date_trunc_interval || ' ' || constraint_cols::text || ' ' || ignore_default_data || ' ' || optimize_constraint
+		FROM partman.part_config WHERE parent_table = 'public.evt'`).Scan(&row); err != nil {
+		t.Fatal(err)
+	}
+	if row != "week {org} false 5" {
+		t.Errorf("part_config: %s", row)
+	}
+	mustPlanClean(t, eng)
+
+	file(base + " optimize_constraint=10")
+	if _, err := eng.Apply(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mustPlanClean(t, eng)
+
+	// The same array spelled as PostgreSQL renders it is no change.
+	file(strings.Replace(base, "constraint_cols=org", `constraint_cols='{"org"}'`, 1) + " optimize_constraint=10")
+	mustPlanClean(t, eng)
+
+	file(strings.Replace(base, "date_trunc_interval=week", "date_trunc_interval=day", 1) + " optimize_constraint=10")
+	r, err := eng.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Partman) != 1 || r.Partman[0].Error == nil || !strings.Contains(r.Partman[0].Error.Error(), "date_trunc_interval is week in the database but declared day") {
+		t.Errorf("changing a fixed setting: %+v", r.Partman)
+	}
+}
+
+// A malformed directive is a property of the files, so it stops the run
+// before ops/ has changed anything.
+func TestPartmanDirectiveErrorStopsBeforeOps(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+	dir := setupMigrationsDir(t)
+	mustWriteFile(t, filepath.Join(dir, "ops", "20260101_000000__mark.sql"), []byte("CREATE TABLE ops_ran (id int)"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "schema", "public", "event_log.sql"), eventLogFile("-- m8:partman event_log control=created_at"), 0644)
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+	if _, err := eng.Apply(context.Background()); err == nil || !strings.Contains(err.Error(), "control and partition_interval are required") {
+		t.Fatalf("got %v", err)
+	}
+	var ran bool
+	if err := conn.QueryRow(context.Background(), "SELECT to_regclass('ops_ran') IS NOT NULL").Scan(&ran); err != nil {
+		t.Fatal(err)
+	}
+	if ran {
+		t.Error("ops/ ran before the malformed directive was refused")
+	}
+}
+
+// What a directive cannot carry is written beside it, so a fresh environment
+// built from the files does not differ silently: a custom template table, or
+// a pg_partman too old to declare at all.
+func TestDumpNotesWhatTheDirectiveCannotCarry(t *testing.T) {
+	conn, _ := partmanDB(t)
+	ctx := context.Background()
+	if _, err := conn.Exec(ctx, installPartman+`
+		CREATE TABLE audit_log (id text NOT NULL, created_at timestamptz NOT NULL) PARTITION BY RANGE (created_at);
+		CREATE TABLE audit_log_tpl (id text NOT NULL, created_at timestamptz NOT NULL);
+		SELECT partman.create_parent('public.audit_log', 'created_at', '1 month', p_template_table := 'public.audit_log_tpl');`); err != nil {
+		t.Fatal(err)
+	}
+	// A custom template is the user's own table, so it is dumped.
+	if tables, err := dump.NewDumper(conn).ListTables(ctx, "public"); err != nil || !slices.Contains(tables, "audit_log_tpl") {
+		t.Fatalf("custom template not listed for dump: %v, %v", tables, err)
+	}
+	table, err := dump.NewDumper(conn).DumpTable(ctx, "public", "audit_log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ddl := dump.RenderDDL(table); !strings.Contains(ddl, "-- pg_partman uses the template table public.audit_log_tpl, which m8:partman cannot declare") ||
+		!strings.Contains(ddl, "-- m8:partman audit_log") {
+		t.Errorf("custom template table:\n%s", ddl)
+	}
+
+	if _, err := conn.Exec(ctx, "UPDATE pg_extension SET extversion = '4.7.4' WHERE extname = 'pg_partman'"); err != nil {
+		t.Fatal(err)
+	}
+	table, err = dump.NewDumper(conn).DumpTable(ctx, "public", "audit_log")
+	if err != nil {
+		t.Fatalf("dump on pg_partman 4.x: %v", err)
+	}
+	ddl := dump.RenderDDL(table)
+	if !strings.Contains(ddl, "pg_partman 4.7.4 is installed") || strings.Contains(ddl, "-- m8:partman audit_log") ||
+		!strings.Contains(ddl, "PARTITION BY RANGE (created_at)") {
+		t.Errorf("pg_partman 4.x:\n%s", ddl)
+	}
+}
+
+// create_parent cuts a long template name to 63 bytes, and dump still knows
+// it for pg_partman's own; a role that cannot read part_config still dumps.
+func TestDumpTemplateNamesAndPermissions(t *testing.T) {
+	conn, _ := partmanDB(t)
+	ctx := context.Background()
+	const long = "audit_log_with_a_rather_long_descriptive_table_name_x"
+	if _, err := conn.Exec(ctx, installPartman+`
+		CREATE TABLE `+long+` (id text NOT NULL, created_at timestamptz NOT NULL) PARTITION BY RANGE (created_at);
+		SELECT partman.create_parent('public.`+long+`', 'created_at', '1 month');
+		CREATE ROLE dumper LOGIN;
+		GRANT USAGE ON SCHEMA partman TO dumper;`); err != nil {
+		t.Fatal(err)
+	}
+	if tables, err := dump.NewDumper(conn).ListTables(ctx, "partman"); err != nil || len(tables) != 0 {
+		t.Fatalf("truncated template listed for dump: %v, %v", tables, err)
+	}
+	table, err := dump.NewDumper(conn).DumpTable(ctx, "public", long)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ddl := dump.RenderDDL(table); strings.Contains(ddl, "template table") {
+		t.Errorf("pg_partman's own template noted as custom:\n%s", ddl)
+	}
+
+	if _, err := conn.Exec(ctx, "SET ROLE dumper"); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = conn.Exec(ctx, "RESET ROLE") }()
+	if _, err := dump.NewDumper(conn).ListTables(ctx, "public"); err != nil {
+		t.Errorf("ListTables without SELECT on part_config: %v", err)
 	}
 }

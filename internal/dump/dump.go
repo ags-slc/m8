@@ -2,13 +2,16 @@ package dump
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/ags-slc/m8/internal/partman"
 	"github.com/ags-slc/m8/internal/pgident"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Table holds the metadata needed to generate a CREATE TABLE statement.
@@ -26,6 +29,9 @@ type Table struct {
 	PartitionKey string
 	// Partman is the table's pg_partman configuration, if pg_partman manages it.
 	Partman *partman.Spec
+	// PartmanNotes are written as comments above the directive: what the dump
+	// could not declare about the table's pg_partman configuration.
+	PartmanNotes []string
 }
 
 // QualifiedName returns the schema-qualified, quoted table name, e.g.
@@ -101,6 +107,10 @@ type Dumper struct {
 	// installed); partmanLooked records that it has been asked.
 	partmanSchema string
 	partmanLooked bool
+	// partmanNote is set when the pg_partman installed is too old to declare.
+	partmanNote string
+	// partmanTemplates are the templates create_parent made, as schema.table.
+	partmanTemplates map[string]bool
 }
 
 // NewDumper creates a new Dumper.
@@ -159,17 +169,17 @@ func (d *Dumper) ListTables(ctx context.Context, schema string) ([]string, error
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var tables []string
-	for rows.Next() {
-		var t string
-		if err := rows.Scan(&t); err != nil {
-			return nil, err
-		}
-		tables = append(tables, t)
+	tables, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, err
 	}
-	return tables, rows.Err()
+
+	// The templates create_parent made are the partition manager's, like the
+	// children.
+	if err := d.lookupPartman(ctx); err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(tables, func(t string) bool { return d.partmanTemplates[schema+"."+t] }), nil
 }
 
 // DumpTable generates a CREATE TABLE statement for a single table.
@@ -201,6 +211,38 @@ func (d *Dumper) DumpTable(ctx context.Context, schema, table string) (*Table, e
 	return t, nil
 }
 
+// lookupPartman finds pg_partman's schema once per run. A pg_partman older
+// than 5.0 is not an error here: the dump still describes every table, and
+// says beside each partitioned one why it carries no directive.
+func (d *Dumper) lookupPartman(ctx context.Context) error {
+	if d.partmanLooked {
+		return nil
+	}
+	nsp, err := partman.ExtensionSchema(ctx, d.conn)
+	if errors.Is(err, partman.ErrUnsupportedVersion) {
+		d.partmanNote = err.Error() + "; this table's pg_partman configuration, if any, is not declared"
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+	if nsp != "" {
+		d.partmanTemplates, err = partman.ManagedTemplates(ctx, d.conn, nsp)
+		// A role that cannot read part_config can still dump every table; it
+		// sees pg_partman's templates as tables, and the dump says nothing
+		// worse than that.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42501" {
+			err = nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+	d.partmanSchema, d.partmanLooked = nsp, true
+	return nil
+}
+
 // loadPartitioning records a partitioned table's partition key and, when
 // pg_partman manages it, its configuration.
 //
@@ -217,16 +259,18 @@ func (d *Dumper) loadPartitioning(ctx context.Context, t *Table) error {
 	if err != nil || t.PartitionKey == "" {
 		return err
 	}
-	if !d.partmanLooked {
-		if d.partmanSchema, err = partman.ExtensionSchema(ctx, d.conn); err != nil {
-			return err
-		}
-		d.partmanLooked = true
+	if err := d.lookupPartman(ctx); err != nil {
+		return err
+	}
+	if d.partmanNote != "" {
+		t.PartmanNotes = []string{d.partmanNote}
 	}
 	if d.partmanSchema == "" {
 		return nil
 	}
-	t.Partman, err = partman.Load(ctx, d.conn, d.partmanSchema, t.Schema, t.Name)
+	var notes []string
+	t.Partman, notes, err = partman.Load(ctx, d.conn, d.partmanSchema, t.Schema, t.Name)
+	t.PartmanNotes = append(t.PartmanNotes, notes...)
 	return err
 }
 
@@ -476,6 +520,9 @@ var onOnlyRe = regexp.MustCompile(`^(CREATE (?:UNIQUE )?INDEX (?:"(?:[^"]|"")+"|
 func RenderDDL(t *Table) string {
 	var b strings.Builder
 
+	for _, n := range t.PartmanNotes {
+		b.WriteString("-- " + n + "\n")
+	}
 	if t.Partman != nil {
 		b.WriteString(t.Partman.Directive() + "\n")
 	}
