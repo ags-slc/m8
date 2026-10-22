@@ -65,12 +65,18 @@ var planCmd = &cobra.Command{
 	},
 }
 
-// undiffable returns the migrations whose schema diff failed to generate.
+// undiffable returns the migrations whose schema diff failed to generate, and
+// the m8:partman tables whose declaration apply would refuse.
 func undiffable(r *engine.ApplyResult) []string {
 	var names []string
 	for _, s := range r.Schema {
 		if s.Error != nil {
 			names = append(names, s.Migration.Filename)
+		}
+	}
+	for _, p := range r.Partman {
+		if p.Error != nil {
+			names = append(names, p.Action.Spec.QualifiedName()+" (partman)")
 		}
 	}
 	return names
@@ -90,6 +96,11 @@ func hasPending(r *engine.ApplyResult) bool {
 			return true
 		}
 	}
+	for _, p := range r.Partman {
+		if len(p.Action.Statements) > 0 {
+			return true
+		}
+	}
 	for _, v := range r.Logic {
 		if !v.Skipped {
 			return true
@@ -97,6 +108,11 @@ func hasPending(r *engine.ApplyResult) bool {
 	}
 	for _, v := range r.Permissions {
 		if !v.Skipped {
+			return true
+		}
+	}
+	for _, d := range r.Reference {
+		if !d.Empty() {
 			return true
 		}
 	}

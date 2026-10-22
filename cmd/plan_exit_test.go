@@ -6,6 +6,7 @@ import (
 
 	"github.com/ags-slc/m8/internal/engine"
 	"github.com/ags-slc/m8/internal/migration"
+	"github.com/ags-slc/m8/internal/reference"
 	"github.com/ags-slc/m8/internal/schema"
 )
 
@@ -74,5 +75,25 @@ func TestAppliedDataMigrationIsNotPending(t *testing.T) {
 	}
 	if hasPending(r) {
 		t.Error("an already-applied data/ migration should not count as pending")
+	}
+}
+
+// A reference/ file sets exit code 2 when it would write rows, and when plan
+// cannot diff it yet because schema/ creates its table -- and only then: a
+// converged file must not keep the gate permanently red.
+func TestReferencePendingOnlyWhenItWouldWrite(t *testing.T) {
+	converged := &reference.Diff{}
+	if hasPending(&engine.ApplyResult{Reference: []*reference.Diff{converged}}) {
+		t.Error("a converged reference/ file counted as pending")
+	}
+	for name, d := range map[string]*reference.Diff{
+		"insert":  {Inserts: []reference.Row{{}}},
+		"update":  {Updates: []reference.Change{{}}},
+		"delete":  {Deletes: []reference.Row{{}}},
+		"pending": {Pending: "table x does not exist yet"},
+	} {
+		if !hasPending(&engine.ApplyResult{Reference: []*reference.Diff{converged, d}}) {
+			t.Errorf("%s: not counted as pending", name)
+		}
 	}
 }

@@ -3,10 +3,10 @@ module github.com/ags-slc/m8
 go 1.26.1
 
 require (
+	github.com/ags-slc/pg-schema-diff v0.0.0-20261022175018-444a2fdc2d90
 	github.com/jackc/pgx/v5 v5.9.1
 	github.com/joho/godotenv v1.5.1
 	github.com/spf13/cobra v1.10.2
-	github.com/stripe/pg-schema-diff v1.0.5
 	github.com/testcontainers/testcontainers-go v0.42.0
 	github.com/testcontainers/testcontainers-go/modules/postgres v0.42.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -82,3 +82,5 @@ require (
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 )
+
+replace github.com/ags-slc/pg-schema-diff => github.com/deusin/pg-schema-diff v0.0.0-20261022175018-444a2fdc2d90

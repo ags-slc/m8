@@ -2,11 +2,16 @@ package dump
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"regexp"
+	"slices"
 	"strings"
 
+	"github.com/ags-slc/m8/internal/partman"
 	"github.com/ags-slc/m8/internal/pgident"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Table holds the metadata needed to generate a CREATE TABLE statement.
@@ -19,6 +24,14 @@ type Table struct {
 	Checks  []CheckConstraint
 	FKs     []ForeignKey
 	Indexes []Index
+	// PartitionKey is pg_get_partkeydef's output -- RANGE (created_at) -- for a
+	// partitioned table, and empty otherwise.
+	PartitionKey string
+	// Partman is the table's pg_partman configuration, if pg_partman manages it.
+	Partman *partman.Spec
+	// PartmanNotes are written as comments above the directive: what the dump
+	// could not declare about the table's pg_partman configuration.
+	PartmanNotes []string
 }
 
 // QualifiedName returns the schema-qualified, quoted table name, e.g.
@@ -89,6 +102,15 @@ type Dumper struct {
 	// because nothing downstream can tell the difference between "this database
 	// has no materialized views" and "m8 did not look".
 	AllowUnsupported bool
+
+	// partmanSchema caches pg_partman's schema for the run ("" when it is not
+	// installed); partmanLooked records that it has been asked.
+	partmanSchema string
+	partmanLooked bool
+	// partmanNote is set when the pg_partman installed is too old to declare.
+	partmanNote string
+	// partmanTemplates are the templates create_parent made, as schema.table.
+	partmanTemplates map[string]bool
 }
 
 // NewDumper creates a new Dumper.
@@ -147,17 +169,17 @@ func (d *Dumper) ListTables(ctx context.Context, schema string) ([]string, error
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var tables []string
-	for rows.Next() {
-		var t string
-		if err := rows.Scan(&t); err != nil {
-			return nil, err
-		}
-		tables = append(tables, t)
+	tables, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, err
 	}
-	return tables, rows.Err()
+
+	// The templates create_parent made are the partition manager's, like the
+	// children.
+	if err := d.lookupPartman(ctx); err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(tables, func(t string) bool { return d.partmanTemplates[schema+"."+t] }), nil
 }
 
 // DumpTable generates a CREATE TABLE statement for a single table.
@@ -182,8 +204,74 @@ func (d *Dumper) DumpTable(ctx context.Context, schema, table string) (*Table, e
 	if err := d.loadIndexes(ctx, t); err != nil {
 		return nil, fmt.Errorf("indexes for %s.%s: %w", schema, table, err)
 	}
+	if err := d.loadPartitioning(ctx, t); err != nil {
+		return nil, fmt.Errorf("partitioning for %s.%s: %w", schema, table, err)
+	}
 
 	return t, nil
+}
+
+// lookupPartman finds pg_partman's schema once per run. A pg_partman older
+// than 5.0 is not an error here: the dump still describes every table, and
+// says beside each partitioned one why it carries no directive.
+func (d *Dumper) lookupPartman(ctx context.Context) error {
+	if d.partmanLooked {
+		return nil
+	}
+	nsp, err := partman.ExtensionSchema(ctx, d.conn)
+	if errors.Is(err, partman.ErrUnsupportedVersion) {
+		d.partmanNote = err.Error() + "; this table's pg_partman configuration, if any, is not declared"
+		err = nil
+	}
+	if err != nil {
+		return err
+	}
+	if nsp != "" {
+		d.partmanTemplates, err = partman.ManagedTemplates(ctx, d.conn, nsp)
+		// A role that cannot read part_config can still dump every table; it
+		// sees pg_partman's templates as tables, and the dump says nothing
+		// worse than that.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "42501" {
+			err = nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+	d.partmanSchema, d.partmanLooked = nsp, true
+	return nil
+}
+
+// loadPartitioning records a partitioned table's partition key and, when
+// pg_partman manages it, its configuration.
+//
+// Without the key the dump describes a different table: a plain one, which the
+// diff plans as DROP TABLE and CREATE TABLE against the partitioned original.
+// Child partitions are not dumped at all -- ListTables leaves them out -- because
+// they are the partition manager's, and the diff adopts them from the live
+// database on every run.
+func (d *Dumper) loadPartitioning(ctx context.Context, t *Table) error {
+	err := d.conn.QueryRow(ctx, `
+		SELECT coalesce(pg_get_partkeydef(c.oid), '')
+		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2`, t.Schema, t.Name).Scan(&t.PartitionKey)
+	if err != nil || t.PartitionKey == "" {
+		return err
+	}
+	if err := d.lookupPartman(ctx); err != nil {
+		return err
+	}
+	if d.partmanNote != "" {
+		t.PartmanNotes = []string{d.partmanNote}
+	}
+	if d.partmanSchema == "" {
+		return nil
+	}
+	var notes []string
+	t.Partman, notes, err = partman.Load(ctx, d.conn, d.partmanSchema, t.Schema, t.Name)
+	t.PartmanNotes = append(t.PartmanNotes, notes...)
+	return err
 }
 
 func (d *Dumper) loadColumns(ctx context.Context, t *Table) error {
@@ -415,14 +503,29 @@ func (d *Dumper) loadIndexes(ctx context.Context, t *Table) error {
 		if err := rows.Scan(&idx.Name, &idx.Unique, &idx.Definition); err != nil {
 			return err
 		}
+		idx.Definition = onOnlyRe.ReplaceAllString(idx.Definition, "$1 ON ")
 		t.Indexes = append(t.Indexes, idx)
 	}
 	return rows.Err()
 }
 
+// onOnlyRe matches the ON ONLY that pg_get_indexdef writes for an index on a
+// partitioned table. ONLY means "this table, not its partitions" -- an index
+// built on no partition and left invalid -- which is how Postgres describes the
+// parent's half of the index, not what the declaration means: the index on the
+// table and all of its partitions, which plain ON says.
+var onOnlyRe = regexp.MustCompile(`^(CREATE (?:UNIQUE )?INDEX (?:"(?:[^"]|"")+"|\S+)) ON ONLY `)
+
 // RenderDDL generates the CREATE TABLE + CREATE INDEX statements for a table.
 func RenderDDL(t *Table) string {
 	var b strings.Builder
+
+	for _, n := range t.PartmanNotes {
+		b.WriteString("-- " + n + "\n")
+	}
+	if t.Partman != nil {
+		b.WriteString(t.Partman.Directive() + "\n")
+	}
 
 	// Schema-qualify every object. The desired-state DDL is replayed into a
 	// throwaway database through a *connection pool*, so a leading
@@ -531,7 +634,11 @@ func RenderDDL(t *Table) string {
 		b.WriteString("\n")
 	}
 
-	b.WriteString(");\n")
+	b.WriteString(")")
+	if t.PartitionKey != "" {
+		b.WriteString(" PARTITION BY " + t.PartitionKey)
+	}
+	b.WriteString(";\n")
 
 	// Indexes (non-constraint). pg_get_indexdef() already emits a
 	// schema-qualified target ("ON materialized.foo"); keep it, for the same

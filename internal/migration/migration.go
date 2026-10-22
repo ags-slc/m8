@@ -22,6 +22,10 @@ const (
 	TypeLogic
 	// TypePermissions migrations re-run when their content changes (grants, revokes, roles).
 	TypePermissions
+	// TypeReference files declare the rows of a table. They are diffed against
+	// the live table on every apply, not gated on a checksum: a row someone
+	// edits by hand is drift, and the next apply puts it back.
+	TypeReference
 	// TypeData migrations run once in timestamp order, LAST -- after schema/,
 	// logic/ and permissions/ have converged.
 	//
@@ -47,6 +51,8 @@ func (t Type) String() string {
 		return "logic"
 	case TypePermissions:
 		return "permissions"
+	case TypeReference:
+		return "reference"
 	case TypeData:
 		return "data"
 	default:
@@ -60,6 +66,7 @@ const (
 	FolderSchema      = "schema"
 	FolderLogic       = "logic"
 	FolderPermissions = "permissions"
+	FolderReference   = "reference"
 	FolderData        = "data"
 )
 
@@ -106,7 +113,7 @@ func Discover(dir string) ([]*Migration, error) {
 	var migrations []*Migration
 
 	folderBased := false
-	for _, sub := range []string{FolderOps, FolderSchema, FolderLogic, FolderPermissions, FolderData} {
+	for _, sub := range []string{FolderOps, FolderSchema, FolderLogic, FolderPermissions, FolderReference, FolderData} {
 		subDir := filepath.Join(dir, sub)
 		if info, err := os.Stat(subDir); err == nil && info.IsDir() {
 			folderBased = true
@@ -179,6 +186,15 @@ func discoverFolderLayout(dir string) ([]*Migration, error) {
 
 	// permissions/
 	if m, err := scanSimpleFolder(filepath.Join(dir, FolderPermissions), FolderPermissions, TypePermissions); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+	} else {
+		migrations = append(migrations, m...)
+	}
+
+	// reference/
+	if m, err := scanSimpleFolder(filepath.Join(dir, FolderReference), FolderReference, TypeReference); err != nil {
 		if !os.IsNotExist(err) {
 			return nil, err
 		}
@@ -287,7 +303,7 @@ func scanSimpleFolder(dir, folderName string, typ Type) ([]*Migration, error) {
 				Content:  content,
 			})
 
-		case TypeLogic, TypePermissions:
+		case TypeLogic, TypePermissions, TypeReference:
 			matches := simplePattern.FindStringSubmatch(entry.Name())
 			if matches == nil {
 				continue

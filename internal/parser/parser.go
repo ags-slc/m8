@@ -29,6 +29,12 @@ type Directive struct {
 	NoTransaction bool
 	LockTimeout   time.Duration
 	Requires      []string // version strings this migration depends on
+	// Reference holds the text after each -- m8:reference, one entry per
+	// directive. Only reference/ files read it.
+	Reference []string
+	// Partman holds the text after each -- m8:partman, one entry per
+	// directive. Only schema/ files read it.
+	Partman []string
 }
 
 type parserState int
@@ -441,6 +447,14 @@ func (sm *stateMachine) tryDollarQuoteTag(pos int) (string, int, bool) {
 	return "", 0, false
 }
 
+// ExtractDirectives reads the -- m8: directive comments without parsing the
+// statements around them, for files whose SQL m8 does not execute itself:
+// a schema/ file goes to pg-schema-diff whole, and its directives are all m8
+// needs from it.
+func ExtractDirectives(content []byte) Directive {
+	return extractDirectives(content)
+}
+
 // extractDirectives scans for -- m8: directive comments.
 func extractDirectives(content []byte) Directive {
 	var d Directive
@@ -466,9 +480,20 @@ func extractDirectives(content []byte) Directive {
 			val := strings.TrimPrefix(directive, "requires ")
 			val = strings.TrimSpace(val)
 			d.Requires = append(d.Requires, strings.Fields(val)...)
+		case hasBody(directive, "reference"):
+			d.Reference = append(d.Reference, strings.TrimSpace(strings.TrimPrefix(directive, "reference")))
+		case hasBody(directive, "partman"):
+			d.Partman = append(d.Partman, strings.TrimSpace(strings.TrimPrefix(directive, "partman")))
 		}
 	}
 	return d
+}
+
+// hasBody reports whether directive is name, alone or followed by whitespace
+// and its arguments -- not a longer directive that starts with name.
+func hasBody(directive, name string) bool {
+	rest, ok := strings.CutPrefix(directive, name)
+	return ok && (rest == "" || rest[0] == ' ' || rest[0] == '\t')
 }
 
 var concurrentlyRegex = regexp.MustCompile(`(?i)^\s*CREATE\s+(UNIQUE\s+)?INDEX\s+CONCURRENTLY\b`)

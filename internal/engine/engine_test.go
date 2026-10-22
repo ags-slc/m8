@@ -25,17 +25,25 @@ import (
 // testDB spins up a PostgreSQL container and returns a connection + cleanup func.
 func testDB(t *testing.T) (*pgx.Conn, *sql.DB, string, func()) {
 	t.Helper()
+	return startPostgres(t, "postgres:16-alpine")
+}
+
+// startPostgres is testDB for any image: img names one, or is empty when
+// extra builds one (testcontainers.WithDockerfile).
+func startPostgres(t *testing.T, img string, extra ...testcontainers.ContainerCustomizer) (*pgx.Conn, *sql.DB, string, func()) {
+	t.Helper()
 	ctx := context.Background()
 
-	container, err := postgres.Run(ctx, "postgres:16-alpine",
+	opts := append([]testcontainers.ContainerCustomizer{
 		postgres.WithDatabase("m8test"),
 		postgres.WithUsername("postgres"),
 		postgres.WithPassword("testpwd"),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).
-				WithStartupTimeout(30*time.Second)),
-	)
+				WithStartupTimeout(30 * time.Second)),
+	}, extra...)
+	container, err := postgres.Run(ctx, img, opts...)
 	if err != nil {
 		t.Fatalf("failed to start postgres: %v", err)
 	}

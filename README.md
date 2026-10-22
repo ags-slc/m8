@@ -106,13 +106,14 @@ m8 sync --database mydb --user postgres
 m8 new schema public/users
 m8 new logic proc_refresh_invoices
 m8 new permissions grants_readonly
+m8 new reference carrier
 m8 new ops "create extensions"
 m8 new data "backfill destination country"
 ```
 
 ## Migration Layout
 
-Organize SQL files in five directories:
+Organize SQL files in six directories:
 
 ```
 migrations/
@@ -130,6 +131,8 @@ migrations/
 ├── permissions/                               # Re-applied on change
 │   ├── grants_materialized.sql
 │   └── default_privileges.sql
+├── reference/                                 # Declared rows, diffed every apply
+│   └── carrier.sql
 ├── ops/                                       # One-time, sequential -- runs FIRST
 │   ├── 20260411_001__create_extensions.sql
 │   └── 20260411_002__create_hypertables.sql
@@ -144,10 +147,13 @@ migrations/
 | **Schema** | `schema/{pg_schema}/` | Desired state diffed against live DB per PG schema | Tables, indexes, constraints |
 | **Logic** | `logic/` | Re-run whenever file content changes | Procedures, functions, views, triggers, pg_cron |
 | **Permissions** | `permissions/` | Re-run whenever file content changes | Grants, revokes, roles, default privileges |
+| **Reference** | `reference/` | Declared rows diffed against the live table on **every** apply | Lookup and seed tables whose rows must equal exact values |
 | **Ops** | `ops/` | Run once in timestamp order, **before** schema/ | Extensions, hypertables, session/database settings |
-| **Data** | `data/` | Run once in timestamp order, **after** everything | Backfills, seeds, one-time DML, comments on new objects |
+| **Data** | `data/` | Run once in timestamp order, **after** everything | Backfills, one-time seeds and DML, comments on new objects |
 
-**Apply order:** Ops → Schema → Logic → Permissions → Data
+**Apply order:** Ops → Schema → pg_partman → Logic → Permissions → Reference → Data
+
+The pg_partman step reconciles tables declared with [`-- m8:partman`](#pg_partman); it runs after schema/ so the parent table exists, and is a no-op when nothing declares one.
 
 ### ops/ or data/?
 
@@ -173,6 +179,92 @@ file by hand afterwards. That is the case `data/` exists to remove.
 A `data/` migration whose procedure `COMMIT`s per batch needs
 `-- m8:no-transaction`, like any other migration that manages its own
 transactions.
+
+### Reference Data
+
+Some tables hold rows the application depends on being exactly so: carriers,
+mappings, codes. A one-time `data/` seed needs a new migration every time those
+rows change, and a hand-written `MERGE` re-run on every deploy rewrites every
+row unless it is guarded just right. A `reference/` file declares the rows
+instead, and m8 makes the table match on every apply:
+
+```sql
+-- reference/vendor_mapping.sql
+-- m8:reference public.vendor_mapping key=match_type,keyword prune touch=updated_at
+SELECT * FROM (VALUES
+    ('vm_1', 'VENDOR_CONTAINS', 'landmark', 'LANDMARK'),
+    ('vm_2', 'VENDOR_CONTAINS', 'funko',    'DHL_ECOM')
+) AS v(id, match_type, keyword, carrier);
+```
+
+The file is one `SELECT` or `VALUES` query; its column aliases name the columns
+it declares. On every apply m8 loads it into a temporary table typed like the
+target, compares by key, and writes only the difference:
+
+- **Missing rows are inserted, changed rows updated.** A row that already
+  matches is not written or locked at all -- no trigger fires, no WAL, no CDC
+  event -- so a converged file costs one read and `m8 plan` reports nothing.
+- **A hand edit is drift.** It shows up in `m8 plan` and the next apply puts it
+  back; nothing waits for the file to change.
+- **`prune` deletes rows the file does not list.** Without it they are kept.
+- **Columns the query does not name are never written** -- inserts take their
+  defaults -- except the `touch=` columns, which are set to `now()` on every row
+  m8 inserts or changes.
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `key=a,b` | the primary key | Columns rows are matched on. A unique, non-partial index must cover exactly these columns. |
+| `prune` | off | Delete live rows whose key the file does not list. |
+| `touch=c,d` | none | Columns set to `now()` on rows m8 inserts or updates. |
+
+`m8 plan` prints each change, capped at 20 lines per kind per file:
+
+```
+  ~ reference/vendor_mapping.sql (reference vendor_mapping: 1 insert, 1 update, 1 delete)
+      + ('VENDOR_CONTAINS', 'royal mail') id='vm_4' carrier='ROYAL_MAIL'
+      ~ ('VENDOR_CONTAINS', 'funko') carrier: 'HAND_EDIT' → 'DHL_ECOM'
+      - ('VENDOR_CONTAINS', 'app')
+```
+
+Values are cast to the column's type and then assigned, as an `INSERT` would:
+a string too long for a `varchar(n)` or `char(n)` is refused rather than
+truncated, and a `numeric(p,s)` rounds the way the table does, so the file
+converges instead of showing a change on every plan.
+
+m8 refuses, naming the file, rather than guess when:
+- the key has no backing unique index, or a key is `NULL` or declared twice;
+- a column does not exist, is generated, or is `GENERATED ALWAYS AS IDENTITY`;
+- two files declare one table;
+- the query reads a table a `reference/` file declares -- every query is loaded
+  before anything is written, so it would see that table's rows from before
+  the apply. Write the values themselves rather than joining to get them;
+- `prune` would delete through a foreign key that is `ON DELETE CASCADE`,
+  `SET NULL` or `SET DEFAULT`, which would change rows in a table the file does
+  not declare.
+
+`json` columns are compared as `jsonb`, so whitespace and key order are not
+changes; `xml` and the geometric types are compared as text. When a file
+declares a `serial` or identity column, apply moves its sequence past the
+highest value in the table -- never backwards -- so an application insert
+that takes the default does not collide with a declared row.
+
+All `reference/` files apply in one transaction, ordered by the foreign keys
+between their tables -- parents first for inserts and updates, children first
+for deletes -- and otherwise by file name. Deletes run before inserts and
+updates, which re-keying a row needs; if that violates a constraint, m8 rolls
+back to a savepoint and runs them after, which moving child rows off a pruned
+parent needs. Directives are parsed before `ops/` runs, so a typo stops the
+release before anything is applied.
+
+`m8 plan` runs the queries in a read-only transaction, so one that calls
+`nextval()` fails rather than moving a sequence. When this release's `schema/`
+changes a table -- a statement naming it as `"schema"."table"` -- plan cannot
+diff it against the table apply will write to, and reports it as diffed at
+apply; any other problem -- a misspelt column -- fails
+plan as it would fail apply. `m8 sync` converges `reference/`; `m8 baseline`
+skips it, since there is no history to adopt; `m8 status` lists it, but only
+plan can say whether it has drifted. Plan and apply wait at most
+`--lock-timeout` (default 3s) for a lock.
 
 ### Schema Migrations
 
@@ -222,6 +314,93 @@ m8 only manages objects you declare. Tables, procedures, and grants that exist i
 
 Use `--strict` to opt in to exact-match mode, where schema diffs include DROP statements for undeclared objects.
 
+### Partitioned Tables
+
+Declare a partitioned table's shape -- columns, indexes, `PARTITION BY` -- and
+leave its children to whatever creates them: pg_partman, an application job, a
+script. On every run m8 reads the live children of each declared partitioned
+table and describes them in the desired state exactly as they are -- bound,
+extra `NOT NULL`s, constraints (their own `CHECK`s included) and indexes under
+their live names, replica identity, row-level-security flags -- so the diff has
+nothing to do for them. A child's grants are left alone: the schema diff does
+not manage privileges on partitions, since PostgreSQL does not carry a parent's
+`GRANT` to them and whatever creates the children owns theirs (pg_partman's
+`inherit_privileges`, for one). That also keeps role names out of the desired
+schema, so a separate shadow instance needs none of the target's roles. The
+children are never written to a file: a list captured once is wrong the first
+time the partition manager adds a month.
+
+Because the children stay visible to the diff, a change to the parent is planned
+against all of them. An index added to the parent is built without blocking
+writes -- an empty index on the parent, a concurrent build on each child, then
+`ATTACH`:
+
+```
+  ~ schema/public/audit_log.sql (schema)
+    CREATE INDEX audit_log_request_id_idx ON ONLY public.audit_log USING btree (request_id)
+    CREATE INDEX CONCURRENTLY audit_log_p20260901_request_id_idx ON public.audit_log_p20260901 USING btree (request_id)
+    ⚠ INDEX_BUILD
+    ALTER INDEX "public"."audit_log_request_id_idx" ATTACH PARTITION "public"."audit_log_p20260901_request_id_idx"
+    ...
+```
+
+Refused, with the table named, rather than planned:
+
+- a table that is partitioned in the database but declared without
+  `PARTITION BY` -- as declared, the diff would drop and recreate it;
+- an undeclared child with a row-level-security policy of its own, or one that
+  is itself partitioned -- pg-schema-diff cannot diff either on a partition.
+
+Children that are declared in the files are managed like any other table.
+
+#### pg_partman
+
+`-- m8:partman` declares a table's pg_partman configuration -- its
+`partman.part_config` row -- alongside its shape:
+
+```sql
+-- schema/public/audit_log.sql
+-- m8:partman audit_log control=created_at partition_interval='1 month' premake=4 infinite_time_partitions=true retention=none
+CREATE TABLE audit_log (
+    id         text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+) PARTITION BY RANGE (created_at);
+```
+
+A table pg_partman does not manage yet is registered with `create_parent`; one it
+does has its `part_config` row updated to match. Keys are `part_config` column
+names, plus `control` and `partition_interval` (required) and create_parent's
+`default_table` and `start_partition`, which apply only when the table is
+registered. A key left out is not managed.
+
+| Keys | On a registered table |
+|------|-----------------------|
+| `control`, `partition_interval`, `partition_type`, `epoch`, `date_trunc_interval` | Fixed: they lay out the partition boundaries, so a change is refused before anything in the run is applied |
+| `premake`, `constraint_cols` (`a,b`), `optimize_constraint`, `ignore_default_data`, `retention` (`none` for no retention), `retention_schema`, `retention_keep_table`, `retention_keep_index`, `infinite_time_partitions`, `inherit_privileges`, `automatic_maintenance`, `jobmon` | Updated in place |
+
+Settings create_parent takes are passed to it, so the children its first call
+makes are already laid out by them. Intervals compare as the server renders
+them, so `'1 month'` matches the `1 mon` that `part_config` stores, while
+`'30 days'` does not. pg_partman 5.0 or later is required; the keys are the
+columns every 5.x has. `template_table` is not declarable -- it names a table
+create_parent otherwise makes itself -- so `m8 dump` writes a comment beside
+the directive when a table uses a custom one, and dumps a partitioned table
+without a directive, with a comment saying why, on a database whose pg_partman
+is older than 5.0. The directive is parsed before any phase runs, so a typo
+stops the release before `ops/` has applied anything.
+
+A pending pg_partman change makes `m8 plan` exit 2, like any other pending
+migration; a refused declaration makes it fail.
+
+pg_partman itself is installed by an `ops/` migration (`CREATE EXTENSION
+pg_partman SCHEMA partman`), which runs before schema/.
+
+Registering a table does not schedule its maintenance: something must call
+`partman.run_maintenance()` -- pg_cron, the pg_partman background worker, or an
+application job -- or the table keeps its first `premake` intervals of children
+and every later row lands in the default partition. `m8 status` reports each
+declared table's last maintenance run, and flags one that has never run.
+
 ## Bootstrapping an Existing Database
 
 Use `m8 dump` to export an existing database into the m8 folder layout:
@@ -266,6 +445,11 @@ column-level grants, sequences, routine `EXECUTE`, `WITH GRANT OPTION`, and the
 -- a `SECURITY DEFINER` function is `EXECUTE`-able by `PUBLIC` the moment it is
 recreated, so losing the revoke is a privilege escalation, not just a gap.
 
+A partitioned table is dumped with its `PARTITION BY` and its indexes declared
+on the whole table; its children are not dumped (see
+[Partitioned Tables](#partitioned-tables)). A table pg_partman manages gets an
+`-- m8:partman` line carrying its complete live configuration.
+
 **Not captured:** materialized views. They have no `CREATE OR REPLACE` form, so
 they cannot be re-applied idempotently the way a `logic/` file must be. `m8 dump`
 names them and refuses rather than leaving them out silently; pass
@@ -293,9 +477,9 @@ and replica identity**, plus roles themselves, event triggers, and
 
 | Command | Description |
 |---------|-------------|
-| `m8 apply` | Apply pending migrations (ops → schema → logic → permissions → data) |
+| `m8 apply` | Apply pending migrations (ops → schema → pg_partman → logic → permissions → reference → data) |
 | `m8 plan` | Show what would be applied without making changes (exit code 2 if pending) |
-| `m8 status` | Show applied, pending, changed, and drifted migrations |
+| `m8 status` | Show applied, pending, changed, and drifted migrations, and pg_partman maintenance |
 | `m8 sync` | One-time convergence for brownfield adoption (`ops/` and `data/` are baselined, not run) |
 | `m8 baseline` | Mark migrations as applied without running them |
 | `m8 dump` | Export database objects to migration files |
@@ -317,6 +501,9 @@ ALTER TABLE large_table ADD COLUMN new_col TEXT;
 ```
 
 m8 also auto-detects `CREATE INDEX CONCURRENTLY` and runs those migrations outside a transaction automatically.
+
+`-- m8:partman <table> key=value ...` in a schema/ file declares the table's
+pg_partman configuration -- see [pg_partman](#pg_partman).
 
 ### Timeouts on generated schema statements
 

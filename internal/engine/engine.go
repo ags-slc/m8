@@ -12,7 +12,9 @@ import (
 
 	"github.com/ags-slc/m8/internal/migration"
 	"github.com/ags-slc/m8/internal/parser"
+	"github.com/ags-slc/m8/internal/partman"
 	"github.com/ags-slc/m8/internal/pgident"
+	"github.com/ags-slc/m8/internal/reference"
 	"github.com/ags-slc/m8/internal/schema"
 	"github.com/ags-slc/m8/internal/state"
 	"github.com/jackc/pgx/v5"
@@ -61,17 +63,23 @@ type Config struct {
 	// plan's own value, which is what you want by default: 3s for ordinary DDL,
 	// 20 minutes for a concurrent index build. The override exists because a
 	// legitimate ALTER TABLE on a large table can exceed 3s -- and until these
-	// timeouts were actually applied, it silently did.
+	// timeouts were actually applied, it silently did. They also bound the
+	// reference/ phase, whose lock timeout is otherwise 3s.
 	LockTimeout      time.Duration
 	StatementTimeout time.Duration
 }
 
 // ApplyResult holds the outcome of an apply or plan operation.
 type ApplyResult struct {
-	Ops         []MigrationResult
-	Schema      []SchemaResult
+	Ops    []MigrationResult
+	Schema []SchemaResult
+	// Partman holds each m8:partman-declared table's reconciliation, run
+	// after schema/ (the parent must exist) and before logic/.
+	Partman     []PartmanResult
 	Logic       []MigrationResult
 	Permissions []MigrationResult
+	// Reference holds one diff per reference/ file, in the order they apply.
+	Reference []*reference.Diff
 	// Data holds the one-time data/ migrations, applied after everything else.
 	Data []MigrationResult
 	// PendingPGSchemas lists PostgreSQL schemas implied by schema/ subfolders
@@ -105,6 +113,13 @@ type StatusResult struct {
 	Pending []*migration.Migration
 	Changed []*migration.Migration
 	Drift   []DriftEntry
+	// Reference lists the reference/ files. They have no history to compare:
+	// only plan, which diffs them against the live tables, can say whether
+	// they have drifted.
+	Reference []*migration.Migration
+	// Partman reports, for each m8:partman-declared table, whether pg_partman
+	// manages it and when maintenance last ran over it.
+	Partman []partman.Status
 }
 
 // DriftEntry represents an ops migration whose file content changed after being applied.
@@ -126,7 +141,7 @@ func New(conn *pgx.Conn, sqlDB *sql.DB, differ *schema.Differ, config *Config, l
 }
 
 // Apply discovers and executes pending migrations:
-// ops → schema → logic → permissions → data.
+// ops → schema → partman → logic → permissions → reference → data.
 func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 	if err := e.acquireLock(ctx); err != nil {
 		return nil, err
@@ -137,10 +152,11 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 		return nil, err
 	}
 
-	all, err := migration.Discover(e.config.MigrationsDir)
+	found, err := e.discover()
 	if err != nil {
 		return nil, err
 	}
+	all := found.all
 
 	result := &ApplyResult{}
 
@@ -153,11 +169,21 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 
 	// Phase B: Schema — ensure PG schemas exist, then diff and apply
 	schemaMigrations := filterByType(all, migration.TypeSchema)
+	if err := e.refusePartman(ctx, found.partman); err != nil {
+		return result, err
+	}
 	if err := e.ensurePGSchemas(ctx, schemaMigrations); err != nil {
 		return result, err
 	}
 	s, err := e.applySchema(ctx, schemaMigrations)
 	result.Schema = s
+	if err != nil {
+		return result, err
+	}
+
+	// Phase B2: pg_partman — register declared tables and reconcile their
+	// part_config rows, now that the schema phase has created the parents.
+	result.Partman, err = e.applyPartman(ctx, found.partman)
 	if err != nil {
 		return result, err
 	}
@@ -176,7 +202,15 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 		return result, err
 	}
 
-	// Phase E: Data — one-time, like ops, but only now that every object the
+	// Phase E: Reference — declared rows, diffed against the live tables on
+	// every apply. After logic/, so the triggers it creates fire on these
+	// writes; before data/, so a one-time backfill can rely on the rows.
+	result.Reference, err = e.reconcileReference(ctx, found.reference, nil)
+	if err != nil {
+		return result, err
+	}
+
+	// Phase F: Data — one-time, like ops, but only now that every object the
 	// release introduces exists. This is the phase a backfill belongs in.
 	r, err = e.applyVersioned(ctx, filterByType(all, migration.TypeData), migration.TypeData)
 	result.Data = r
@@ -202,10 +236,11 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		return nil, err
 	}
 
-	all, err := migration.Discover(e.config.MigrationsDir)
+	found, err := e.discover()
 	if err != nil {
 		return nil, err
 	}
+	all := found.all
 
 	result := &ApplyResult{}
 
@@ -269,6 +304,13 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		return nil, errDifferUnavailable(len(schemaMigrations))
 	}
 
+	// Phase B2: pg_partman — what registering and reconciling the declared
+	// tables would run.
+	result.Partman, err = e.planPartman(ctx, found.partman)
+	if err != nil {
+		return nil, err
+	}
+
 	// Phase C: Logic — find changed checksums
 	result.Logic, err = e.planIdempotent(ctx, filterByType(all, migration.TypeLogic), "logic", stateReady)
 	if err != nil {
@@ -281,7 +323,13 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		return result, err
 	}
 
-	// Phase E: Data — find unapplied
+	// Phase E: Reference — diff the declared rows against the live tables.
+	result.Reference, err = e.reconcileReference(ctx, found.reference, schemaChanges(result))
+	if err != nil {
+		return result, err
+	}
+
+	// Phase F: Data — find unapplied
 	result.Data, err = e.planVersioned(ctx, filterByType(all, migration.TypeData), migration.TypeData, stateReady)
 	if err != nil {
 		return result, err
@@ -320,10 +368,11 @@ func (e *Engine) Status(ctx context.Context) (*StatusResult, error) {
 		return nil, err
 	}
 
-	all, err := migration.Discover(e.config.MigrationsDir)
+	found, err := e.discover()
 	if err != nil {
 		return nil, err
 	}
+	all := found.all
 
 	history, err := e.store.GetAllHistory(ctx)
 	if err != nil {
@@ -367,6 +416,10 @@ func (e *Engine) Status(ctx context.Context) (*StatusResult, error) {
 
 	result := &StatusResult{Applied: history}
 
+	if result.Partman, err = partman.Statuses(ctx, e.conn, found.partman); err != nil {
+		return nil, err
+	}
+
 	for _, m := range all {
 		switch m.Type {
 		case migration.TypeOps, migration.TypeData:
@@ -393,6 +446,8 @@ func (e *Engine) Status(ctx context.Context) (*StatusResult, error) {
 			} else if latestLogic[m.Name].Checksum != m.Checksum {
 				result.Changed = append(result.Changed, m)
 			}
+		case migration.TypeReference:
+			result.Reference = append(result.Reference, m)
 		case migration.TypePermissions:
 			if _, ok := latestPerms[m.Name]; !ok {
 				result.Pending = append(result.Pending, m)
@@ -422,6 +477,10 @@ func (e *Engine) Baseline(ctx context.Context, version string, all bool) error {
 	}
 
 	for _, m := range allMigrations {
+		// reference/ has no history to adopt: every apply diffs it afresh.
+		if m.Type == migration.TypeReference {
+			continue
+		}
 		if !all && migration.IsVersioned(m.Type) && m.Version > version {
 			continue
 		}
@@ -457,10 +516,11 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 		return nil, err
 	}
 
-	all, err := migration.Discover(e.config.MigrationsDir)
+	found, err := e.discover()
 	if err != nil {
 		return nil, err
 	}
+	all := found.all
 
 	result := &ApplyResult{}
 
@@ -483,11 +543,20 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 
 	// Schema — ensure PG schemas exist, then diff and apply
 	syncSchemaMigrations := filterByType(all, migration.TypeSchema)
+	if err := e.refusePartman(ctx, found.partman); err != nil {
+		return result, err
+	}
 	if err := e.ensurePGSchemas(ctx, syncSchemaMigrations); err != nil {
 		return result, err
 	}
 	s, err := e.applySchema(ctx, syncSchemaMigrations)
 	result.Schema = s
+	if err != nil {
+		return result, err
+	}
+
+	// pg_partman configuration converges with the schema it belongs to.
+	result.Partman, err = e.applyPartman(ctx, found.partman)
 	if err != nil {
 		return result, err
 	}
@@ -528,7 +597,10 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 		result.Permissions = append(result.Permissions, mr)
 	}
 
-	return result, nil
+	// Reference — declared rows are desired state, like schema/, so sync
+	// converges them rather than baselining them the way it does data/.
+	result.Reference, err = e.reconcileReference(ctx, found.reference, nil)
+	return result, err
 }
 
 // --- apply helpers ---
@@ -850,10 +922,8 @@ func (e *Engine) executeMigration(ctx context.Context, m *migration.Migration) e
 	// Rollback is a no-op once the transaction has been committed.
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if parsed.Directives.LockTimeout > 0 {
-		if _, err = tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", parsed.Directives.LockTimeout.Milliseconds())); err != nil {
-			return fmt.Errorf("failed to set lock_timeout: %w", err)
-		}
+	if err := setLocalTimeouts(ctx, tx, parsed.Directives.LockTimeout, 0); err != nil {
+		return err
 	}
 
 	for i, stmt := range parsed.Statements {
@@ -863,6 +933,76 @@ func (e *Engine) executeMigration(ctx context.Context, m *migration.Migration) e
 	}
 
 	return tx.Commit(ctx)
+}
+
+// discovered is every migration file, with the directives that need no
+// database already parsed.
+type discovered struct {
+	all       []*migration.Migration
+	reference []reference.Spec
+	partman   []partman.Spec
+}
+
+// discover finds every migration file and parses the reference/ files and the
+// m8:partman directives in schema/. Every command calls it before its first
+// phase, so a malformed directive stops the run before anything has changed.
+func (e *Engine) discover() (discovered, error) {
+	all, err := migration.Discover(e.config.MigrationsDir)
+	if err != nil {
+		return discovered{}, err
+	}
+	d := discovered{all: all}
+	for _, m := range filterByType(all, migration.TypeReference) {
+		s, err := reference.Parse(m.Filename, m.Content)
+		if err != nil {
+			return discovered{}, err
+		}
+		d.reference = append(d.reference, s)
+	}
+	if d.partman, err = collectPartmanSpecs(filterByType(all, migration.TypeSchema)); err != nil {
+		return discovered{}, err
+	}
+	return d, nil
+}
+
+// defaultLockTimeout bounds the wait for a lock when --lock-timeout is not
+// set, matching pg-schema-diff's default for DDL. The reference/ and pg_partman
+// phases write rows and tables an application may hold locked; left
+// unbounded, they queue behind a long transaction -- and, for create_parent's
+// ACCESS EXCLUSIVE lock, every query on the table queues behind them.
+const defaultLockTimeout = 3 * time.Second
+
+// beginBounded starts a transaction whose waits are bounded: lock_timeout is
+// --lock-timeout or defaultLockTimeout, statement_timeout is
+// --statement-timeout if set. Both are SET LOCAL, so they end with it.
+func (e *Engine) beginBounded(ctx context.Context) (pgx.Tx, error) {
+	tx, err := e.conn.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lock := defaultLockTimeout
+	if e.config.LockTimeout > 0 {
+		lock = e.config.LockTimeout
+	}
+	if err := setLocalTimeouts(ctx, tx, lock, e.config.StatementTimeout); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	return tx, nil
+}
+
+// setLocalTimeouts bounds the rest of tx. A zero duration leaves that timeout
+// as it is.
+func setLocalTimeouts(ctx context.Context, tx pgx.Tx, lock, statement time.Duration) error {
+	for name, d := range map[string]time.Duration{"lock_timeout": lock, "statement_timeout": statement} {
+		if d <= 0 {
+			continue
+		}
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL %s = '%dms'", name, d.Milliseconds())); err != nil {
+			return fmt.Errorf("failed to set %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // --- locking ---
@@ -1014,6 +1154,24 @@ func FormatPlanOutput(result *ApplyResult) string {
 		}
 	}
 
+	for _, p := range result.Partman {
+		name := p.Action.Spec.QualifiedName()
+		switch {
+		case p.Error != nil:
+			fmt.Fprintf(&b, "  ! %s (partman) ERROR: %v\n", name, p.Error)
+			pending++
+		case len(p.Action.Statements) > 0:
+			fmt.Fprintf(&b, "  ~ %s (partman)\n", name)
+			if !p.Action.Installed {
+				fmt.Fprintf(&b, "    ℹ pg_partman is not installed yet; statements assume it will be in schema %s\n", partman.AssumedSchema)
+			}
+			for _, stmt := range p.Action.Statements {
+				fmt.Fprintf(&b, "    %s\n", stmt)
+			}
+			pending++
+		}
+	}
+
 	for _, r := range result.Logic {
 		if !r.Skipped {
 			fmt.Fprintf(&b, "  ~ %s (logic)\n", r.Migration.Filename)
@@ -1024,6 +1182,21 @@ func FormatPlanOutput(result *ApplyResult) string {
 	for _, r := range result.Permissions {
 		if !r.Skipped {
 			fmt.Fprintf(&b, "  ~ %s (permissions)\n", r.Migration.Filename)
+			pending++
+		}
+	}
+
+	for _, d := range result.Reference {
+		switch {
+		case d.Pending != "":
+			fmt.Fprintf(&b, "  ~ %s (reference %s: diffed at apply — %s)\n", d.Spec.File, d.Table, d.Pending)
+			pending++
+		case !d.Empty():
+			fmt.Fprintf(&b, "  ~ %s (reference %s: %d insert, %d update, %d delete)\n",
+				d.Spec.File, d.Table, len(d.Inserts), len(d.Updates), len(d.Deletes))
+			for _, l := range d.Lines(planRowLimit) {
+				fmt.Fprintf(&b, "      %s\n", l)
+			}
 			pending++
 		}
 	}
@@ -1058,6 +1231,10 @@ func FormatPlanOutput(result *ApplyResult) string {
 	header := fmt.Sprintf("Plan: %d migration(s) to apply.\n\n", pending)
 	return header + w.String() + b.String()
 }
+
+// planRowLimit caps the rows a plan prints per kind of change in one
+// reference/ file; the counts on the file's own line are never capped.
+const planRowLimit = 20
 
 // FormatApplyOutput returns a human-readable summary of an apply result.
 //
@@ -1120,8 +1297,30 @@ func FormatApplyOutput(result *ApplyResult) string {
 			skipped++
 		}
 	}
+	for _, p := range result.Partman {
+		name := p.Action.Spec.QualifiedName()
+		switch {
+		case p.Error != nil:
+			fmt.Fprintf(&b, "  ✗ %s (partman, %dms) ERROR: %v\n", name, p.ExecMs, p.Error)
+			failed++
+		case p.Applied:
+			fmt.Fprintf(&b, "  ✓ %s (partman, %dms, %d statements)\n", name, p.ExecMs, len(p.Action.Statements))
+			applied++
+		default:
+			skipped++
+		}
+	}
 	writeResults(result.Logic)
 	writeResults(result.Permissions)
+	for _, d := range result.Reference {
+		if d.Empty() {
+			skipped++
+			continue
+		}
+		fmt.Fprintf(&b, "  ✓ %s (%d inserted, %d updated, %d deleted)\n",
+			d.Spec.File, len(d.Inserts), len(d.Updates), len(d.Deletes))
+		applied++
+	}
 	writeResults(result.Data)
 
 	summary := fmt.Sprintf("\nApplied: %d, Skipped: %d, Failed: %d\n", applied, skipped, failed)
@@ -1172,8 +1371,40 @@ func FormatStatusOutput(result *StatusResult) string {
 		b.WriteString("\n")
 	}
 
+	if len(result.Reference) > 0 {
+		fmt.Fprintf(&b, "Reference (diffed on every apply; run m8 plan for drift) (%d):\n", len(result.Reference))
+		for _, m := range result.Reference {
+			fmt.Fprintf(&b, "  = %s\n", m.Filename)
+		}
+		b.WriteString("\n")
+	}
+
+	// Maintenance is reported, not just registration: a table pg_partman
+	// manages but whose maintenance never runs keeps its first premake months
+	// of children and then routes every new row into its default partition.
+	// Nothing about that shows up as a pending migration.
+	if len(result.Partman) > 0 {
+		fmt.Fprintf(&b, "pg_partman (%d):\n", len(result.Partman))
+		for _, p := range result.Partman {
+			name := p.Spec.QualifiedName()
+			switch {
+			case !p.Registered:
+				fmt.Fprintf(&b, "  + %s not registered yet (apply runs create_parent)\n", name)
+			case p.LastRun == "":
+				fmt.Fprintf(&b, "  ⚠ %s maintenance has never run (is partman.run_maintenance() scheduled?)\n", name)
+			default:
+				fmt.Fprintf(&b, "  ✓ %s maintenance last ran %s\n", name, p.LastRun)
+			}
+		}
+		b.WriteString("\n")
+	}
+
 	if len(result.Pending) == 0 && len(result.Changed) == 0 && len(result.Drift) == 0 {
-		b.WriteString("Database is up to date.\n")
+		if len(result.Reference) > 0 {
+			b.WriteString("Migrations are up to date.\n")
+		} else {
+			b.WriteString("Database is up to date.\n")
+		}
 	}
 
 	return b.String()
