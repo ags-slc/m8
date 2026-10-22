@@ -320,10 +320,15 @@ Declare a partitioned table's shape -- columns, indexes, `PARTITION BY` -- and
 leave its children to whatever creates them: pg_partman, an application job, a
 script. On every run m8 reads the live children of each declared partitioned
 table and describes them in the desired state exactly as they are -- bound,
-extra `NOT NULL`s, constraints and indexes under their live names,
-replica identity, row-level-security flags, grants -- so the diff has nothing to
-do for them. They are never written to a file: a list captured once is wrong the
-first time the partition manager adds a month.
+extra `NOT NULL`s, constraints (their own `CHECK`s included) and indexes under
+their live names, replica identity, row-level-security flags -- so the diff has
+nothing to do for them. A child's grants are left alone: the schema diff does
+not manage privileges on partitions, since PostgreSQL does not carry a parent's
+`GRANT` to them and whatever creates the children owns theirs (pg_partman's
+`inherit_privileges`, for one). That also keeps role names out of the desired
+schema, so a separate shadow instance needs none of the target's roles. The
+children are never written to a file: a list captured once is wrong the first
+time the partition manager adds a month.
 
 Because the children stay visible to the diff, a change to the parent is planned
 against all of them. An index added to the parent is built without blocking
@@ -343,8 +348,8 @@ Refused, with the table named, rather than planned:
 
 - a table that is partitioned in the database but declared without
   `PARTITION BY` -- as declared, the diff would drop and recreate it;
-- an undeclared child with a `CHECK` constraint of its own, or one that is
-  itself partitioned -- pg-schema-diff cannot diff either on a partition.
+- an undeclared child with a row-level-security policy of its own, or one that
+  is itself partitioned -- pg-schema-diff cannot diff either on a partition.
 
 Children that are declared in the files are managed like any other table.
 

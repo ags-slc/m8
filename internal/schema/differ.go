@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/ags-slc/m8/internal/pgident"
+	"github.com/ags-slc/pg-schema-diff/pkg/diff"
+	"github.com/ags-slc/pg-schema-diff/pkg/tempdb"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/stripe/pg-schema-diff/pkg/diff"
-	"github.com/stripe/pg-schema-diff/pkg/tempdb"
 )
 
 // DiffResult holds the output of diffing a schema file against the live database.
