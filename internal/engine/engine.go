@@ -152,10 +152,11 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 		return nil, err
 	}
 
-	all, refSpecs, err := e.discover()
+	found, err := e.discover()
 	if err != nil {
 		return nil, err
 	}
+	all := found.all
 
 	result := &ApplyResult{}
 
@@ -168,7 +169,7 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 
 	// Phase B: Schema — ensure PG schemas exist, then diff and apply
 	schemaMigrations := filterByType(all, migration.TypeSchema)
-	if err := e.refusePartman(ctx, schemaMigrations); err != nil {
+	if err := e.refusePartman(ctx, found.partman); err != nil {
 		return result, err
 	}
 	if err := e.ensurePGSchemas(ctx, schemaMigrations); err != nil {
@@ -182,7 +183,7 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 
 	// Phase B2: pg_partman — register declared tables and reconcile their
 	// part_config rows, now that the schema phase has created the parents.
-	result.Partman, err = e.applyPartman(ctx, schemaMigrations)
+	result.Partman, err = e.applyPartman(ctx, found.partman)
 	if err != nil {
 		return result, err
 	}
@@ -204,7 +205,7 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 	// Phase E: Reference — declared rows, diffed against the live tables on
 	// every apply. After logic/, so the triggers it creates fire on these
 	// writes; before data/, so a one-time backfill can rely on the rows.
-	result.Reference, err = e.reconcileReference(ctx, refSpecs, nil)
+	result.Reference, err = e.reconcileReference(ctx, found.reference, nil)
 	if err != nil {
 		return result, err
 	}
@@ -235,10 +236,11 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		return nil, err
 	}
 
-	all, refSpecs, err := e.discover()
+	found, err := e.discover()
 	if err != nil {
 		return nil, err
 	}
+	all := found.all
 
 	result := &ApplyResult{}
 
@@ -304,7 +306,7 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 
 	// Phase B2: pg_partman — what registering and reconciling the declared
 	// tables would run.
-	result.Partman, err = e.planPartman(ctx, schemaMigrations)
+	result.Partman, err = e.planPartman(ctx, found.partman)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +324,7 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 	}
 
 	// Phase E: Reference — diff the declared rows against the live tables.
-	result.Reference, err = e.reconcileReference(ctx, refSpecs, schemaChanges(result))
+	result.Reference, err = e.reconcileReference(ctx, found.reference, schemaChanges(result))
 	if err != nil {
 		return result, err
 	}
@@ -366,10 +368,11 @@ func (e *Engine) Status(ctx context.Context) (*StatusResult, error) {
 		return nil, err
 	}
 
-	all, err := migration.Discover(e.config.MigrationsDir)
+	found, err := e.discover()
 	if err != nil {
 		return nil, err
 	}
+	all := found.all
 
 	history, err := e.store.GetAllHistory(ctx)
 	if err != nil {
@@ -413,11 +416,7 @@ func (e *Engine) Status(ctx context.Context) (*StatusResult, error) {
 
 	result := &StatusResult{Applied: history}
 
-	specs, err := collectPartmanSpecs(filterByType(all, migration.TypeSchema))
-	if err != nil {
-		return nil, err
-	}
-	if result.Partman, err = partman.Statuses(ctx, e.conn, specs); err != nil {
+	if result.Partman, err = partman.Statuses(ctx, e.conn, found.partman); err != nil {
 		return nil, err
 	}
 
@@ -517,10 +516,11 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 		return nil, err
 	}
 
-	all, refSpecs, err := e.discover()
+	found, err := e.discover()
 	if err != nil {
 		return nil, err
 	}
+	all := found.all
 
 	result := &ApplyResult{}
 
@@ -543,7 +543,7 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 
 	// Schema — ensure PG schemas exist, then diff and apply
 	syncSchemaMigrations := filterByType(all, migration.TypeSchema)
-	if err := e.refusePartman(ctx, syncSchemaMigrations); err != nil {
+	if err := e.refusePartman(ctx, found.partman); err != nil {
 		return result, err
 	}
 	if err := e.ensurePGSchemas(ctx, syncSchemaMigrations); err != nil {
@@ -556,7 +556,7 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 	}
 
 	// pg_partman configuration converges with the schema it belongs to.
-	result.Partman, err = e.applyPartman(ctx, syncSchemaMigrations)
+	result.Partman, err = e.applyPartman(ctx, found.partman)
 	if err != nil {
 		return result, err
 	}
@@ -599,7 +599,7 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 
 	// Reference — declared rows are desired state, like schema/, so sync
 	// converges them rather than baselining them the way it does data/.
-	result.Reference, err = e.reconcileReference(ctx, refSpecs, nil)
+	result.Reference, err = e.reconcileReference(ctx, found.reference, nil)
 	return result, err
 }
 
@@ -933,6 +933,76 @@ func (e *Engine) executeMigration(ctx context.Context, m *migration.Migration) e
 	}
 
 	return tx.Commit(ctx)
+}
+
+// discovered is every migration file, with the directives that need no
+// database already parsed.
+type discovered struct {
+	all       []*migration.Migration
+	reference []reference.Spec
+	partman   []partman.Spec
+}
+
+// discover finds every migration file and parses the reference/ files and the
+// m8:partman directives in schema/. Every command calls it before its first
+// phase, so a malformed directive stops the run before anything has changed.
+func (e *Engine) discover() (discovered, error) {
+	all, err := migration.Discover(e.config.MigrationsDir)
+	if err != nil {
+		return discovered{}, err
+	}
+	d := discovered{all: all}
+	for _, m := range filterByType(all, migration.TypeReference) {
+		s, err := reference.Parse(m.Filename, m.Content)
+		if err != nil {
+			return discovered{}, err
+		}
+		d.reference = append(d.reference, s)
+	}
+	if d.partman, err = collectPartmanSpecs(filterByType(all, migration.TypeSchema)); err != nil {
+		return discovered{}, err
+	}
+	return d, nil
+}
+
+// defaultLockTimeout bounds the wait for a lock when --lock-timeout is not
+// set, matching pg-schema-diff's default for DDL. The reference/ and pg_partman
+// phases write rows and tables an application may hold locked; left
+// unbounded, they queue behind a long transaction -- and, for create_parent's
+// ACCESS EXCLUSIVE lock, every query on the table queues behind them.
+const defaultLockTimeout = 3 * time.Second
+
+// beginBounded starts a transaction whose waits are bounded: lock_timeout is
+// --lock-timeout or defaultLockTimeout, statement_timeout is
+// --statement-timeout if set. Both are SET LOCAL, so they end with it.
+func (e *Engine) beginBounded(ctx context.Context) (pgx.Tx, error) {
+	tx, err := e.conn.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lock := defaultLockTimeout
+	if e.config.LockTimeout > 0 {
+		lock = e.config.LockTimeout
+	}
+	if err := setLocalTimeouts(ctx, tx, lock, e.config.StatementTimeout); err != nil {
+		_ = tx.Rollback(ctx)
+		return nil, err
+	}
+	return tx, nil
+}
+
+// setLocalTimeouts bounds the rest of tx. A zero duration leaves that timeout
+// as it is.
+func setLocalTimeouts(ctx context.Context, tx pgx.Tx, lock, statement time.Duration) error {
+	for name, d := range map[string]time.Duration{"lock_timeout": lock, "statement_timeout": statement} {
+		if d <= 0 {
+			continue
+		}
+		if _, err := tx.Exec(ctx, fmt.Sprintf("SET LOCAL %s = '%dms'", name, d.Milliseconds())); err != nil {
+			return fmt.Errorf("failed to set %s: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // --- locking ---

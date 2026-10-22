@@ -45,11 +45,7 @@ func collectPartmanSpecs(migrations []*migration.Migration) ([]partman.Spec, err
 // would do. It runs after the schema diff in the phase order, and reads the
 // database as it stands: a table the schema phase has yet to create is
 // reported as one create_parent will register.
-func (e *Engine) planPartman(ctx context.Context, schemaMigrations []*migration.Migration) ([]PartmanResult, error) {
-	specs, err := collectPartmanSpecs(schemaMigrations)
-	if err != nil {
-		return nil, err
-	}
+func (e *Engine) planPartman(ctx context.Context, specs []partman.Spec) ([]PartmanResult, error) {
 	actions, err := partman.Plan(ctx, e.conn, specs)
 	if err != nil {
 		return nil, err
@@ -65,8 +61,8 @@ func (e *Engine) planPartman(ctx context.Context, schemaMigrations []*migration.
 // declaration would be refused. applyPartman checks again after the schema
 // phase; this is the check that keeps a refusal from landing as a partial
 // apply -- the schema half committed, the pg_partman half refused.
-func (e *Engine) refusePartman(ctx context.Context, schemaMigrations []*migration.Migration) error {
-	results, err := e.planPartman(ctx, schemaMigrations)
+func (e *Engine) refusePartman(ctx context.Context, specs []partman.Spec) error {
+	results, err := e.planPartman(ctx, specs)
 	if err != nil {
 		return err
 	}
@@ -85,8 +81,8 @@ func (e *Engine) refusePartman(ctx context.Context, schemaMigrations []*migratio
 //
 // Every table is planned before any is touched: a refusal on one table refuses
 // the run, for the same reason a schema diff that cannot be computed does.
-func (e *Engine) applyPartman(ctx context.Context, schemaMigrations []*migration.Migration) ([]PartmanResult, error) {
-	results, err := e.planPartman(ctx, schemaMigrations)
+func (e *Engine) applyPartman(ctx context.Context, specs []partman.Spec) ([]PartmanResult, error) {
+	results, err := e.planPartman(ctx, specs)
 	if err != nil || len(results) == 0 {
 		return results, err
 	}
@@ -117,33 +113,17 @@ func (e *Engine) applyPartman(ctx context.Context, schemaMigrations []*migration
 	return results, nil
 }
 
-// partmanLockTimeout bounds the wait for a lock when --lock-timeout is not
-// set, matching pg-schema-diff's default for DDL. create_parent creates child
-// tables of the parent, and CREATE TABLE ... PARTITION OF takes an ACCESS
-// EXCLUSIVE lock on it: left unbounded, it queues behind a long-running query
-// and every query against the table then queues behind it.
-const partmanLockTimeout = 3 * time.Second
-
 // execInTx runs statements as one transaction: create_parent and the UPDATE
 // that follows it land together or not at all, so a failure never leaves a
 // table registered with pg_partman's defaults instead of its declaration.
-// The timeouts are SET LOCAL, so they end with the transaction.
 func (e *Engine) execInTx(ctx context.Context, stmts []string) error {
-	tx, err := e.conn.Begin(ctx)
+	tx, err := e.beginBounded(ctx)
 	if err != nil {
 		return err
 	}
-	lockTimeout := partmanLockTimeout
-	if e.config.LockTimeout > 0 {
-		lockTimeout = e.config.LockTimeout
-	}
-	settings := []string{fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", lockTimeout.Milliseconds())}
-	if e.config.StatementTimeout > 0 {
-		settings = append(settings, fmt.Sprintf("SET LOCAL statement_timeout = '%dms'", e.config.StatementTimeout.Milliseconds()))
-	}
-	for _, s := range append(settings, stmts...) {
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s); err != nil {
-			_ = tx.Rollback(ctx)
 			return fmt.Errorf("%w\nSQL: %s", err, s)
 		}
 	}

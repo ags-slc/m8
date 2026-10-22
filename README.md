@@ -369,16 +369,25 @@ CREATE TABLE audit_log (
 
 A table pg_partman does not manage yet is registered with `create_parent`; one it
 does has its `part_config` row updated to match. Keys are `part_config` column
-names -- `premake`, `retention` (`none` for no retention), `retention_keep_table`,
-`retention_keep_index`, `infinite_time_partitions`, `inherit_privileges`,
-`automatic_maintenance`, `jobmon` -- plus `control` and `partition_interval`
-(required), and create_parent's `default_table` and `start_partition`, which apply
-only when the table is registered. A key left out is not managed. Changing
-`control` or `partition_interval` on a registered table is refused, before
-anything in the run is applied: pg_partman cannot change either in place.
-Intervals compare as the server renders them, so `'1 month'` matches the
-`1 mon` that `part_config` stores, while `'30 days'` does not. pg_partman 5.0
-or later is required.
+names, plus `control` and `partition_interval` (required) and create_parent's
+`default_table` and `start_partition`, which apply only when the table is
+registered. A key left out is not managed.
+
+| Keys | On a registered table |
+|------|-----------------------|
+| `control`, `partition_interval`, `partition_type`, `epoch`, `date_trunc_interval` | Fixed: they lay out the partition boundaries, so a change is refused before anything in the run is applied |
+| `premake`, `constraint_cols` (`a,b`), `optimize_constraint`, `ignore_default_data`, `retention` (`none` for no retention), `retention_schema`, `retention_keep_table`, `retention_keep_index`, `infinite_time_partitions`, `inherit_privileges`, `automatic_maintenance`, `jobmon` | Updated in place |
+
+Settings create_parent takes are passed to it, so the children its first call
+makes are already laid out by them. Intervals compare as the server renders
+them, so `'1 month'` matches the `1 mon` that `part_config` stores, while
+`'30 days'` does not. pg_partman 5.0 or later is required; the keys are the
+columns every 5.x has. `template_table` is not declarable -- it names a table
+create_parent otherwise makes itself -- so `m8 dump` writes a comment beside
+the directive when a table uses a custom one, and dumps a partitioned table
+without a directive, with a comment saying why, on a database whose pg_partman
+is older than 5.0. The directive is parsed before any phase runs, so a typo
+stops the release before `ops/` has applied anything.
 
 A pending pg_partman change makes `m8 plan` exit 2, like any other pending
 migration; a refused declaration makes it fail.
