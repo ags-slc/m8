@@ -34,8 +34,9 @@ import (
 // a month.
 //
 // Each child is rebuilt the way pg_partman 5 builds one: a table LIKE the
-// parent, given the child's own NOT NULLs, constraints and indexes under their
-// live names, then attached. (Not its column defaults: pg-schema-diff does not
+// parent, with the parent's CHECK constraints -- ATTACH PARTITION refuses a
+// child missing one -- given the child's own NOT NULLs, constraints and
+// indexes under their live names, then attached. (Not its column defaults: pg-schema-diff does not
 // compare those on a partition.) Attaching reuses an index that matches
 // one of the parent's instead of creating it, so the rebuilt child's indexes
 // carry the names the live child's do -- a child built with CREATE TABLE ...
@@ -135,7 +136,7 @@ func adoptPartitions(ctx context.Context, liveDB *sql.DB, targetSchema string, d
 		out.children[k.name] = true
 		qChild, qParent := pgident.Qualify(targetSchema, k.name), pgident.Qualify(targetSchema, k.parent)
 
-		ddl = append(ddl, fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING GENERATED);", qChild, qParent))
+		ddl = append(ddl, fmt.Sprintf("CREATE TABLE %s (LIKE %s INCLUDING GENERATED INCLUDING CONSTRAINTS);", qChild, qParent))
 		for _, col := range notNulls[k.name] {
 			ddl = append(ddl, fmt.Sprintf("ALTER TABLE %s ALTER COLUMN %s SET NOT NULL;", qChild, pgident.Quote(col)))
 		}
