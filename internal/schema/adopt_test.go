@@ -135,6 +135,22 @@ ALTER TABLE public.event_log_p202610 ADD CONSTRAINT org_not_empty CHECK (org <> 
 	}
 }
 
+// ATTACH PARTITION refuses a child missing one of its parent's CHECK
+// constraints, so the rebuilt child carries them -- alongside one of its own.
+func TestParentCheckConstraintsAreCarried(t *testing.T) {
+	const parent = `CREATE TABLE public.event_log (id text NOT NULL, created_at timestamptz NOT NULL, org text NOT NULL,
+    CONSTRAINT org_set CHECK (org <> '')) PARTITION BY RANGE (created_at);`
+	res := adoptDiff(t, parent+`
+CREATE TABLE public.event_log_p202610 PARTITION OF public.event_log FOR VALUES FROM ('2026-10-01') TO ('2026-11-01');
+ALTER TABLE public.event_log_p202610 ADD CONSTRAINT id_set CHECK (id <> '');`, parent)
+	if res.HasChanges {
+		t.Fatalf("expected no changes, got:\n%s", joinDDL(res))
+	}
+	if res.ValidationSkipped {
+		t.Fatalf("plan was not validated: %s", res.ValidationSkippedReason)
+	}
+}
+
 // A child that logical replication reads from carries REPLICA IDENTITY FULL.
 // The adopted child must carry it too, and adopting it must not count as the
 // folder declaring replica identity: that would unlock replica-identity
