@@ -42,13 +42,18 @@ import (
 // PARTITION OF would get the names Postgres generates instead, and a partition
 // whose indexes were named any other way could not be validated at all. After
 // attaching, the child gets the attributes a partition does not inherit:
-// replica identity, row-level-security flags and grants. Leaving any of these
-// out would read as a change to the child -- and under --strict, which filters
+// replica identity and row-level-security flags. Leaving any of these out
+// would read as a change to the child -- and under --strict, which filters
 // nothing, the plan would make it: drop a child-only index, reset REPLICA
-// IDENTITY FULL on a partition logical replication reads from.
+// IDENTITY FULL on a partition logical replication reads from. A child's own
+// CHECK constraints -- pg_partman's constraint_cols adds them to older
+// children -- are carried like its other constraints. Its grants are not:
+// pg-schema-diff leaves privileges on partitions to whatever creates them, so
+// they need no declaring, and a desired schema that named their roles could
+// not be built on a shadow instance that lacks them.
 //
 // What the rebuild cannot carry is refused rather than left to fail inside the
-// diff: a child with a CHECK constraint of its own, and a child that is itself
+// diff: a child with a policy of its own, and a child that is itself
 // partitioned. pg-schema-diff implements neither on a partition.
 func adoptPartitions(ctx context.Context, liveDB *sql.DB, targetSchema string, desiredDDL []string) (adopted, error) {
 	declared := declaredTables(desiredDDL)
@@ -91,9 +96,8 @@ func adoptPartitions(ctx context.Context, liveDB *sql.DB, targetSchema string, d
 		return adopted{}, nil
 	}
 
-	checks, err := q.pairs(`SELECT k.relname, con.conname FROM kids k
-		JOIN pg_constraint con ON con.conrelid = k.oid
-		WHERE con.contype = 'c' AND con.conislocal ORDER BY 1, 2`)
+	policies, err := q.pairs(`SELECT k.relname, pol.polname FROM kids k
+		JOIN pg_policy pol ON pol.polrelid = k.oid ORDER BY 1, 2`)
 	if err != nil {
 		return adopted{}, err
 	}
@@ -106,7 +110,8 @@ func adoptPartitions(ctx context.Context, liveDB *sql.DB, targetSchema string, d
 	}
 	constraints, err := q.pairs(`SELECT k.relname, format('ADD CONSTRAINT %I %s', con.conname, pg_get_constraintdef(con.oid))
 		FROM kids k JOIN pg_constraint con ON con.conrelid = k.oid
-		WHERE con.contype IN ('p', 'u', 'x') ORDER BY 1, con.conname`)
+		WHERE con.contype IN ('p', 'u', 'x') OR (con.contype = 'c' AND con.conislocal)
+		ORDER BY 1, con.conname`)
 	if err != nil {
 		return adopted{}, err
 	}
@@ -118,26 +123,14 @@ func adoptPartitions(ctx context.Context, liveDB *sql.DB, targetSchema string, d
 	if err != nil {
 		return adopted{}, err
 	}
-	grants, err := q.pairs(`SELECT k.relname,
-		       format('%s ON %I.%I TO %s%s', a.privilege_type, $1::text, k.relname,
-		              CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE '"' || replace(r.rolname, '"', '""') || '"' END,
-		              CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END)
-		FROM kids k JOIN pg_class c ON c.oid = k.oid
-		CROSS JOIN LATERAL aclexplode(c.relacl) a
-		LEFT JOIN pg_roles r ON r.oid = a.grantee
-		WHERE a.grantee <> c.relowner
-		ORDER BY 1, a.privilege_type, a.grantee`)
-	if err != nil {
-		return adopted{}, err
-	}
 
 	out := adopted{children: map[string]bool{}}
 	var ddl []string
 	for _, k := range undeclared {
-		if c := checks[k.name]; len(c) > 0 {
-			return adopted{}, fmt.Errorf("%s.%s, a partition of %s.%s, has a CHECK constraint of its own (%s); "+
-				"pg-schema-diff cannot diff check constraints on a partition, so the partition cannot be adopted",
-				targetSchema, k.name, targetSchema, k.parent, c[0])
+		if p := policies[k.name]; len(p) > 0 {
+			return adopted{}, fmt.Errorf("%s.%s, a partition of %s.%s, has a policy of its own (%s); "+
+				"pg-schema-diff cannot diff policies on a partition, so the partition cannot be adopted",
+				targetSchema, k.name, targetSchema, k.parent, p[0])
 		}
 		out.children[k.name] = true
 		qChild, qParent := pgident.Qualify(targetSchema, k.name), pgident.Qualify(targetSchema, k.parent)
@@ -167,9 +160,6 @@ func adoptPartitions(ctx context.Context, liveDB *sql.DB, targetSchema string, d
 		}
 		if k.forceRLS {
 			ddl = append(ddl, fmt.Sprintf("ALTER TABLE %s FORCE ROW LEVEL SECURITY;", qChild))
-		}
-		for _, g := range grants[k.name] {
-			ddl = append(ddl, "GRANT "+g+";")
 		}
 	}
 

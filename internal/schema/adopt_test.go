@@ -95,16 +95,38 @@ CREATE INDEX event_log_id_idx ON public.event_log (id);`)
 }
 
 // Partitions do not inherit their parent's grants, so GRANT ... ON ALL TABLES
-// or default privileges leave every child with grants of its own. Adopting a
-// child without them would read as a change pg-schema-diff refuses outright
-// ("privileges on partitions: not implemented"); with them, the plan is clean
-// and validated.
-func TestAdoptedPartitionsKeepTheirGrants(t *testing.T) {
-	res := adoptDiff(t, partitionedFixture+`
+// or default privileges leave every child with grants of its own.
+// pg-schema-diff leaves those alone, so the plan is clean and validated
+// without adoption declaring them -- and the desired schema names no role,
+// so a shadow instance without the target's roles can build it.
+func TestAdoptedPartitionsLeaveTheirGrantsAlone(t *testing.T) {
+	db, connStr := depDB(t)
+	_, shadowURL := depDB(t)
+	mustExec(t, db, partitionedFixture+`
 CREATE ROLE probe_app;
-GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO probe_app;`,
-		declaredParent+`
-GRANT SELECT, INSERT ON public.event_log TO probe_app;`)
+GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO probe_app;`)
+	d, err := NewDiffer(context.Background(), connStr, shadowURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.Close() })
+	res, err := d.Diff(context.Background(), db, "public", []string{declaredParent}, false)
+	if err != nil {
+		t.Fatalf("diff against a shadow without the role: %v", err)
+	}
+	if res.HasChanges {
+		t.Fatalf("expected no changes, got:\n%s", joinDDL(res))
+	}
+	if res.ValidationSkipped {
+		t.Fatalf("plan was not validated: %s", res.ValidationSkippedReason)
+	}
+}
+
+// A child's own CHECK constraint -- pg_partman's constraint_cols adds one to
+// each older child -- is adopted with the child, so it plans clean.
+func TestAdoptedPartitionsKeepTheirCheckConstraints(t *testing.T) {
+	res := adoptDiff(t, partitionedFixture+`
+ALTER TABLE public.event_log_p202610 ADD CONSTRAINT org_not_empty CHECK (org <> '');`, declaredParent)
 	if res.HasChanges {
 		t.Fatalf("expected no changes, got:\n%s", joinDDL(res))
 	}
@@ -257,9 +279,10 @@ func TestEmptyPartitionedTableDeclaredPlainIsRefused(t *testing.T) {
 // the diff with "not implemented".
 func TestUnadoptablePartitionsAreRefusedByName(t *testing.T) {
 	err := diffErr(t, partitionedFixture+`
-ALTER TABLE public.event_log_p202610 ADD CONSTRAINT org_not_empty CHECK (org <> '');`, declaredParent)
-	if err == nil || !strings.Contains(err.Error(), "event_log_p202610") || !strings.Contains(err.Error(), "CHECK constraint") {
-		t.Errorf("expected the CHECK on event_log_p202610 named, got %v", err)
+ALTER TABLE public.event_log_p202610 ENABLE ROW LEVEL SECURITY;
+CREATE POLICY org_only ON public.event_log_p202610 USING (org = current_user);`, declaredParent)
+	if err == nil || !strings.Contains(err.Error(), "event_log_p202610") || !strings.Contains(err.Error(), "policy of its own (org_only)") {
+		t.Errorf("expected the policy on event_log_p202610 named, got %v", err)
 	}
 
 	err = diffErr(t, `
