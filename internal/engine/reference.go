@@ -62,14 +62,20 @@ func (e *Engine) reconcileReference(ctx context.Context, specs []reference.Spec,
 	}
 
 	diffs, err := reference.Plan(ctx, tx, specs, changing)
-	if err != nil || changing != nil {
+	if changing != nil {
 		return diffs, err
+	}
+	// An apply returns no diffs with its error: the transaction rolls back, so
+	// nothing was written, and FormatApplyOutput would report every non-empty
+	// diff as applied.
+	if err != nil {
+		return nil, err
 	}
 	if err := reference.Apply(ctx, tx, diffs); err != nil {
-		return diffs, err
+		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return diffs, err
+		return nil, err
 	}
 	for _, d := range diffs {
 		if !d.Empty() {

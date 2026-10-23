@@ -485,6 +485,43 @@ func TestReferenceRefusals(t *testing.T) {
 	}
 }
 
+// A write that fails rolls the whole phase back, so the output must not report
+// any reference/ file as applied -- not even a.sql, whose own write succeeded
+// before z.sql's broke the CHECK.
+func TestReferenceFailedWriteReportsNothingApplied(t *testing.T) {
+	conn, sqlDB, connStr, cleanup := testDB(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	mustExec(t, conn, `CREATE TABLE witness (code TEXT PRIMARY KEY, name TEXT);
+		CREATE TABLE fee (code TEXT PRIMARY KEY, amount NUMERIC CHECK (amount >= 0))`)
+	dir := setupMigrationsDir(t)
+	mustMkdirAll(t, filepath.Join(dir, "reference"), 0755)
+	mustWriteFile(t, filepath.Join(dir, "reference", "a.sql"),
+		[]byte("-- m8:reference witness\nSELECT * FROM (VALUES ('w', 'x')) v(code, name)"), 0644)
+	mustWriteFile(t, filepath.Join(dir, "reference", "z.sql"),
+		[]byte("-- m8:reference fee\nSELECT * FROM (VALUES ('neg', -1)) v(code, amount)"), 0644)
+	eng, differ := newEngine(conn, sqlDB, connStr, dir, false)
+	if differ != nil {
+		defer func() { _ = differ.Close() }()
+	}
+
+	for name, run := range map[string]func(context.Context) (*ApplyResult, error){"apply": eng.Apply, "sync": eng.Sync} {
+		t.Run(name, func(t *testing.T) {
+			result, err := run(ctx)
+			if err == nil || !strings.Contains(err.Error(), "fee_amount_check") {
+				t.Fatalf("got %v, want the CHECK violation", err)
+			}
+			if out := FormatApplyOutput(result); strings.Contains(out, "reference/") {
+				t.Errorf("output reports a rolled-back reference/ file:\n%s", out)
+			}
+			if got := refQuery(t, conn, "SELECT count(*)::text FROM witness"); got != "0" {
+				t.Errorf("a failed run left %s row(s) from reference/a.sql", got)
+			}
+		})
+	}
+}
+
 // Writes between declared tables follow their foreign keys, not their file
 // names: the child sorts first here, so file order would insert a row whose
 // parent does not exist yet, and prune would delete a parent still referenced.
