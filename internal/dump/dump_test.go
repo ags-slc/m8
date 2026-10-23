@@ -4,48 +4,24 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 
+	"github.com/ags-slc/m8/internal/pgtest"
 	"github.com/jackc/pgx/v5"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+func TestMain(m *testing.M) { pgtest.Main(m) }
+
+// testDB connects to a fresh database on the package's shared PostgreSQL;
+// pgtest drops it, and any role the test created, when the test ends.
 func testDB(t *testing.T) (*pgx.Conn, func()) {
 	t.Helper()
 	ctx := context.Background()
 
-	container, err := postgres.Run(ctx, "postgres:16-alpine",
-		postgres.WithDatabase("m8test"),
-		postgres.WithUsername("postgres"),
-		postgres.WithPassword("testpwd"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(30*time.Second)),
-	)
+	conn, err := pgx.Connect(ctx, pgtest.DB(t))
 	if err != nil {
-		t.Fatalf("failed to start postgres: %v", err)
-	}
-
-	connStr, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		_ = container.Terminate(ctx)
-		t.Fatalf("failed to get connection string: %v", err)
-	}
-
-	conn, err := pgx.Connect(ctx, connStr)
-	if err != nil {
-		_ = container.Terminate(ctx)
 		t.Fatalf("failed to connect: %v", err)
 	}
-
-	cleanup := func() {
-		_ = conn.Close(ctx)
-		_ = container.Terminate(ctx)
-	}
-	return conn, cleanup
+	return conn, func() { _ = conn.Close(ctx) }
 }
 
 func TestDumpTable(t *testing.T) {
