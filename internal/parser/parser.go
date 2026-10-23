@@ -29,6 +29,9 @@ type Directive struct {
 	NoTransaction bool
 	LockTimeout   time.Duration
 	Requires      []string // version strings this migration depends on
+	// Reference holds the text after each -- m8:reference, one entry per
+	// directive. Only reference/ files read it.
+	Reference []string
 }
 
 type parserState int
@@ -466,6 +469,8 @@ func extractDirectives(content []byte) Directive {
 			val := strings.TrimPrefix(directive, "requires ")
 			val = strings.TrimSpace(val)
 			d.Requires = append(d.Requires, strings.Fields(val)...)
+		case directive == "reference" || strings.HasPrefix(directive, "reference "):
+			d.Reference = append(d.Reference, strings.TrimSpace(strings.TrimPrefix(directive, "reference")))
 		}
 	}
 	return d

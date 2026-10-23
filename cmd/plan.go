@@ -100,6 +100,11 @@ func hasPending(r *engine.ApplyResult) bool {
 			return true
 		}
 	}
+	for _, d := range r.Reference {
+		if !d.Empty() {
+			return true
+		}
+	}
 	for _, v := range r.Data {
 		if !v.Skipped {
 			return true

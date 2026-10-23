@@ -106,13 +106,14 @@ m8 sync --database mydb --user postgres
 m8 new schema public/users
 m8 new logic proc_refresh_invoices
 m8 new permissions grants_readonly
+m8 new reference carrier
 m8 new ops "create extensions"
 m8 new data "backfill destination country"
 ```
 
 ## Migration Layout
 
-Organize SQL files in five directories:
+Organize SQL files in six directories:
 
 ```
 migrations/
@@ -130,6 +131,8 @@ migrations/
 ├── permissions/                               # Re-applied on change
 │   ├── grants_materialized.sql
 │   └── default_privileges.sql
+├── reference/                                 # Declared rows, diffed every apply
+│   └── carrier.sql
 ├── ops/                                       # One-time, sequential -- runs FIRST
 │   ├── 20260411_001__create_extensions.sql
 │   └── 20260411_002__create_hypertables.sql
@@ -144,10 +147,11 @@ migrations/
 | **Schema** | `schema/{pg_schema}/` | Desired state diffed against live DB per PG schema | Tables, indexes, constraints |
 | **Logic** | `logic/` | Re-run whenever file content changes | Procedures, functions, views, triggers, pg_cron |
 | **Permissions** | `permissions/` | Re-run whenever file content changes | Grants, revokes, roles, default privileges |
+| **Reference** | `reference/` | Declared rows diffed against the live table on **every** apply | Lookup and seed tables whose rows must equal exact values |
 | **Ops** | `ops/` | Run once in timestamp order, **before** schema/ | Extensions, hypertables, session/database settings |
-| **Data** | `data/` | Run once in timestamp order, **after** everything | Backfills, seeds, one-time DML, comments on new objects |
+| **Data** | `data/` | Run once in timestamp order, **after** everything | Backfills, one-time seeds and DML, comments on new objects |
 
-**Apply order:** Ops → Schema → Logic → Permissions → Data
+**Apply order:** Ops → Schema → Logic → Permissions → Reference → Data
 
 ### ops/ or data/?
 
@@ -173,6 +177,92 @@ file by hand afterwards. That is the case `data/` exists to remove.
 A `data/` migration whose procedure `COMMIT`s per batch needs
 `-- m8:no-transaction`, like any other migration that manages its own
 transactions.
+
+### Reference Data
+
+Some tables hold rows the application depends on being exactly so: carriers,
+mappings, codes. A one-time `data/` seed needs a new migration every time those
+rows change, and a hand-written `MERGE` re-run on every deploy rewrites every
+row unless it is guarded just right. A `reference/` file declares the rows
+instead, and m8 makes the table match on every apply:
+
+```sql
+-- reference/vendor_mapping.sql
+-- m8:reference public.vendor_mapping key=match_type,keyword prune touch=updated_at
+SELECT * FROM (VALUES
+    ('vm_1', 'VENDOR_CONTAINS', 'landmark', 'LANDMARK'),
+    ('vm_2', 'VENDOR_CONTAINS', 'funko',    'DHL_ECOM')
+) AS v(id, match_type, keyword, carrier);
+```
+
+The file is one `SELECT` or `VALUES` query; its column aliases name the columns
+it declares. On every apply m8 loads it into a temporary table typed like the
+target, compares by key, and writes only the difference:
+
+- **Missing rows are inserted, changed rows updated.** A row that already
+  matches is not written or locked at all -- no trigger fires, no WAL, no CDC
+  event -- so a converged file costs one read and `m8 plan` reports nothing.
+- **A hand edit is drift.** It shows up in `m8 plan` and the next apply puts it
+  back; nothing waits for the file to change.
+- **`prune` deletes rows the file does not list.** Without it they are kept.
+- **Columns the query does not name are never written** -- inserts take their
+  defaults -- except the `touch=` columns, which are set to `now()` on every row
+  m8 inserts or changes.
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `key=a,b` | the primary key | Columns rows are matched on. A unique, non-partial index must cover exactly these columns. |
+| `prune` | off | Delete live rows whose key the file does not list. |
+| `touch=c,d` | none | Columns set to `now()` on rows m8 inserts or updates. |
+
+`m8 plan` prints each change, capped at 20 lines per kind per file:
+
+```
+  ~ reference/vendor_mapping.sql (reference vendor_mapping: 1 insert, 1 update, 1 delete)
+      + ('VENDOR_CONTAINS', 'royal mail') id='vm_4' carrier='ROYAL_MAIL'
+      ~ ('VENDOR_CONTAINS', 'funko') carrier: 'HAND_EDIT' → 'DHL_ECOM'
+      - ('VENDOR_CONTAINS', 'app')
+```
+
+Values are cast to the column's type and then assigned, as an `INSERT` would:
+a string too long for a `varchar(n)` or `char(n)` is refused rather than
+truncated, and a `numeric(p,s)` rounds the way the table does, so the file
+converges instead of showing a change on every plan.
+
+m8 refuses, naming the file, rather than guess when:
+- the key has no backing unique index, or a key is `NULL` or declared twice;
+- a column does not exist, is generated, or is `GENERATED ALWAYS AS IDENTITY`;
+- two files declare one table;
+- the query reads a table a `reference/` file declares -- every query is loaded
+  before anything is written, so it would see that table's rows from before
+  the apply. Write the values themselves rather than joining to get them;
+- `prune` would delete through a foreign key that is `ON DELETE CASCADE`,
+  `SET NULL` or `SET DEFAULT`, which would change rows in a table the file does
+  not declare.
+
+`json` columns are compared as `jsonb`, so whitespace and key order are not
+changes; `xml` and the geometric types are compared as text. When a file
+declares a `serial` or identity column, apply moves its sequence past the
+highest value in the table -- never backwards -- so an application insert
+that takes the default does not collide with a declared row.
+
+All `reference/` files apply in one transaction, ordered by the foreign keys
+between their tables -- parents first for inserts and updates, children first
+for deletes -- and otherwise by file name. Deletes run before inserts and
+updates, which re-keying a row needs; if that violates a constraint, m8 rolls
+back to a savepoint and runs them after, which moving child rows off a pruned
+parent needs. Directives are parsed before `ops/` runs, so a typo stops the
+release before anything is applied.
+
+`m8 plan` runs the queries in a read-only transaction, so one that calls
+`nextval()` fails rather than moving a sequence. When this release's `schema/`
+changes a table -- a statement naming it as `"schema"."table"` -- plan cannot
+diff it against the table apply will write to, and reports it as diffed at
+apply; any other problem -- a misspelt column -- fails
+plan as it would fail apply. `m8 sync` converges `reference/`; `m8 baseline`
+skips it, since there is no history to adopt; `m8 status` lists it, but only
+plan can say whether it has drifted. Plan and apply wait at most
+`--lock-timeout` (default 3s) for a lock.
 
 ### Schema Migrations
 
@@ -293,7 +383,7 @@ and replica identity**, plus roles themselves, event triggers, and
 
 | Command | Description |
 |---------|-------------|
-| `m8 apply` | Apply pending migrations (ops → schema → logic → permissions → data) |
+| `m8 apply` | Apply pending migrations (ops → schema → logic → permissions → reference → data) |
 | `m8 plan` | Show what would be applied without making changes (exit code 2 if pending) |
 | `m8 status` | Show applied, pending, changed, and drifted migrations |
 | `m8 sync` | One-time convergence for brownfield adoption (`ops/` and `data/` are baselined, not run) |

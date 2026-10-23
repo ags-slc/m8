@@ -13,6 +13,7 @@ import (
 	"github.com/ags-slc/m8/internal/migration"
 	"github.com/ags-slc/m8/internal/parser"
 	"github.com/ags-slc/m8/internal/pgident"
+	"github.com/ags-slc/m8/internal/reference"
 	"github.com/ags-slc/m8/internal/schema"
 	"github.com/ags-slc/m8/internal/state"
 	"github.com/jackc/pgx/v5"
@@ -61,7 +62,8 @@ type Config struct {
 	// plan's own value, which is what you want by default: 3s for ordinary DDL,
 	// 20 minutes for a concurrent index build. The override exists because a
 	// legitimate ALTER TABLE on a large table can exceed 3s -- and until these
-	// timeouts were actually applied, it silently did.
+	// timeouts were actually applied, it silently did. They also bound the
+	// reference/ phase, whose lock timeout is otherwise 3s.
 	LockTimeout      time.Duration
 	StatementTimeout time.Duration
 }
@@ -72,6 +74,8 @@ type ApplyResult struct {
 	Schema      []SchemaResult
 	Logic       []MigrationResult
 	Permissions []MigrationResult
+	// Reference holds one diff per reference/ file, in the order they apply.
+	Reference []*reference.Diff
 	// Data holds the one-time data/ migrations, applied after everything else.
 	Data []MigrationResult
 	// PendingPGSchemas lists PostgreSQL schemas implied by schema/ subfolders
@@ -105,6 +109,10 @@ type StatusResult struct {
 	Pending []*migration.Migration
 	Changed []*migration.Migration
 	Drift   []DriftEntry
+	// Reference lists the reference/ files. They have no history to compare:
+	// only plan, which diffs them against the live tables, can say whether
+	// they have drifted.
+	Reference []*migration.Migration
 }
 
 // DriftEntry represents an ops migration whose file content changed after being applied.
@@ -126,7 +134,7 @@ func New(conn *pgx.Conn, sqlDB *sql.DB, differ *schema.Differ, config *Config, l
 }
 
 // Apply discovers and executes pending migrations:
-// ops → schema → logic → permissions → data.
+// ops → schema → logic → permissions → reference → data.
 func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 	if err := e.acquireLock(ctx); err != nil {
 		return nil, err
@@ -137,7 +145,7 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 		return nil, err
 	}
 
-	all, err := migration.Discover(e.config.MigrationsDir)
+	all, refSpecs, err := e.discover()
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +184,15 @@ func (e *Engine) Apply(ctx context.Context) (*ApplyResult, error) {
 		return result, err
 	}
 
-	// Phase E: Data — one-time, like ops, but only now that every object the
+	// Phase E: Reference — declared rows, diffed against the live tables on
+	// every apply. After logic/, so the triggers it creates fire on these
+	// writes; before data/, so a one-time backfill can rely on the rows.
+	result.Reference, err = e.reconcileReference(ctx, refSpecs, nil)
+	if err != nil {
+		return result, err
+	}
+
+	// Phase F: Data — one-time, like ops, but only now that every object the
 	// release introduces exists. This is the phase a backfill belongs in.
 	r, err = e.applyVersioned(ctx, filterByType(all, migration.TypeData), migration.TypeData)
 	result.Data = r
@@ -202,7 +218,7 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		return nil, err
 	}
 
-	all, err := migration.Discover(e.config.MigrationsDir)
+	all, refSpecs, err := e.discover()
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +297,13 @@ func (e *Engine) Plan(ctx context.Context) (*ApplyResult, error) {
 		return result, err
 	}
 
-	// Phase E: Data — find unapplied
+	// Phase E: Reference — diff the declared rows against the live tables.
+	result.Reference, err = e.reconcileReference(ctx, refSpecs, schemaChanges(result))
+	if err != nil {
+		return result, err
+	}
+
+	// Phase F: Data — find unapplied
 	result.Data, err = e.planVersioned(ctx, filterByType(all, migration.TypeData), migration.TypeData, stateReady)
 	if err != nil {
 		return result, err
@@ -393,6 +415,8 @@ func (e *Engine) Status(ctx context.Context) (*StatusResult, error) {
 			} else if latestLogic[m.Name].Checksum != m.Checksum {
 				result.Changed = append(result.Changed, m)
 			}
+		case migration.TypeReference:
+			result.Reference = append(result.Reference, m)
 		case migration.TypePermissions:
 			if _, ok := latestPerms[m.Name]; !ok {
 				result.Pending = append(result.Pending, m)
@@ -422,6 +446,10 @@ func (e *Engine) Baseline(ctx context.Context, version string, all bool) error {
 	}
 
 	for _, m := range allMigrations {
+		// reference/ has no history to adopt: every apply diffs it afresh.
+		if m.Type == migration.TypeReference {
+			continue
+		}
 		if !all && migration.IsVersioned(m.Type) && m.Version > version {
 			continue
 		}
@@ -457,7 +485,7 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 		return nil, err
 	}
 
-	all, err := migration.Discover(e.config.MigrationsDir)
+	all, refSpecs, err := e.discover()
 	if err != nil {
 		return nil, err
 	}
@@ -528,7 +556,10 @@ func (e *Engine) Sync(ctx context.Context) (*ApplyResult, error) {
 		result.Permissions = append(result.Permissions, mr)
 	}
 
-	return result, nil
+	// Reference — declared rows are desired state, like schema/, so sync
+	// converges them rather than baselining them the way it does data/.
+	result.Reference, err = e.reconcileReference(ctx, refSpecs, nil)
+	return result, err
 }
 
 // --- apply helpers ---
@@ -850,10 +881,8 @@ func (e *Engine) executeMigration(ctx context.Context, m *migration.Migration) e
 	// Rollback is a no-op once the transaction has been committed.
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	if parsed.Directives.LockTimeout > 0 {
-		if _, err = tx.Exec(ctx, fmt.Sprintf("SET LOCAL lock_timeout = '%dms'", parsed.Directives.LockTimeout.Milliseconds())); err != nil {
-			return fmt.Errorf("failed to set lock_timeout: %w", err)
-		}
+	if err := setLocalTimeouts(ctx, tx, parsed.Directives.LockTimeout, 0); err != nil {
+		return err
 	}
 
 	for i, stmt := range parsed.Statements {
@@ -1028,6 +1057,21 @@ func FormatPlanOutput(result *ApplyResult) string {
 		}
 	}
 
+	for _, d := range result.Reference {
+		switch {
+		case d.Pending != "":
+			fmt.Fprintf(&b, "  ~ %s (reference %s: diffed at apply — %s)\n", d.Spec.File, d.Table, d.Pending)
+			pending++
+		case !d.Empty():
+			fmt.Fprintf(&b, "  ~ %s (reference %s: %d insert, %d update, %d delete)\n",
+				d.Spec.File, d.Table, len(d.Inserts), len(d.Updates), len(d.Deletes))
+			for _, l := range d.Lines(planRowLimit) {
+				fmt.Fprintf(&b, "      %s\n", l)
+			}
+			pending++
+		}
+	}
+
 	for _, r := range result.Data {
 		if !r.Skipped {
 			fmt.Fprintf(&b, "  + %s (data)\n", r.Migration.Filename)
@@ -1058,6 +1102,10 @@ func FormatPlanOutput(result *ApplyResult) string {
 	header := fmt.Sprintf("Plan: %d migration(s) to apply.\n\n", pending)
 	return header + w.String() + b.String()
 }
+
+// planRowLimit caps the rows a plan prints per kind of change in one
+// reference/ file; the counts on the file's own line are never capped.
+const planRowLimit = 20
 
 // FormatApplyOutput returns a human-readable summary of an apply result.
 //
@@ -1122,6 +1170,15 @@ func FormatApplyOutput(result *ApplyResult) string {
 	}
 	writeResults(result.Logic)
 	writeResults(result.Permissions)
+	for _, d := range result.Reference {
+		if d.Empty() {
+			skipped++
+			continue
+		}
+		fmt.Fprintf(&b, "  ✓ %s (%d inserted, %d updated, %d deleted)\n",
+			d.Spec.File, len(d.Inserts), len(d.Updates), len(d.Deletes))
+		applied++
+	}
 	writeResults(result.Data)
 
 	summary := fmt.Sprintf("\nApplied: %d, Skipped: %d, Failed: %d\n", applied, skipped, failed)
@@ -1172,8 +1229,20 @@ func FormatStatusOutput(result *StatusResult) string {
 		b.WriteString("\n")
 	}
 
+	if len(result.Reference) > 0 {
+		fmt.Fprintf(&b, "Reference (diffed on every apply; run m8 plan for drift) (%d):\n", len(result.Reference))
+		for _, m := range result.Reference {
+			fmt.Fprintf(&b, "  = %s\n", m.Filename)
+		}
+		b.WriteString("\n")
+	}
+
 	if len(result.Pending) == 0 && len(result.Changed) == 0 && len(result.Drift) == 0 {
-		b.WriteString("Database is up to date.\n")
+		if len(result.Reference) > 0 {
+			b.WriteString("Migrations are up to date.\n")
+		} else {
+			b.WriteString("Database is up to date.\n")
+		}
 	}
 
 	return b.String()
