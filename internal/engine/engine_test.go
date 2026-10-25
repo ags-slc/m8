@@ -13,56 +13,48 @@ import (
 
 	"github.com/ags-slc/m8/internal/dump"
 	"github.com/ags-slc/m8/internal/migration"
+	"github.com/ags-slc/m8/internal/pgtest"
 	"github.com/ags-slc/m8/internal/schema"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// testDB spins up a PostgreSQL container and returns a connection + cleanup func.
+func TestMain(m *testing.M) { pgtest.Main(m) }
+
+// testDB gives the test a fresh database on the package's shared PostgreSQL
+// and returns a connection + cleanup func. pgtest drops the database after.
 func testDB(t *testing.T) (*pgx.Conn, *sql.DB, string, func()) {
+	t.Helper()
+	return connect(t, pgtest.DB(t))
+}
+
+// testServer is testDB on a PostgreSQL of the test's own, for a test that
+// creates, counts or sweeps databases -- which on the shared server would see
+// every other test's.
+func testServer(t *testing.T) (*pgx.Conn, *sql.DB, string, func()) {
+	t.Helper()
+	return connect(t, pgtest.Server(t))
+}
+
+func connect(t *testing.T, connStr string) (*pgx.Conn, *sql.DB, string, func()) {
 	t.Helper()
 	ctx := context.Background()
 
-	container, err := postgres.Run(ctx, "postgres:16-alpine",
-		postgres.WithDatabase("m8test"),
-		postgres.WithUsername("postgres"),
-		postgres.WithPassword("testpwd"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(30*time.Second)),
-	)
-	if err != nil {
-		t.Fatalf("failed to start postgres: %v", err)
-	}
-
-	connStr, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		_ = container.Terminate(ctx)
-		t.Fatalf("failed to get connection string: %v", err)
-	}
-
 	conn, err := pgx.Connect(ctx, connStr)
 	if err != nil {
-		_ = container.Terminate(ctx)
 		t.Fatalf("failed to connect: %v", err)
 	}
 
 	sqlDB, err := sql.Open("pgx", connStr)
 	if err != nil {
 		_ = conn.Close(ctx)
-		_ = container.Terminate(ctx)
 		t.Fatalf("failed to open sql.DB: %v", err)
 	}
 
 	cleanup := func() {
 		_ = sqlDB.Close()
 		_ = conn.Close(ctx)
-		_ = container.Terminate(ctx)
 	}
 
 	return conn, sqlDB, connStr, cleanup
@@ -633,7 +625,7 @@ func TestSchemaApply(t *testing.T) {
 }
 
 func TestSweepInvalidTempDBs(t *testing.T) {
-	conn, _, connStr, cleanup := testDB(t)
+	conn, _, connStr, cleanup := testServer(t)
 	defer cleanup()
 	ctx := context.Background()
 
@@ -712,7 +704,7 @@ func TestSchemaMigrationsRequireDiffer(t *testing.T) {
 }
 
 func TestSweepStaleTempDBs(t *testing.T) {
-	conn, _, connStr, cleanup := testDB(t)
+	conn, _, connStr, cleanup := testServer(t)
 	defer cleanup()
 	ctx := context.Background()
 
@@ -765,7 +757,7 @@ func TestSweepStaleTempDBs(t *testing.T) {
 // tempDBConnStr rewrites a test container connection string to point at another
 // database on the same instance.
 func tempDBConnStr(connStr, dbName string) string {
-	return strings.Replace(connStr, "/m8test?", "/"+dbName+"?", 1)
+	return pgtest.WithDatabase(connStr, dbName)
 }
 
 // seedTempDBMetadata writes pg-schema-diff's metadata table into dbName with a
@@ -822,9 +814,9 @@ func countTempDBs(t *testing.T, conn *pgx.Conn) int {
 // the diff would fail outright, which the final subtest demonstrates by taking the
 // shadow away and watching the identical call fail.
 func TestShadowInstanceRouting(t *testing.T) {
-	targetConn, _, targetSuperConnStr, targetCleanup := testDB(t)
+	targetConn, _, targetSuperConnStr, targetCleanup := testServer(t)
 	defer targetCleanup()
-	shadowConn, _, shadowConnStr, shadowCleanup := testDB(t)
+	shadowConn, _, shadowConnStr, shadowCleanup := testServer(t)
 	defer shadowCleanup()
 
 	ctx := context.Background()
@@ -944,9 +936,9 @@ func TestShadowInstanceRouting(t *testing.T) {
 // Without the override this test fails at NewDiffer, and the documented promise
 // that no separate "postgres" database is required would be false.
 func TestShadowInstanceWithoutPostgresDatabase(t *testing.T) {
-	_, targetDB, targetConnStr, targetCleanup := testDB(t)
+	_, targetDB, targetConnStr, targetCleanup := testServer(t)
 	defer targetCleanup()
-	shadowConn, _, shadowConnStr, shadowCleanup := testDB(t)
+	shadowConn, _, shadowConnStr, shadowCleanup := testServer(t)
 	defer shadowCleanup()
 
 	ctx := context.Background()
@@ -982,9 +974,9 @@ func TestShadowInstanceWithoutPostgresDatabase(t *testing.T) {
 // sweep nor the one-hour TTL sweep reaches it. Reclaiming strictly by the names
 // this process created must get it, and must not touch anyone else's.
 func TestDropCreatedTempDBs(t *testing.T) {
-	_, targetDB, targetConnStr, targetCleanup := testDB(t)
+	_, targetDB, targetConnStr, targetCleanup := testServer(t)
 	defer targetCleanup()
-	shadowConn, _, shadowConnStr, shadowCleanup := testDB(t)
+	shadowConn, _, shadowConnStr, shadowCleanup := testServer(t)
 	defer shadowCleanup()
 
 	ctx := context.Background()
@@ -1286,7 +1278,7 @@ func TestSchemaApplyCreatesSerialTable(t *testing.T) {
 // What plan must not do is leave anything behind: no _m8 state schema, no
 // declared object, and no surviving temp database.
 func TestPlanLeavesNoPersistentTraceOnTheTarget(t *testing.T) {
-	conn, sqlDB, connStr, cleanup := testDB(t)
+	conn, sqlDB, connStr, cleanup := testServer(t)
 	defer cleanup()
 
 	ctx := context.Background()

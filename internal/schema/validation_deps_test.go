@@ -5,40 +5,22 @@ import (
 	"database/sql"
 	"strings"
 	"testing"
-	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/ags-slc/m8/internal/pgtest"
 )
 
-// depDB starts a throwaway PostgreSQL and returns a pool plus its conn string.
+func TestMain(m *testing.M) { pgtest.Main(m) }
+
+// depDB returns a pool on a fresh database plus its conn string. The database
+// shares a PostgreSQL with the package's other tests; pgtest drops it after.
 func depDB(t *testing.T) (*sql.DB, string) {
 	t.Helper()
-	ctx := context.Background()
-	c, err := postgres.Run(ctx, "postgres:16-alpine",
-		postgres.WithDatabase("m8test"),
-		postgres.WithUsername("postgres"),
-		postgres.WithPassword("testpwd"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).WithStartupTimeout(60*time.Second)),
-	)
-	if err != nil {
-		t.Fatalf("start postgres: %v", err)
-	}
-	connStr, err := c.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		_ = c.Terminate(ctx)
-		t.Fatalf("connection string: %v", err)
-	}
+	connStr := pgtest.DB(t)
 	db, err := sql.Open("pgx", connStr)
 	if err != nil {
-		_ = c.Terminate(ctx)
 		t.Fatalf("open: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close(); _ = c.Terminate(ctx) })
+	t.Cleanup(func() { _ = db.Close() })
 	return db, connStr
 }
 
