@@ -3,6 +3,75 @@
 Notable changes to m8. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-10-26
+
+### Added
+
+- **A sixth phase, `reference/`: declare a table's rows, and every apply makes
+  the table match.** Lookup and seed tables -- carriers, mappings, codes -- hold
+  rows the application depends on being exactly so. A one-time `data/` seed
+  needs a new migration each time those rows change, and a hand-written `MERGE`
+  re-run on every deploy rewrites every row unless its guard is exactly right,
+  firing triggers and emitting a CDC event per row per deploy.
+
+  A `reference/` file names a table and holds one `SELECT` or `VALUES` query
+  whose result is the rows it must contain:
+
+  ```sql
+  -- m8:reference public.vendor_mapping key=match_type,keyword prune touch=updated_at
+  SELECT * FROM (VALUES
+      ('vm_1', 'VENDOR_CONTAINS', 'landmark', 'LANDMARK'),
+      ('vm_2', 'VENDOR_CONTAINS', 'funko',    'DHL_ECOM')
+  ) AS v(id, match_type, keyword, carrier);
+  ```
+
+  Every apply compares the declared rows with the live table by key and writes
+  only the difference: missing rows inserted, changed rows updated, and -- with
+  `prune` -- unlisted rows deleted. A row that already matches is neither
+  written nor locked, so a converged file costs one read and `plan` reports
+  nothing. A hand edit is drift: `plan` shows it, and the next apply puts it
+  back. Columns the query does not name are left alone, except `touch=`
+  columns, which are set to `now()` on the rows m8 writes.
+
+  Apply order is now **ops → schema → logic → permissions → reference → data**.
+  All `reference/` files apply in one transaction, ordered by the foreign keys
+  between their tables. m8 refuses, naming the file, rather than guess -- when
+  the key has no unique index, a key is `NULL` or repeated, a column is missing
+  or generated, two files declare one table, or `prune` would delete through a
+  cascading foreign key. Directives are parsed before `ops/` runs, so a typo
+  stops the release before anything is applied.
+
+  `m8 new reference <table>` scaffolds a file. Pending reference changes make
+  `plan` exit 2 like any other pending work. `sync` converges `reference/`;
+  `baseline` skips it, since there is no history to adopt. See
+  [Reference Data](README.md#reference-data) for every option and refusal.
+
+  **Upgrade every runner before the first `reference/` file merges.** `v0.3.3`
+  and earlier do not know the folder exists: they skip it, report the release
+  fully applied, and exit 0 from `plan`. A CI gate keyed on `plan`'s exit code
+  goes green while the rows have not been written. Nothing is lost -- the first
+  run of a new enough binary converges them -- but until then the table is
+  whatever it was.
+
+  If your migrations directory already has a folder named `reference/` for
+  something else, rename it first: m8 now reads every `.sql` file in it, and a
+  file without an `-- m8:reference` directive fails the release before `ops/`.
+
+  **Known limitations**, tracked for a later release:
+  - `plan` fails with `table ... does not exist` when the table is created by
+    an `ops/` migration in the same release, though `apply` succeeds
+    ([#25](https://github.com/ags-slc/m8/issues/25)). Create reference tables
+    in `schema/`, which `plan` already handles.
+  - Changing a declared `serial` or identity value with an update, when rows
+    are matched on a different `key=`, does not advance the sequence
+    ([#26](https://github.com/ags-slc/m8/issues/26)).
+  - A foreign key that only points at a reference table makes `plan` report it
+    as "diffed at apply" in the release that adds the key
+    ([#27](https://github.com/ags-slc/m8/issues/27)).
+  - A column whose type is a domain over `json`, `xml` or a geometric type
+    fails the comparison with an error
+    ([#28](https://github.com/ags-slc/m8/issues/28)).
+
 ## [0.3.3] - 2026-09-05
 
 ### Fixed
@@ -357,6 +426,7 @@ Initial release. The m8 CLI scaffold: `plan`, `apply`, `dump`, `baseline`,
 `sync`, `status`, `new`, and `version`. Superseded by `0.2.0` — see the upgrade
 note above before running it against anything you care about.
 
+[0.4.0]: https://github.com/ags-slc/m8/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/ags-slc/m8/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ags-slc/m8/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ags-slc/m8/compare/v0.3.0...v0.3.1
