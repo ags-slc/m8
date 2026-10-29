@@ -3,6 +3,7 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"github.com/ags-slc/m8/internal/pgtest"
 	"reflect"
 	"strings"
 	"testing"
@@ -101,7 +102,9 @@ CREATE INDEX event_log_id_idx ON public.event_log (id);`)
 // so a shadow instance without the target's roles can build it.
 func TestAdoptedPartitionsLeaveTheirGrantsAlone(t *testing.T) {
 	db, connStr := depDB(t)
-	_, shadowURL := depDB(t)
+	// Roles are per server, so the shadow is a server of its own: one the
+	// test's role was never created on.
+	shadowURL := pgtest.Server(t)
 	mustExec(t, db, partitionedFixture+`
 CREATE ROLE probe_app;
 GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA public TO probe_app;`)
