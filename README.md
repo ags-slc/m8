@@ -151,7 +151,9 @@ migrations/
 | **Ops** | `ops/` | Run once in timestamp order, **before** schema/ | Extensions, hypertables, session/database settings |
 | **Data** | `data/` | Run once in timestamp order, **after** everything | Backfills, one-time seeds and DML, comments on new objects |
 
-**Apply order:** Ops → Schema → Logic → Permissions → Reference → Data
+**Apply order:** Ops → Schema → pg_partman → Logic → Permissions → Reference → Data
+
+The pg_partman step reconciles tables declared with [`-- m8:partman`](#pg_partman); it runs after schema/ so the parent table exists, and is a no-op when nothing declares one.
 
 ### ops/ or data/?
 
@@ -312,6 +314,93 @@ m8 only manages objects you declare. Tables, procedures, and grants that exist i
 
 Use `--strict` to opt in to exact-match mode, where schema diffs include DROP statements for undeclared objects.
 
+### Partitioned Tables
+
+Declare a partitioned table's shape -- columns, indexes, `PARTITION BY` -- and
+leave its children to whatever creates them: pg_partman, an application job, a
+script. On every run m8 reads the live children of each declared partitioned
+table and describes them in the desired state exactly as they are -- bound,
+extra `NOT NULL`s, constraints (their own `CHECK`s included) and indexes under
+their live names, replica identity, row-level-security flags -- so the diff has
+nothing to do for them. A child's grants are left alone: the schema diff does
+not manage privileges on partitions, since PostgreSQL does not carry a parent's
+`GRANT` to them and whatever creates the children owns theirs (pg_partman's
+`inherit_privileges`, for one). That also keeps role names out of the desired
+schema, so a separate shadow instance needs none of the target's roles. The
+children are never written to a file: a list captured once is wrong the first
+time the partition manager adds a month.
+
+Because the children stay visible to the diff, a change to the parent is planned
+against all of them. An index added to the parent is built without blocking
+writes -- an empty index on the parent, a concurrent build on each child, then
+`ATTACH`:
+
+```
+  ~ schema/public/audit_log.sql (schema)
+    CREATE INDEX audit_log_request_id_idx ON ONLY public.audit_log USING btree (request_id)
+    CREATE INDEX CONCURRENTLY audit_log_p20260901_request_id_idx ON public.audit_log_p20260901 USING btree (request_id)
+    ⚠ INDEX_BUILD
+    ALTER INDEX "public"."audit_log_request_id_idx" ATTACH PARTITION "public"."audit_log_p20260901_request_id_idx"
+    ...
+```
+
+Refused, with the table named, rather than planned:
+
+- a table that is partitioned in the database but declared without
+  `PARTITION BY` -- as declared, the diff would drop and recreate it;
+- an undeclared child with a row-level-security policy of its own, or one that
+  is itself partitioned -- pg-schema-diff cannot diff either on a partition.
+
+Children that are declared in the files are managed like any other table.
+
+#### pg_partman
+
+`-- m8:partman` declares a table's pg_partman configuration -- its
+`partman.part_config` row -- alongside its shape:
+
+```sql
+-- schema/public/audit_log.sql
+-- m8:partman audit_log control=created_at partition_interval='1 month' premake=4 infinite_time_partitions=true retention=none
+CREATE TABLE audit_log (
+    id         text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+) PARTITION BY RANGE (created_at);
+```
+
+A table pg_partman does not manage yet is registered with `create_parent`; one it
+does has its `part_config` row updated to match. Keys are `part_config` column
+names, plus `control` and `partition_interval` (required) and create_parent's
+`default_table` and `start_partition`, which apply only when the table is
+registered. A key left out is not managed.
+
+| Keys | On a registered table |
+|------|-----------------------|
+| `control`, `partition_interval`, `partition_type`, `epoch`, `date_trunc_interval` | Fixed: they lay out the partition boundaries, so a change is refused before anything in the run is applied |
+| `premake`, `constraint_cols` (`a,b`), `optimize_constraint`, `ignore_default_data`, `retention` (`none` for no retention), `retention_schema`, `retention_keep_table`, `retention_keep_index`, `infinite_time_partitions`, `inherit_privileges`, `automatic_maintenance`, `jobmon` | Updated in place |
+
+Settings create_parent takes are passed to it, so the children its first call
+makes are already laid out by them. Intervals compare as the server renders
+them, so `'1 month'` matches the `1 mon` that `part_config` stores, while
+`'30 days'` does not. pg_partman 5.0 or later is required; the keys are the
+columns every 5.x has. `template_table` is not declarable -- it names a table
+create_parent otherwise makes itself -- so `m8 dump` writes a comment beside
+the directive when a table uses a custom one, and dumps a partitioned table
+without a directive, with a comment saying why, on a database whose pg_partman
+is older than 5.0. The directive is parsed before any phase runs, so a typo
+stops the release before `ops/` has applied anything.
+
+A pending pg_partman change makes `m8 plan` exit 2, like any other pending
+migration; a refused declaration makes it fail.
+
+pg_partman itself is installed by an `ops/` migration (`CREATE EXTENSION
+pg_partman SCHEMA partman`), which runs before schema/.
+
+Registering a table does not schedule its maintenance: something must call
+`partman.run_maintenance()` -- pg_cron, the pg_partman background worker, or an
+application job -- or the table keeps its first `premake` intervals of children
+and every later row lands in the default partition. `m8 status` reports each
+declared table's last maintenance run, and flags one that has never run.
+
 ## Bootstrapping an Existing Database
 
 Use `m8 dump` to export an existing database into the m8 folder layout:
@@ -356,6 +445,11 @@ column-level grants, sequences, routine `EXECUTE`, `WITH GRANT OPTION`, and the
 -- a `SECURITY DEFINER` function is `EXECUTE`-able by `PUBLIC` the moment it is
 recreated, so losing the revoke is a privilege escalation, not just a gap.
 
+A partitioned table is dumped with its `PARTITION BY` and its indexes declared
+on the whole table; its children are not dumped (see
+[Partitioned Tables](#partitioned-tables)). A table pg_partman manages gets an
+`-- m8:partman` line carrying its complete live configuration.
+
 **Not captured:** materialized views. They have no `CREATE OR REPLACE` form, so
 they cannot be re-applied idempotently the way a `logic/` file must be. `m8 dump`
 names them and refuses rather than leaving them out silently; pass
@@ -383,9 +477,9 @@ and replica identity**, plus roles themselves, event triggers, and
 
 | Command | Description |
 |---------|-------------|
-| `m8 apply` | Apply pending migrations (ops → schema → logic → permissions → reference → data) |
+| `m8 apply` | Apply pending migrations (ops → schema → pg_partman → logic → permissions → reference → data) |
 | `m8 plan` | Show what would be applied without making changes (exit code 2 if pending) |
-| `m8 status` | Show applied, pending, changed, and drifted migrations |
+| `m8 status` | Show applied, pending, changed, and drifted migrations, and pg_partman maintenance |
 | `m8 sync` | One-time convergence for brownfield adoption (`ops/` and `data/` are baselined, not run) |
 | `m8 baseline` | Mark migrations as applied without running them |
 | `m8 dump` | Export database objects to migration files |
@@ -407,6 +501,9 @@ ALTER TABLE large_table ADD COLUMN new_col TEXT;
 ```
 
 m8 also auto-detects `CREATE INDEX CONCURRENTLY` and runs those migrations outside a transaction automatically.
+
+`-- m8:partman <table> key=value ...` in a schema/ file declares the table's
+pg_partman configuration -- see [pg_partman](#pg_partman).
 
 ### Timeouts on generated schema statements
 

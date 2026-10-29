@@ -7,7 +7,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/stripe/pg-schema-diff/pkg/diff"
+	"github.com/ags-slc/pg-schema-diff/pkg/diff"
 )
 
 // maxSeededRelations caps how much of a dependency schema m8 will import into a

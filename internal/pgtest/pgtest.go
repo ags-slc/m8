@@ -62,7 +62,7 @@ func DB(t *testing.T) string {
 	t.Helper()
 	ctx := context.Background()
 	shared.once.Do(func() {
-		shared.container, shared.connStr, shared.err = start(ctx)
+		shared.container, shared.connStr, shared.err = start(ctx, "postgres:16-alpine")
 	})
 	if shared.err != nil {
 		t.Fatalf("starting the shared postgres: %v", shared.err)
@@ -139,8 +139,20 @@ func userRoles(ctx context.Context, conn *pgx.Conn) (map[string]bool, error) {
 // the container stops when the test ends.
 func Server(t *testing.T) string {
 	t.Helper()
+	return server(t, "postgres:16-alpine")
+}
+
+// ServerFromDockerfile is Server on an image built from df, for tests that
+// need an extension postgres:16-alpine does not ship.
+func ServerFromDockerfile(t *testing.T, df testcontainers.FromDockerfile) string {
+	t.Helper()
+	return server(t, "", testcontainers.WithDockerfile(df))
+}
+
+func server(t *testing.T, img string, opts ...testcontainers.ContainerCustomizer) string {
+	t.Helper()
 	ctx := context.Background()
-	container, connStr, err := start(ctx)
+	container, connStr, err := start(ctx, img, opts...)
 	if err != nil {
 		t.Fatalf("starting postgres: %v", err)
 	}
@@ -159,16 +171,18 @@ func WithDatabase(connStr, name string) string {
 	return u.String()
 }
 
-func start(ctx context.Context) (*postgres.PostgresContainer, string, error) {
-	container, err := postgres.Run(ctx, "postgres:16-alpine",
+// start runs a PostgreSQL container from img, or, when img is empty, from the
+// image an option builds.
+func start(ctx context.Context, img string, opts ...testcontainers.ContainerCustomizer) (*postgres.PostgresContainer, string, error) {
+	container, err := postgres.Run(ctx, img, append([]testcontainers.ContainerCustomizer{
 		postgres.WithDatabase(Database),
 		postgres.WithUsername("postgres"),
 		postgres.WithPassword("testpwd"),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second)),
-	)
+				WithStartupTimeout(60 * time.Second)),
+	}, opts...)...)
 	if err != nil {
 		return nil, "", err
 	}
