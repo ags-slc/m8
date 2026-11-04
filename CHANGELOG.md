@@ -3,6 +3,19 @@
 Notable changes to m8. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`m8 version` said `dev` for every binary not built by GoReleaser.** The
+  version, commit and build date were only ever set by the release build's
+  `-ldflags`, so `go install github.com/ags-slc/m8@v0.4.0` printed
+  `m8 dev (commit: none, built: unknown)`. m8 now falls back to the build info
+  Go embeds: a `go install` binary reports its module version (`m8 0.4.0`), and
+  a `go build` in a checkout reports a version derived from the nearest tag,
+  plus the commit (marked `-dirty` for an uncommitted tree) and the commit's
+  time. Release archives and Homebrew are unchanged.
+
 ## [0.4.0] - 2026-10-26
 
 ### Added
@@ -426,6 +439,7 @@ Initial release. The m8 CLI scaffold: `plan`, `apply`, `dump`, `baseline`,
 `sync`, `status`, `new`, and `version`. Superseded by `0.2.0` — see the upgrade
 note above before running it against anything you care about.
 
+[Unreleased]: https://github.com/ags-slc/m8/compare/v0.4.0...HEAD
 [0.4.0]: https://github.com/ags-slc/m8/compare/v0.3.3...v0.4.0
 [0.3.3]: https://github.com/ags-slc/m8/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ags-slc/m8/compare/v0.3.1...v0.3.2
